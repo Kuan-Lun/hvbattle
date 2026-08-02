@@ -56,6 +56,7 @@ class BattleSession(HVDriver):
         self._buff_manager: BuffManager | None = None
         self._completion_observed = False
         self._last_dialog_category: str | None = None
+        self._missing_round_metadata_logged = False
         self.turn = -1
         self.round = -1
 
@@ -154,8 +155,15 @@ class BattleSession(HVDriver):
         self.turn = -1
         self.round = -1
         self._completion_observed = False
+        self._missing_round_metadata_logged = False
         if self.battle_dashboard is not None:
             self.battle_dashboard.reset()
+
+    def _round_progress_text(self) -> str:
+        """Render unavailable resumed-battle metadata without inventing round zero."""
+        if self.current_round <= 0 or self.total_rounds <= 0:
+            return "Round   ? / ?  "
+        return f"Round {self.current_round:>3} / {self.total_rounds:<3}"
 
     async def prepare_turn(self) -> tuple[str, ...] | None:
         """Refresh one actionable turn, or return ``None`` at a transition."""
@@ -208,7 +216,15 @@ class BattleSession(HVDriver):
         self.turn += 1
         self.round = self.current_round
         turn_text = f"Turn {self.turn:>5}"
-        round_text = f"Round {self.current_round:>3} / {self.total_rounds:<3}"
+        round_text = self._round_progress_text()
+        if "?" in round_text and not getattr(
+            self, "_missing_round_metadata_logged", False
+        ):
+            logger.info(
+                "Round metadata is unavailable on this active page; it will "
+                "become available after a later round initialization is observed."
+            )
+            self._missing_round_metadata_logged = True
         lines = tuple(
             f"{turn_text} {round_text} {line}"
             for line in self._dashboard().log_entries.current_lines

@@ -21,7 +21,7 @@ class GrindfestOption:
 
 @dataclass(frozen=True, slots=True)
 class BattleCompleted:
-    """Immutable summary returned after one active battle has completed."""
+    """Immutable summary; zero round values mean metadata was not observed."""
 
     is_isekai: bool
     decision_count: int
@@ -31,7 +31,7 @@ class BattleCompleted:
 
 @dataclass(frozen=True, slots=True)
 class BattleStopped:
-    """The client strategy deliberately yielded the active battle to its caller."""
+    """Strategy yield summary; zero round values mean metadata was not observed."""
 
     is_isekai: bool
     decision_count: int

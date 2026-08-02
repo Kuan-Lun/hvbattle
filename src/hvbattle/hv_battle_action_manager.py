@@ -480,6 +480,9 @@ def _confirmed_transition_evidence(
         and current_round is not None
         and current_round > before_round
     )
+    round_initialized = (
+        before.next_floor_present and before_round is None and current_round is not None
+    )
     actionable_battle = bool(
         current.battle_present
         and current.log_revision is not None
@@ -491,6 +494,15 @@ def _confirmed_transition_evidence(
             return "battle-generation+round-advanced"
         if not generation_changed:
             return "battle-round-advanced"
+    if round_initialized and actionable_battle:
+        if generation_changed and current.ready_state == "complete":
+            return "battle-generation+round-initialized"
+        if (
+            not generation_changed
+            and current.log_revision is not None
+            and current.log_revision != before.log_revision
+        ):
+            return "battle-round-initialized"
     return None
 
 

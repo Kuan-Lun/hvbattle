@@ -124,6 +124,31 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(prepared)
         self.assertEqual(session.turn, 4)
 
+    async def test_resumed_turn_logs_unknown_round_metadata_once(self) -> None:
+        session = object.__new__(BattleSession)
+        session.turn = -1
+        session.round = -1
+        session._completion_observed = False
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_phase = AsyncMock(return_value="active")
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.update = AsyncMock()
+        session.battle_dashboard.snap = SimpleNamespace(warnings=[])
+        session.battle_dashboard.overview_monsters.alive_monster = [0]
+        session.battle_dashboard.log_entries.current_round = 0
+        session.battle_dashboard.log_entries.total_round = 0
+        session.battle_dashboard.log_entries.current_lines = ["You hit a monster."]
+
+        with self.assertLogs("hvbattle.session", level="INFO") as captured:
+            await BattleSession.prepare_turn(session)
+            await BattleSession.prepare_turn(session)
+
+        output = "\n".join(captured.output)
+        self.assertEqual(output.count("Round metadata is unavailable"), 1)
+        self.assertIn("Round   ? / ?", output)
+        self.assertNotIn("Round   0 / 0", output)
+
     async def test_final_round_numbers_without_dom_marker_are_invalid(
         self,
     ) -> None:
@@ -425,6 +450,33 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         strategy.on_battle_started.assert_awaited_once_with(session)
         strategy.take_turn.assert_awaited_once_with(session)
 
+    async def test_unknown_round_completion_log_does_not_report_round_zero(
+        self,
+    ) -> None:
+        session = _FakeSession(active=True)
+        session.current_round = 0
+        session.total_rounds = 0
+        strategy = Mock()
+
+        async def finish(_session: object) -> TurnDecision:
+            session._active = False
+            session.battle_completion_observed = True
+            return TurnDecision.ACTED
+
+        strategy.take_turn = AsyncMock(side_effect=finish)
+
+        with self.assertLogs("hvbattle.runner", level="INFO") as captured:
+            result = await BattleRunner(
+                session,  # type: ignore[arg-type]
+                strategy,
+                sleep=AsyncMock(),
+            ).run_current()
+
+        self.assertIsInstance(result, BattleCompleted)
+        output = "\n".join(captured.output)
+        self.assertIn("round=<unknown>", output)
+        self.assertNotIn("final_round=0", output)
+
     async def test_ponychart_runs_before_optional_strategy_lifecycle(self) -> None:
         session = _FakeSession(active=True)
         events: list[str] = []
@@ -704,6 +756,22 @@ class PonyChartResolutionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BattleLogTests(unittest.TestCase):
+    def test_unknown_round_metadata_is_rendered_as_unknown(self) -> None:
+        session = object.__new__(BattleSession)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.log_entries.current_round = 0
+        session.battle_dashboard.log_entries.total_round = 0
+
+        self.assertEqual(session._round_progress_text(), "Round   ? / ?  ")
+
+    def test_observed_round_metadata_is_rendered_numerically(self) -> None:
+        session = object.__new__(BattleSession)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.log_entries.current_round = 2
+        session.battle_dashboard.log_entries.total_round = 10
+
+        self.assertEqual(session._round_progress_text(), "Round   2 / 10 ")
+
     def test_empty_refresh_clears_previous_log_delta(self) -> None:
         entry = LogEntry()
         entry.update(SimpleNamespace(log=SimpleNamespace(lines=["first"])))

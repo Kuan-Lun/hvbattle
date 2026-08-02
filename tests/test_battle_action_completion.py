@@ -562,6 +562,60 @@ class BattleActionEvidenceTests(unittest.TestCase):
             "battle-round-advanced",
         )
 
+    def test_resumed_unknown_round_accepts_new_round_generation(self) -> None:
+        before = _state(
+            round_text=None,
+            next_floor_present=True,
+            action_controls=0,
+        )
+        current = _state(
+            document_id="document-2",
+            battle_node_id="battle-node-2",
+            round_text="Initializing arena (Round 2 / 10)",
+            next_floor_present=False,
+            action_controls=3,
+        )
+
+        self.assertEqual(
+            _confirmed_transition_evidence(before, current),
+            "battle-generation+round-initialized",
+        )
+
+    def test_resumed_unknown_round_accepts_ajax_round_initialization(self) -> None:
+        before = _state(
+            round_text=None,
+            log_revision="round-1-complete",
+            next_floor_present=True,
+            action_controls=0,
+        )
+        current = _state(
+            round_text="Initializing arena (Round 2 / 10)",
+            log_revision="round-2-log",
+            next_floor_present=False,
+            action_controls=3,
+        )
+
+        self.assertEqual(
+            _confirmed_transition_evidence(before, current),
+            "battle-round-initialized",
+        )
+
+    def test_resumed_unknown_round_rejects_unchanged_ajax_state(self) -> None:
+        before = _state(
+            round_text=None,
+            log_revision="same-log",
+            next_floor_present=True,
+            action_controls=0,
+        )
+        current = _state(
+            round_text="Initializing arena (Round 2 / 10)",
+            log_revision="same-log",
+            next_floor_present=False,
+            action_controls=3,
+        )
+
+        self.assertIsNone(_confirmed_transition_evidence(before, current))
+
     def test_new_document_must_finish_loading_before_transition_confirms(
         self,
     ) -> None:

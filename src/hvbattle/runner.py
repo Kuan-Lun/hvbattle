@@ -148,7 +148,16 @@ class BattleRunner:
                 final_round=self.session.current_round,
                 total_rounds=self.session.total_rounds,
             )
-            logger.info("Battle complete: %s", result)
+            if result.final_round > 0 and result.total_rounds > 0:
+                logger.info("Battle complete: %s", result)
+            else:
+                logger.info(
+                    "Battle complete: is_isekai=%s decision_count=%d "
+                    "round=<unknown>; the positive completion control appeared "
+                    "before round metadata became available",
+                    result.is_isekai,
+                    result.decision_count,
+                )
             return result
         except BattleInterruptedError:
             raise

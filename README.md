@@ -66,10 +66,16 @@ GrindFest uses the equivalent `list_grindfest_options()` and
 or last server option.
 
 `BaseControlPanel`, `ControlPanel`, and `NullControlPanel` provide reusable
-pause, skill-selection, and named-toggle mechanisms. The package does not
-register campaign choices or choose their defaults: a calling application owns
-the toggle names, labels, initial values, and the policy that reads their live
-state. Importing `hvbattle` does not import Tk or start a GUI process.
+pause, named-action, named-toggle, and validated integer mechanisms. The
+`set_actions()` API is the generic spelling; the older `set_skills()` spelling
+remains available as a compatibility alias. Integer edits become live only
+after Apply or Enter, so partially typed mutation amounts are never published.
+Closing the interactive window sets the pause flag before the GUI exits.
+
+The package does not register campaign choices or choose their defaults: a
+calling application owns the control names, labels, initial values, and the
+policy that reads their committed state. Importing `hvbattle` does not import
+Tk or start a GUI process.
 
 ## Development
 

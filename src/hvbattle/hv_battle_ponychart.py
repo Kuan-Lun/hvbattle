@@ -11,6 +11,10 @@ from hvbrowser.runtime import is_connection_error, notify, setup_logger
 logger = setup_logger(__name__)
 
 
+class PonyChartResolutionError(RuntimeError):
+    """Raised when a detected timed challenge remains on screen."""
+
+
 class _PredictionResult(Protocol):
     @property
     def labels(self) -> frozenset[str]: ...
@@ -151,6 +155,10 @@ class PonyChart:
         elements = await self.page.query_selector_all("#riddlesubmit")
         return bool(elements)
 
+    async def is_present(self) -> bool:
+        """Inspect challenge presence without answering or clicking it."""
+        return await self._check()
+
     async def check(self) -> bool:
         isponychart: bool = await self._check()
         if not isponychart:
@@ -205,6 +213,9 @@ class PonyChart:
                 logger.warning(
                     f"[PonyChart] Fallback submit click did not dismiss riddle "
                     f"(clicked={clicked}); likely auto-failed by game timeout"
+                )
+                raise PonyChartResolutionError(
+                    "PonyChart remained present after fallback submission"
                 )
             else:
                 logger.info(

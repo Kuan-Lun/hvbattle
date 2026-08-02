@@ -86,7 +86,7 @@ class ElementActionManager:
         zendriver 的 CDP 呼叫沒有內建 timeout，若頁面在 evaluate 期間
         發生 navigation 導致 execution context 被銷毀，回應可能永遠不會
         送達，造成 await 永久卡死。這裡用 asyncio.wait_for 包一層，逾時
-        改丟 TimeoutError，交由外層 battle() 的 recovery 機制處理。
+        改丟 TimeoutError，交由外層 BattleRunner 的 retry policy 處理。
         """
         return await asyncio.wait_for(
             self.hvdriver.page.evaluate(_PAGE_HASH_JS), timeout=timeout

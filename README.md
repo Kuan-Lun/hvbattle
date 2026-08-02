@@ -4,30 +4,66 @@ HVBattle provides reusable HentaiVerse battle-domain APIs. It builds on
 `hvbrowser` for the authenticated Hentaiverse browser session and keeps the
 private command-line runner in a separate application workspace.
 
-The first release preserves the historical `BattleDriver` API while adding a
-safe `run_current()` boundary. That method only runs an already active battle;
-it never repairs equipment, recovers stamina, or starts Arena/GrindFest.
-Automatic next-battle toggles default to off and require explicit opt-in.
-`BattleDriver` preloads the PonyChart classifier and ONNX model before opening
-the browser, so a timed challenge never pays the first-load cost.
+The package exposes a policy-neutral `BattleSession`, atomic battle actions,
+and a `BattleRunner` that runs exactly one already-active battle using a
+client-supplied `BattleStrategy`. It never repairs equipment, recovers stamina,
+or starts Arena/GrindFest on its own. Campaign policy and post-battle work belong
+to the calling application.
+
+`BattleSession` preloads the PonyChart classifier and ONNX model before opening
+the browser, so a timed challenge never pays the first-load cost. The runner
+checks for and resolves PonyChart before parsing an ordinary battle turn or
+calling client strategy code.
 
 ```python
 import asyncio
 
-from hvbattle import BattleDriver
+from hvbattle import BattleCompleted, BattleRunner, BattleSession, TurnDecision
+
+
+class MyStrategy:
+    async def take_turn(self, session: BattleSession, /) -> TurnDecision:
+        if await session.go_next_floor():
+            return TurnDecision.ACTED
+        if not session.alive_monster_ids:
+            return TurnDecision.IDLE
+        if await session.attack_monster(session.alive_monster_ids[0]):
+            return TurnDecision.ACTED
+        return TurnDecision.IDLE
+
+
+async def after_battle(session: BattleSession, completed: BattleCompleted) -> None:
+    print(completed)
 
 
 async def main() -> None:
-    async with BattleDriver(headless=True) as driver:
-        await driver.run_current()
+    async with BattleSession(headless=True) as session:
+        result = await BattleRunner(session, MyStrategy()).run_current()
+        if isinstance(result, BattleCompleted):
+            await after_battle(session, result)
 
 
 asyncio.run(main())
 ```
 
-The legacy `battle()` loop remains available for the private runner. It can
-repair equipment and recover stamina; starting another Arena or GrindFest also
-requires explicitly enabling the corresponding auto-next option.
+The example requires credentials through the normal `EH_USERNAME` and
+`EH_PASSWORD` indirection and an already-active server battle; otherwise
+`run_current()` returns `None`. `TurnDecision.STOP` deliberately returns a
+`BattleStopped` result. Leaving the battle page without positive final-round
+completion evidence raises `BattleInterruptedError`, so callers cannot mistake
+an expired login or unexpected navigation for a completed battle.
+
+`BattleDriver` is only a transitional name alias for `BattleSession`, not an
+API-compatible implementation of the old driver. Migrate constructor strategy
+settings into a `BattleStrategy`, replace `driver.battle()` with
+`BattleRunner(driver, strategy).run_current()`, and perform maintenance,
+post-battle tasks, and next-battle selection after the returned
+`BattleCompleted`. Arena choice follows the same boundary:
+`list_arena_options()` returns data and `start_arena(option)` starts only the
+option explicitly selected by the caller.
+GrindFest uses the equivalent `list_grindfest_options()` and
+`start_grindfest(option)` pair; the package does not silently choose the first
+or last server option.
 
 ## Development
 

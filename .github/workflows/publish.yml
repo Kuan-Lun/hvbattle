@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
+      contents: read
       id-token: write
     steps:
       - uses: actions/checkout@v4
@@ -56,7 +57,14 @@ jobs:
 
       - name: Build
         if: steps.version.outputs.bumped == 'true'
-        run: pip install build && python -m build
+        run: |
+          python -m pip install --upgrade build
+          python -m pip install --editable ".[dev]"
+          black --check src/hvbattle tests
+          ruff check src/hvbattle tests
+          mypy src/hvbattle
+          pytest
+          python -m build
 
       - name: Publish
         if: steps.version.outputs.bumped == 'true'

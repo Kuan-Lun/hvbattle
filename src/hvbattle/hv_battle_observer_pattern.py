@@ -52,7 +52,7 @@ class BattleSubject:
         zendriver 的 CDP 呼叫沒有內建 timeout，若頁面在取得內容期間發生
         navigation 導致 execution context 被銷毀，回應可能永遠不會送達，
         造成 await 永久卡死。這裡用 asyncio.wait_for 包一層，逾時改丟
-        TimeoutError，交由外層 battle() 的 recovery 機制處理。
+        TimeoutError，交由外層 BattleRunner 的 retry policy 處理。
 
         zendriver 的 Connection.send() 在 mapper 為空時重置 id counter，
         該檢查沒有上鎖，若此時另一個 coroutine（例如 alert dialog handler）
@@ -72,8 +72,12 @@ class BattleSubject:
 
     async def init(self) -> None:
         """非同步初始化 - 取得初始快照"""
+        self.snap = await self.inspect()
+
+    async def inspect(self) -> BattleSnapshot:
+        """Parse the current page without mutating observers or log deltas."""
         html = await self._get_content()
-        self.snap = parse_snapshot(html)
+        return parse_snapshot(html)
 
     def attach(self, observer: Observer) -> None:
         self._observers.append(observer)
@@ -129,6 +133,7 @@ class LogEntry(Observer):
 
     def update(self, snap: BattleSnapshot) -> None:
         lines = self.get_new_lines(snap)
+        self.current_lines = []
         if lines:
             self.current_lines = [line for line in lines if line not in self.prev_lines]
             self._parse_round_info(self.current_lines)
@@ -154,6 +159,20 @@ class BattleDashboard:
         await self.battle_subject.notify()
         self.snap = self.battle_subject.snap
         self.update_overview_monsters()
+
+    async def inspect(self) -> BattleSnapshot:
+        """Return a snapshot without consuming observer state."""
+        return await self.battle_subject.inspect()
+
+    def reset(self) -> None:
+        """Discard per-battle snapshot, monster, and log observer state."""
+        previous_log_entries = self.log_entries
+        self.battle_subject.detach(previous_log_entries)
+        self.battle_subject.snap = None
+        self.snap = None
+        self.overview_monsters = OverviewMonsters()
+        self.log_entries = LogEntry()
+        self.battle_subject.attach(self.log_entries)
 
     def update_overview_monsters(self) -> None:
         self.overview_monsters.alive_monster = [

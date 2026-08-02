@@ -73,6 +73,10 @@ class BuffManager:
         self.skill2turn[key] = max(self.skill2turn[key], turns)
         return turns
 
+    def get_observed_max_turns(self, key: str) -> int:
+        """Return the largest duration observed for a buff in this session."""
+        return self.skill2turn[key]
+
     async def _cast_skill(self, key: str) -> bool:
         iscast = await self._skill_manager.cast(key)
         if iscast:
@@ -93,6 +97,11 @@ class BuffManager:
         else:
             return bool(remaining_turns >= 0)
 
+    def is_action_needed(self, key: str, *, force: bool = False) -> bool:
+        """Return whether the requested buff action should currently run."""
+        buff_key = SKILLS_TO_CHARACTER_BUFFS.get(key, key)
+        return force or not self.has_buff(buff_key)
+
     async def _apply_hybrid_buff(self, key: str, item_name: str) -> bool:
         """
         Apply buff that can be cast from both item and skill.
@@ -107,11 +116,7 @@ class BuffManager:
         """
         Apply the buff if it is not already active.
         """
-        if key in SKILLS_TO_CHARACTER_BUFFS:
-            buff_key = SKILLS_TO_CHARACTER_BUFFS[key]
-        else:
-            buff_key = key
-        if all([not force, self.has_buff(buff_key)]):
+        if not self.is_action_needed(key, force=force):
             return False
 
         # Special cases
@@ -127,7 +132,6 @@ class BuffManager:
             return await self._item_provider.use(key)
 
         if key in SKILL_BUFFS:
-            await self._item_provider.use("mystic gem")
             return await self._cast_skill(key)
 
         raise ValueError(f"Unknown buff key: {key}")

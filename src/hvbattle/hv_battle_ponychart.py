@@ -1,5 +1,6 @@
 import asyncio
-import sys
+import shutil
+import tempfile
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -40,8 +41,18 @@ def preload_ponychart_classifier() -> None:
 
 
 class PonyChart:
-    def __init__(self, driver: HVDriver) -> None:
+    def __init__(
+        self,
+        driver: HVDriver,
+        *,
+        diagnostic_directory: Path | None = None,
+        diagnostic_file_limit: int = 20,
+    ) -> None:
+        if diagnostic_file_limit < 1:
+            raise ValueError("diagnostic_file_limit must be at least 1")
         self.hvdriver = driver
+        self._diagnostic_directory = diagnostic_directory
+        self._diagnostic_file_limit = diagnostic_file_limit
 
     @property
     def page(self) -> Any:
@@ -95,7 +106,7 @@ class PonyChart:
         raise TimeoutError("PonyChart image did not finish loading in time")
 
     async def _save_pony_chart_image(self) -> str:
-        """保存 PonyChart 圖片到 pony_chart 資料夾，回傳檔案路徑。"""
+        """Capture one challenge in a temporary file for classifier input."""
         await self._wait_for_image_loaded()
 
         riddleimage_div = await self.page.select("#riddleimage")
@@ -105,23 +116,45 @@ class PonyChart:
         if not img_src:
             raise ValueError("無法獲取圖片 src")
 
-        if (
-            hasattr(sys.modules["__main__"], "__file__")
-            and sys.modules["__main__"].__file__
-        ):
-            main_script_dir = Path(sys.modules["__main__"].__file__).resolve().parent
-        else:
-            raise RuntimeError("無法獲取主執行檔案的目錄，請確保在正確的環境中運行。")
-
-        pony_chart_dir = main_script_dir / "pony_chart"
-        pony_chart_dir.mkdir(exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"pony_chart_{timestamp}.png"
-        filepath = pony_chart_dir / filename
-
-        await img_element.save_screenshot(str(filepath))
+        with tempfile.NamedTemporaryFile(
+            prefix="hvbattle-ponychart-",
+            suffix=".png",
+            delete=False,
+        ) as temporary:
+            filepath = Path(temporary.name)
+        try:
+            await img_element.save_screenshot(str(filepath))
+        except BaseException:
+            filepath.unlink(missing_ok=True)
+            raise
         return str(filepath)
+
+    def _retain_diagnostic(self, img_path: str) -> Path | None:
+        """Retain a bounded failure artifact only when explicitly configured."""
+        if self._diagnostic_directory is None:
+            return None
+
+        try:
+            directory = self._diagnostic_directory
+            directory.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            destination = directory / f"pony_chart_failure_{timestamp}.png"
+            shutil.copyfile(img_path, destination)
+
+            diagnostics = sorted(
+                (
+                    candidate
+                    for candidate in directory.glob("pony_chart_failure_*.png")
+                    if candidate.is_file()
+                ),
+                key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name),
+            )
+            for obsolete in diagnostics[: -self._diagnostic_file_limit]:
+                obsolete.unlink()
+        except OSError as error:
+            logger.warning("Unable to retain PonyChart diagnostic: %r", error)
+            return None
+        return destination
 
     async def _auto_answer(self, img_path: str) -> frozenset[str] | None:
         """模型推論後依角色名稱比對 label 文字並點擊。"""
@@ -165,65 +198,89 @@ class PonyChart:
             return isponychart
 
         img_path = await self._save_pony_chart_image()
+        diagnostic_retained: Path | None = None
+        diagnostic_attempted = False
 
-        if not self.hvdriver.headless:
-            notify("PonyChart", "PonyChart detected")
+        def retain_diagnostic_once() -> Path | None:
+            nonlocal diagnostic_attempted, diagnostic_retained
+            if not diagnostic_attempted:
+                diagnostic_attempted = True
+                diagnostic_retained = self._retain_diagnostic(img_path)
+            return diagnostic_retained
 
         try:
-            await self._auto_answer(img_path)
-        except Exception as e:  # pragma: no cover
-            if is_connection_error(e):
-                raise
-            logger.error(f"[PonyChart] Auto-check failed: {e}")
+            if not self.hvdriver.headless:
+                notify("PonyChart", "PonyChart detected")
 
-        wait_seconds = 10
-        waitlimit = wait_seconds
-        while waitlimit > 0 and await self._check():
-            await asyncio.sleep(1)
-            waitlimit -= 1
-
-        if waitlimit <= 1 and await self._check():
-            logger.info(
-                "[PonyChart] Auto-answer did not trigger submission within "
-                f"{wait_seconds}s, attempting fallback submit"
-            )
-            clicked = False
             try:
-                submit_elements = await self.hvdriver.page.xpath(
-                    "//input[@type='submit' and @value='Submit Answer']", timeout=2
-                )
-                if submit_elements:
-                    await submit_elements[0].click()
-                    clicked = True
+                await self._auto_answer(img_path)
             except Exception as e:
                 if is_connection_error(e):
                     raise
+                retained = retain_diagnostic_once()
+                logger.error(
+                    "[PonyChart] Auto-check failed: %r diagnostic=%s",
+                    e,
+                    retained,
+                )
 
-            if not clicked:
+            wait_seconds = 10
+            waitlimit = wait_seconds
+            while waitlimit > 0 and await self._check():
+                await asyncio.sleep(1)
+                waitlimit -= 1
+
+            if waitlimit <= 1 and await self._check():
+                logger.info(
+                    "[PonyChart] Auto-answer did not trigger submission within "
+                    "%ds, attempting fallback submit",
+                    wait_seconds,
+                )
+                clicked = False
                 try:
-                    riddle_submit = await self.hvdriver.page.select("#riddlesubmit")
-                    await riddle_submit.click()
-                    clicked = True
-                except Exception as e2:
-                    if is_connection_error(e2):
+                    submit_elements = await self.hvdriver.page.xpath(
+                        "//input[@type='submit' and @value='Submit Answer']",
+                        timeout=2,
+                    )
+                    if submit_elements:
+                        await submit_elements[0].click()
+                        clicked = True
+                except Exception as e:
+                    if is_connection_error(e):
                         raise
 
-            await asyncio.sleep(1)
-            if await self._check():
-                logger.warning(
-                    f"[PonyChart] Fallback submit click did not dismiss riddle "
-                    f"(clicked={clicked}); likely auto-failed by game timeout"
-                )
-                raise PonyChartResolutionError(
-                    "PonyChart remained present after fallback submission"
-                )
-            else:
+                if not clicked:
+                    try:
+                        riddle_submit = await self.hvdriver.page.select("#riddlesubmit")
+                        await riddle_submit.click()
+                        clicked = True
+                    except Exception as e2:
+                        if is_connection_error(e2):
+                            raise
+
+                await asyncio.sleep(1)
+                if await self._check():
+                    retained = retain_diagnostic_once()
+                    logger.warning(
+                        "[PonyChart] Fallback submit click did not dismiss riddle "
+                        "(clicked=%s); likely auto-failed by game timeout; "
+                        "diagnostic=%s",
+                        clicked,
+                        retained,
+                    )
+                    raise PonyChartResolutionError(
+                        "PonyChart remained present after fallback submission"
+                    )
+
                 logger.info(
-                    f"[PonyChart] Fallback submit click dismissed riddle "
-                    f"(clicked={clicked})"
+                    "[PonyChart] Fallback submit click dismissed riddle "
+                    "(clicked=%s)",
+                    clicked,
                 )
+                return isponychart
+
+            await asyncio.sleep(1)
+
             return isponychart
-
-        await asyncio.sleep(1)
-
-        return isponychart
+        finally:
+            Path(img_path).unlink(missing_ok=True)

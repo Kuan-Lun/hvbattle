@@ -12,7 +12,6 @@ from hvbrowser import HVDriver
 from hvbrowser.runtime import ElementAction, setup_logger
 
 from .contracts import BattleActionOutcomeUnknownError
-from .hv_battle_observer_pattern import BattleDashboard
 
 logger = setup_logger(__name__)
 
@@ -507,15 +506,10 @@ def _confirmed_transition_evidence(
 
 
 class ElementActionManager:
-    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashboard) -> None:
+    def __init__(self, driver: HVDriver) -> None:
         self.hvdriver = driver
-        self.battle_dashboard = battle_dashboard
         self._action = ElementAction(lambda: driver.page)
-        shared_lock = getattr(driver, "_hvbattle_action_lock", None)
-        if not isinstance(shared_lock, asyncio.Lock):
-            shared_lock = asyncio.Lock()
-            setattr(driver, "_hvbattle_action_lock", shared_lock)
-        self._action_lock: asyncio.Lock = shared_lock
+        self._action_lock = asyncio.Lock()
 
     @property
     def page(self) -> Any:

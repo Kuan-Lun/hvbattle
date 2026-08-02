@@ -10,10 +10,26 @@ client-supplied `BattleStrategy`. It never repairs equipment, recovers stamina,
 or starts Arena/GrindFest on its own. Campaign policy and post-battle work belong
 to the calling application.
 
+`BattleSession` is a facade, not an `HVDriver` subclass. It composes an explicit
+`browser_client`, a battle-scoped state store, a battle launcher, and shared
+action/item/skill/buff collaborators. Callers that also need non-battle
+`hvbrowser` operations use `session.browser_client` explicitly; this prevents
+maintenance APIs from leaking into the battle-domain surface. The legacy
+`battle_dashboard` name remains a compatibility alias for the state store.
+
+Turn preparation uses `BattleTurnState` and `BattleTurnPhase` to distinguish an
+active turn, next-floor transition, PonyChart challenge, positive completion,
+and an absent battle page. `BattleRunner` consumes this typed state directly;
+the former sentinel-returning `prepare_turn()` remains only as a compatibility
+adapter.
+
 `BattleSession` preloads the PonyChart classifier and ONNX model before opening
 the browser, so a timed challenge never pays the first-load cost. The runner
 checks for and resolves PonyChart before parsing an ordinary battle turn or
-calling client strategy code.
+calling client strategy code. Classifier screenshots are temporary and removed
+after every attempt. Failure artifacts are retained only when
+`ponychart_diagnostic_directory` is explicitly configured, and that directory
+is bounded by `ponychart_diagnostic_file_limit`.
 
 ```python
 import asyncio

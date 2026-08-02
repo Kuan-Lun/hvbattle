@@ -47,6 +47,37 @@ class BattleActionOutcomeUnknownError(RuntimeError):
     """A submitted action did not produce authoritative completion evidence."""
 
 
+class BattleTurnPhase(StrEnum):
+    """The explicit page state observed while preparing a strategy decision."""
+
+    ABSENT = "absent"
+    CHALLENGE = "challenge"
+    ACTIVE = "active"
+    NEXT_FLOOR = "next-floor"
+    COMPLETE = "complete"
+
+
+@dataclass(frozen=True, slots=True)
+class BattleTurnState:
+    """One typed turn-preparation result without sentinel return values."""
+
+    phase: BattleTurnPhase
+    log_lines: tuple[str, ...] = ()
+
+    @property
+    def actionable(self) -> bool:
+        """Whether the state needs an action to advance the battle."""
+        return self.phase in {
+            BattleTurnPhase.ACTIVE,
+            BattleTurnPhase.NEXT_FLOOR,
+        }
+
+    @property
+    def strategy_actionable(self) -> bool:
+        """Whether client strategy code should make a policy decision."""
+        return self.phase is BattleTurnPhase.ACTIVE
+
+
 class TurnDecision(StrEnum):
     """What the single-battle runner should do after a strategy decision."""
 

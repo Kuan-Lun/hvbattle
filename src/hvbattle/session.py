@@ -1,20 +1,26 @@
 """State inspection and atomic actions for one HentaiVerse battle session."""
 
 import asyncio
-import json
-import re
-from typing import Any, cast
+from pathlib import Path
+from typing import Any, Self
 
 from hv_bie.types import BattleSnapshot
-from hvbrowser import HENTAIVERSE_ROOT_URL, HVDriver
+from hvbrowser import HVDriver
 from hvbrowser.runtime import is_connection_error, setup_logger
 from zendriver import cdp
 
-from .contracts import ArenaOption, GrindfestOption
+from .battle_launcher import BattleLauncher
+from .battle_state import BattleStateStore
+from .contracts import (
+    ArenaOption,
+    BattleInterruptedError,
+    BattleTurnPhase,
+    BattleTurnState,
+    GrindfestOption,
+)
 from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_buff_manager import BuffManager
 from .hv_battle_item_provider import ItemProvider
-from .hv_battle_observer_pattern import BattleDashboard
 from .hv_battle_ponychart import PonyChart, preload_ponychart_classifier
 from .hv_battle_skill_manager import SkillManager
 
@@ -38,18 +44,38 @@ _BATTLE_PHASE_JS = r"""
 """
 
 
-class BattleSession(HVDriver):
-    """Reusable battle state and action facade without a concrete policy."""
+class BattleSession:
+    """Battle facade backed by one explicitly composed browser client."""
 
     def __init__(
         self,
         *args: Any,
         auto_accept_dialogs: bool = False,
+        browser_client: HVDriver | None = None,
+        ponychart_diagnostic_directory: str | Path | None = None,
+        ponychart_diagnostic_file_limit: int = 20,
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        if browser_client is not None and (args or kwargs):
+            raise TypeError(
+                "Browser options cannot be combined with an injected browser_client"
+            )
+        self.browser_client = (
+            browser_client if browser_client is not None else HVDriver(*args, **kwargs)
+        )
         self.auto_accept_dialogs = auto_accept_dialogs
-        self.battle_dashboard: BattleDashboard | None = None
+        diagnostic_directory = (
+            Path(ponychart_diagnostic_directory)
+            if ponychart_diagnostic_directory is not None
+            else None
+        )
+        self._ponychart = PonyChart(
+            self.browser_client,
+            diagnostic_directory=diagnostic_directory,
+            diagnostic_file_limit=ponychart_diagnostic_file_limit,
+        )
+        self._launcher = BattleLauncher(self.browser_client)
+        self.battle_state: BattleStateStore | None = None
         self.element_action_manager: ElementActionManager | None = None
         self._item_provider: ItemProvider | None = None
         self._skill_manager: SkillManager | None = None
@@ -59,22 +85,102 @@ class BattleSession(HVDriver):
         self._missing_round_metadata_logged = False
         self.turn = -1
         self.round = -1
+        self._initialize_battle_components()
+
+    @property
+    def page(self) -> Any:
+        """Expose the battle page while keeping the full client explicit."""
+        client = self.__dict__.get("browser_client")
+        if client is not None:
+            return client.page
+        return self.__dict__["_page_override"]
+
+    @page.setter
+    def page(self, value: Any) -> None:
+        """Keep lightweight, uninitialized test doubles usable."""
+        client = self.__dict__.get("browser_client")
+        if client is not None:
+            client.page = value
+        else:
+            self.__dict__["_page_override"] = value
+
+    @property
+    def headless(self) -> bool:
+        return bool(self.browser_client.headless)
+
+    @property
+    def battle_dashboard(self) -> BattleStateStore | None:
+        """Compatibility alias for the former observer-oriented state name."""
+        return self.__dict__.get("battle_state")
+
+    @battle_dashboard.setter
+    def battle_dashboard(self, value: BattleStateStore | None) -> None:
+        current = self.__dict__.get("battle_state")
+        component_graph_exists = any(
+            self.__dict__.get(name) is not None
+            for name in (
+                "element_action_manager",
+                "_item_provider",
+                "_skill_manager",
+                "_buff_manager",
+            )
+        )
+        if component_graph_exists and value is not current:
+            raise AttributeError(
+                "battle_dashboard is a read-only compatibility alias after "
+                "battle components are initialized"
+            )
+        self.battle_state = value
+
+    @property
+    async def is_isekai(self) -> bool:
+        """Expose the realm needed by battle-run completion results."""
+        return bool(await self.browser_client.is_isekai)
+
+    async def __aenter__(self) -> Self:
+        try:
+            await self._init_browser()
+            await self.browser_client.login()
+            await self.browser_client.gohomepage()
+        except BaseException as error:
+            await self.__aexit__(type(error), error, error.__traceback__)
+            raise
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: Any,
+        exc_value: Any,
+        traceback: Any,
+    ) -> None:
+        await self.browser_client.__aexit__(exc_type, exc_value, traceback)
 
     async def _init_browser(self) -> None:
         await asyncio.to_thread(preload_ponychart_classifier)
-        await super()._init_browser()
+        await self.browser_client._init_browser()
         if self.auto_accept_dialogs:
             await self._setup_alert_handler()
-        self._initialize_battle_components()
 
     def _initialize_battle_components(self) -> None:
         """Create battle adapters without parsing a non-battle login page."""
-        dashboard = BattleDashboard(self)
-        self.battle_dashboard = dashboard
-        self.element_action_manager = ElementActionManager(self, dashboard)
-        self._item_provider = ItemProvider(self, dashboard)
-        self._skill_manager = SkillManager(self, dashboard)
-        self._buff_manager = BuffManager(self, dashboard)
+        if self.battle_state is not None:
+            return
+        state_store = BattleStateStore(self.browser_client)
+        actions = ElementActionManager(self.browser_client)
+        items = ItemProvider(self.browser_client, state_store, actions)
+        skills = SkillManager(self.browser_client, state_store, actions)
+        buffs = BuffManager(
+            self.browser_client,
+            state_store,
+            actions,
+            items,
+            skills,
+        )
+        self.battle_state = state_store
+        self.element_action_manager = actions
+        self._item_provider = items
+        self._skill_manager = skills
+        self._buff_manager = buffs
 
     async def _setup_alert_handler(self) -> None:
         async def dialog_handler(
@@ -98,10 +204,10 @@ class BattleSession(HVDriver):
 
         self.page.add_handler(cdp.page.JavascriptDialogOpening, dialog_handler)
 
-    def _dashboard(self) -> BattleDashboard:
-        if self.battle_dashboard is None:
+    def _state(self) -> BattleStateStore:
+        if self.battle_state is None:
             raise RuntimeError("Battle components have not been initialized")
-        return self.battle_dashboard
+        return self.battle_state
 
     def _actions(self) -> ElementActionManager:
         if self.element_action_manager is None:
@@ -125,39 +231,39 @@ class BattleSession(HVDriver):
 
     @property
     def snapshot(self) -> BattleSnapshot:
-        snapshot = self._dashboard().snap
+        snapshot = self._state().snap
         if snapshot is None:
             raise RuntimeError("No battle snapshot is available before prepare_turn()")
-        return cast(BattleSnapshot, snapshot)
+        return snapshot
 
     @property
     def alive_monster_ids(self) -> tuple[int, ...]:
-        return tuple(self._dashboard().overview_monsters.alive_monster)
+        return tuple(self._state().overview_monsters.alive_monster)
 
     @property
     def alive_monster_ids_by_name(self) -> dict[str, int]:
-        return dict(self._dashboard().overview_monsters.alive_monster_name)
+        return dict(self._state().overview_monsters.alive_monster_name)
 
     def monster_ids_with_buff(self, buff: str) -> tuple[int, ...]:
         return tuple(
-            self._dashboard().overview_monsters.alive_monster_with_buff.get(buff, ())
+            self._state().overview_monsters.alive_monster_with_buff.get(buff, ())
         )
 
     @property
     def current_round(self) -> int:
-        return self._dashboard().log_entries.current_round
+        return self._state().log_entries.current_round
 
     @property
     def total_rounds(self) -> int:
-        return self._dashboard().log_entries.total_round
+        return self._state().log_entries.total_round
 
     def reset_battle_tracking(self) -> None:
         self.turn = -1
         self.round = -1
         self._completion_observed = False
         self._missing_round_metadata_logged = False
-        if self.battle_dashboard is not None:
-            self.battle_dashboard.reset()
+        if self.battle_state is not None:
+            self.battle_state.reset()
 
     def _round_progress_text(self) -> str:
         """Render unavailable resumed-battle metadata without inventing round zero."""
@@ -166,32 +272,37 @@ class BattleSession(HVDriver):
         return f"Round {self.current_round:>3} / {self.total_rounds:<3}"
 
     async def prepare_turn(self) -> tuple[str, ...] | None:
-        """Refresh one actionable turn, or return ``None`` at a transition."""
+        """Compatibility adapter for the former sentinel-based turn API."""
+        state = await self.prepare_turn_state()
+        return state.log_lines if state.actionable else None
+
+    async def prepare_turn_state(self) -> BattleTurnState:
+        """Refresh the page and return one explicit turn-preparation state."""
         if not await self._has_battle_marker():
-            return None
+            return BattleTurnState(BattleTurnPhase.ABSENT)
 
         phase = await self._read_battle_phase()
         if phase == _BATTLE_PHASE_COMPLETE:
             self._completion_observed = True
             logger.info("Final battle completion control is ready.")
-            return None
+            return BattleTurnState(BattleTurnPhase.COMPLETE)
         if phase == _BATTLE_PHASE_NEXT_FLOOR:
             return self._prepare_round_transition()
         if await self.is_ponychart_present():
-            return None
+            return BattleTurnState(BattleTurnPhase.CHALLENGE)
 
         try:
-            await self._dashboard().update()
+            await self._state().update()
         except Exception as error:
             if is_connection_error(error):
                 raise
             if await self.is_ponychart_present():
-                return None
+                return BattleTurnState(BattleTurnPhase.CHALLENGE)
             phase = await self._read_battle_phase()
             if phase == _BATTLE_PHASE_COMPLETE:
                 self._completion_observed = True
                 logger.info("Final battle completion control appeared while parsing.")
-                return None
+                return BattleTurnState(BattleTurnPhase.COMPLETE)
             if phase == _BATTLE_PHASE_NEXT_FLOOR:
                 return self._prepare_round_transition()
             raise
@@ -200,7 +311,7 @@ class BattleSession(HVDriver):
         if phase == _BATTLE_PHASE_COMPLETE:
             self._completion_observed = True
             logger.info("Final battle completion control appeared after parsing.")
-            return None
+            return BattleTurnState(BattleTurnPhase.COMPLETE)
         if phase == _BATTLE_PHASE_NEXT_FLOOR:
             return self._prepare_round_transition()
         if self.snapshot.warnings:
@@ -227,21 +338,21 @@ class BattleSession(HVDriver):
             self._missing_round_metadata_logged = True
         lines = tuple(
             f"{turn_text} {round_text} {line}"
-            for line in self._dashboard().log_entries.current_lines
+            for line in self._state().log_entries.current_lines
         )
         for line in lines:
             logger.info(line)
-        return lines
+        return BattleTurnState(BattleTurnPhase.ACTIVE, lines)
 
-    def _prepare_round_transition(self) -> tuple[str, ...]:
+    def _prepare_round_transition(self) -> BattleTurnState:
         """Expose a transition as a strategy decision without parsing monsters."""
         self.turn += 1
         logger.info("Turn %5d: next-round control is ready.", self.turn)
-        return ()
+        return BattleTurnState(BattleTurnPhase.NEXT_FLOOR)
 
     async def is_ponychart_present(self) -> bool:
         """Inspect challenge presence without parsing ordinary battle HTML."""
-        return await PonyChart(self).is_present()
+        return await self._ponychart.is_present()
 
     async def _read_battle_phase(self) -> str:
         """Read final and next-floor controls atomically, with final priority."""
@@ -261,19 +372,36 @@ class BattleSession(HVDriver):
     async def _has_battle_marker(self) -> bool:
         return bool(await self.page.xpath("//*[@id='battle_main']", timeout=2))
 
+    @property
+    def hp_percent(self) -> float:
+        return float(self.snapshot.player.hp_percent)
+
+    @property
+    def mp_percent(self) -> float:
+        return float(self.snapshot.player.mp_percent)
+
+    @property
+    def sp_percent(self) -> float:
+        return float(self.snapshot.player.sp_percent)
+
+    @property
+    def overcharge(self) -> float:
+        """Return the raw overcharge value; it is not a percentage."""
+        return float(self.snapshot.player.overcharge_value)
+
     def get_stat_percent(self, stat: str) -> float:
-        match stat.lower():
+        """Compatibility adapter; new code should use the named properties."""
+        match stat.casefold():
             case "hp":
-                value = self.snapshot.player.hp_percent
+                return self.hp_percent
             case "mp":
-                value = self.snapshot.player.mp_percent
+                return self.mp_percent
             case "sp":
-                value = self.snapshot.player.sp_percent
+                return self.sp_percent
             case "overcharge":
-                value = self.snapshot.player.overcharge_value
+                return self.overcharge
             case _:
                 raise ValueError(f"Unknown stat: {stat}")
-        return float(value)
 
     async def cast_skill(self, key: str) -> bool:
         """Cast a non-targeted skill and wait for the resulting game action."""
@@ -316,7 +444,17 @@ class BattleSession(HVDriver):
     async def attack_monster_by_skill(self, slot: int, skill_name: str) -> bool:
         if not await self.select_targeted_skill(skill_name):
             return False
-        return await self.attack_monster(slot)
+        try:
+            acted = await self.attack_monster(slot)
+        except Exception as error:
+            raise BattleInterruptedError(
+                f"Target submission did not clear armed skill {skill_name!r}"
+            ) from error
+        if not acted:
+            raise BattleInterruptedError(
+                f"Target disappeared while skill {skill_name!r} was armed"
+            )
+        return True
 
     @property
     def battle_completion_observed(self) -> bool:
@@ -324,27 +462,13 @@ class BattleSession(HVDriver):
         return self._completion_observed
 
     async def resolve_ponychart(self) -> bool:
-        return await PonyChart(self).check()
-
-    async def _goto_via_battle_menu(self, label: str) -> bool:
-        battle_menu = await self.page.select("#parent_Battle")
-        target_elements = await self.page.xpath(
-            f"//div[contains(text(), '{label}')]", timeout=5
-        )
-        if not target_elements:
-            logger.warning("Unable to find %r in the Battle menu", label)
-            return False
-
-        await battle_menu.mouse_move()
-        await target_elements[0].mouse_move()
-        await self.wait(target_elements[0].mouse_click, ischangeurl=True)
-        return True
+        return await self._ponychart.check()
 
     async def goto_arena(self) -> bool:
-        return await self._goto_via_battle_menu("The Arena")
+        return await self._launcher.goto_arena()
 
     async def goto_grindfest(self) -> bool:
-        return await self._goto_via_battle_menu("GrindFest")
+        return await self._launcher.goto_grindfest()
 
     async def go_next_floor(self) -> bool:
         elements = await self.page.query_selector_all("#btcp")
@@ -354,120 +478,16 @@ class BattleSession(HVDriver):
         return True
 
     async def list_arena_options(self) -> tuple[ArenaOption, ...]:
-        """Return Arena choices without selecting one for the client."""
-        onclick_list = await self.page.evaluate("""
-            (() => {
-                const imgs = document.querySelectorAll(
-                    'img[onclick*="init_battle"]'
-                );
-                return Array.from(imgs).map(
-                    (el) => el.getAttribute('onclick') || ''
-                );
-            })()
-            """)
-        options: list[ArenaOption] = []
-        for onclick in onclick_list or ():
-            match = re.match(
-                r"init_battle\(\s*(\d+)\s*,\s*(\d+)\s*"
-                r"(?:,\s*['\"]([^'\"]*)['\"]\s*)?\)",
-                onclick,
-            )
-            if not match:
-                logger.debug("Arena action did not match: %s", onclick)
-                continue
-            options.append(
-                ArenaOption(battle_id=int(match.group(1)), token=match.group(3))
-            )
-        return tuple(options)
+        return await self._launcher.list_arena_options()
 
     async def start_arena(self, option: ArenaOption) -> bool:
-        """Submit one Arena option explicitly selected by the caller."""
-        path_prefix = await self._get_path_prefix()
-        arena_url = f"{HENTAIVERSE_ROOT_URL}{path_prefix}/?s=Battle&ss=ar"
-        current_url = await self.page.evaluate("window.location.href")
-        if current_url != arena_url:
-            return False
-
-        token_js = json.dumps(option.token)
-        try:
-            submitted = await self.page.evaluate(f"""
-                (() => {{
-                    const initid = document.getElementById('initid');
-                    const initform = document.getElementById('initform');
-                    if (!initid || !initform) return false;
-                    initid.value = '{option.battle_id}';
-                    const tokenVal = {token_js};
-                    if (tokenVal !== null) {{
-                        const inittoken = document.getElementById('inittoken');
-                        if (inittoken) inittoken.value = tokenVal;
-                    }}
-                    initform.submit();
-                    return true;
-                }})()
-                """)
-        except Exception:
-            logger.exception("Arena battle form submission outcome is unknown")
-            raise
-        if submitted is not True:
-            logger.warning("Arena battle form was not submitted")
-            return False
-
-        logger.info(
-            "Started Arena battle id=%s token=%s",
-            option.battle_id,
-            "<present>" if option.token else "<none>",
-        )
-        return True
+        return await self._launcher.start_arena(option)
 
     async def list_grindfest_options(self) -> tuple[GrindfestOption, ...]:
-        """Return GrindFest choices without selecting one for the client."""
-        onclick_list = await self.page.evaluate("""
-            (() => {
-                const imgs = document.querySelectorAll(
-                    '#grindfest img[onclick*="init_battle"]'
-                );
-                return Array.from(imgs).map(
-                    (el) => el.getAttribute('onclick') || ''
-                );
-            })()
-            """)
-        options: list[GrindfestOption] = []
-        for onclick in onclick_list or ():
-            match = re.match(r"init_battle\(\s*(\d+)\s*\)", onclick)
-            if not match:
-                logger.debug("GrindFest action did not match: %s", onclick)
-                continue
-            options.append(GrindfestOption(battle_id=int(match.group(1))))
-        return tuple(options)
+        return await self._launcher.list_grindfest_options()
 
     async def start_grindfest(self, option: GrindfestOption) -> bool:
-        """Submit one GrindFest option explicitly selected by the caller."""
-        path_prefix = await self._get_path_prefix()
-        grindfest_url = f"{HENTAIVERSE_ROOT_URL}{path_prefix}/?s=Battle&ss=gr"
-        current_url = await self.page.evaluate("window.location.href")
-        if current_url != grindfest_url:
-            return False
-
-        try:
-            submitted = await self.page.evaluate(f"""
-                (() => {{
-                    const initid = document.getElementById('initid');
-                    const initform = document.getElementById('initform');
-                    if (!initid || !initform) return false;
-                    initid.value = '{option.battle_id}';
-                    initform.submit();
-                    return true;
-                }})()
-                """)
-        except Exception:
-            logger.exception("GrindFest battle form submission outcome is unknown")
-            raise
-        if submitted is not True:
-            logger.warning("GrindFest battle form was not submitted")
-            return False
-
-        logger.info("Started GrindFest id=%s", option.battle_id)
-        return True
+        return await self._launcher.start_grindfest(option)
 
     async def is_in_battle(self) -> bool:
         """Return whether the current page represents an active battle."""
@@ -488,7 +508,7 @@ class BattleSession(HVDriver):
         last_error: Exception | None = None
         for attempt in range(2):
             try:
-                snapshot = await self._dashboard().inspect()
+                snapshot = await self._state().inspect()
                 if any(monster.alive for monster in snapshot.monsters.values()):
                     return True
                 if await self.is_ponychart_present():

@@ -1,28 +1,34 @@
 from collections import defaultdict
 from typing import Any
 
+from hv_bie.types import BattleSnapshot
 from hvbrowser import HVDriver
 
+from .battle_state import BattleStateStore
 from .hv_battle_action_manager import ElementActionManager
-from .hv_battle_observer_pattern import BattleDashboard
 
 
 class SkillManager:
     def __init__(
         self,
         driver: HVDriver,
-        battle_dashboard: BattleDashboard,
+        state_store: BattleStateStore,
+        element_action_manager: ElementActionManager,
     ) -> None:
         self.hvdriver = driver
-        self.battle_dashboard = battle_dashboard
-        self.element_action_manager = ElementActionManager(
-            self.hvdriver, self.battle_dashboard
-        )
+        self.state_store = state_store
+        self.element_action_manager = element_action_manager
         self.skills_cost: dict[str, int] = defaultdict(lambda: 1)
 
     @property
     def page(self) -> Any:
         return self.hvdriver.page
+
+    def _snapshot(self) -> BattleSnapshot:
+        snapshot = self.state_store.snap
+        if snapshot is None:
+            raise RuntimeError("No battle snapshot is available")
+        return snapshot
 
     async def _is_pane_visible(self, pane_id: str) -> bool:
         element = await self.page.select(f"#{pane_id}")
@@ -59,9 +65,10 @@ class SkillManager:
         )
 
         if ability.available:
-            if key in self.battle_dashboard.snap.abilities.skills:
+            snapshot = self._snapshot()
+            if key in snapshot.abilities.skills:
                 await self.open_skills_menu()
-            if key in self.battle_dashboard.snap.abilities.spells:
+            if key in snapshot.abilities.spells:
                 await self.open_spells_menu()
             await self._click_skill(ability.element_id, iswait)
             return True
@@ -69,10 +76,8 @@ class SkillManager:
             return False
 
     def get_skills_and_spells(self) -> dict[str, Any]:
-        return (  # type: ignore[no-any-return]
-            self.battle_dashboard.snap.abilities.skills
-            | self.battle_dashboard.snap.abilities.spells
-        )
+        snapshot = self._snapshot()
+        return snapshot.abilities.skills | snapshot.abilities.spells
 
     def get_max_skill_mp_cost_by_name(self, skill_name: str) -> int:
         if skill_name not in self.get_skills_and_spells():

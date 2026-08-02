@@ -13,6 +13,8 @@ class PublicApiTests(unittest.TestCase):
 
         self.assertTrue(hasattr(hvbattle, "BattleSession"))
         self.assertTrue(hasattr(hvbattle, "BattleRunner"))
+        self.assertTrue(hasattr(hvbattle, "BattleTurnPhase"))
+        self.assertTrue(hasattr(hvbattle, "BattleTurnState"))
         self.assertTrue(hasattr(hvbattle, "BattleStrategy"))
         self.assertTrue(hasattr(hvbattle, "BaseControlPanel"))
         self.assertTrue(hasattr(hvbattle, "ControlPanel"))

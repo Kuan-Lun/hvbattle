@@ -1,13 +1,13 @@
 """Public battle-domain API."""
 
-from hvbrowser.runtime import notify
-
 from .contracts import (
     ArenaOption,
     BattleActionOutcomeUnknownError,
     BattleCompleted,
     BattleInterruptedError,
     BattleStopped,
+    BattleTurnPhase,
+    BattleTurnState,
     GrindfestOption,
     TurnDecision,
 )
@@ -29,12 +29,13 @@ __all__ = [
     "BattleRunner",
     "BattleSession",
     "BattleStopped",
+    "BattleTurnPhase",
+    "BattleTurnState",
     "BattleStrategy",
     "ControlPanel",
     "GrindfestOption",
     "NullControlPanel",
     "PonyChartResolutionError",
     "TurnDecision",
-    "notify",
     "preload_ponychart_classifier",
 ]

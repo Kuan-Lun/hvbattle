@@ -11,6 +11,7 @@ from .contracts import (
     BattleCompleted,
     BattleInterruptedError,
     BattleStopped,
+    BattleTurnPhase,
     TurnDecision,
 )
 from .session import BattleSession
@@ -68,11 +69,15 @@ class BattleRunner:
             retry_count = 0
 
             await self.session.resolve_ponychart()
-            on_battle_started = getattr(self.strategy, "on_battle_started", None)
-            if on_battle_started is not None and inspect.iscoroutinefunction(
-                on_battle_started
-            ):
-                await on_battle_started(self.session)
+            lifecycle_declared = inspect.getattr_static(
+                self.strategy, "on_battle_started", None
+            )
+            if lifecycle_declared is not None:
+                on_battle_started = getattr(self.strategy, "on_battle_started")
+                lifecycle_result = on_battle_started(self.session)
+                if not inspect.isawaitable(lifecycle_result):
+                    raise TypeError("BattleLifecycle.on_battle_started() must be async")
+                await lifecycle_result
 
             while True:
                 try:
@@ -85,14 +90,36 @@ class BattleRunner:
                         retry_count = 0
                         continue
 
-                    prepared = await self.session.prepare_turn()
+                    prepared = await self.session.prepare_turn_state()
                     if await self.session.resolve_ponychart():
                         retry_count = 0
                         continue
-                    if prepared is None:
+                    if prepared.phase is BattleTurnPhase.CHALLENGE:
+                        # The challenge may have disappeared between the state
+                        # probe and the second resolver call.  Refresh the page
+                        # before allowing strategy code to act.
+                        continue
+                    if prepared.phase is BattleTurnPhase.COMPLETE:
+                        break
+                    if prepared.phase is BattleTurnPhase.ABSENT:
                         if await self._confirm_completion_or_transition():
                             break
                         continue
+                    if prepared.phase is BattleTurnPhase.NEXT_FLOOR:
+                        await self._wait_while_servicing_ponychart()
+                        if await self.session.resolve_ponychart():
+                            retry_count = 0
+                            continue
+                        if not await self.session.go_next_floor():
+                            raise TimeoutError(
+                                "Next-floor control disappeared before progression"
+                            )
+                        retry_count = 0
+                        continue
+                    if not prepared.strategy_actionable:
+                        raise RuntimeError(
+                            f"Unsupported battle turn phase: {prepared.phase!r}"
+                        )
 
                     await self._wait_while_servicing_ponychart()
                     if await self.session.resolve_ponychart():

@@ -1,11 +1,12 @@
 from collections import defaultdict
 from typing import Any
 
+from hv_bie.types import BattleSnapshot
 from hvbrowser import HVDriver
 
+from .battle_state import BattleStateStore
 from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_item_provider import ItemProvider
-from .hv_battle_observer_pattern import BattleDashboard
 from .hv_battle_skill_manager import SkillManager
 
 ITEM_BUFFS = {
@@ -45,19 +46,30 @@ SKILL_BUFFS = {
 
 
 class BuffManager:
-    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashboard) -> None:
+    def __init__(
+        self,
+        driver: HVDriver,
+        state_store: BattleStateStore,
+        element_action_manager: ElementActionManager,
+        item_provider: ItemProvider,
+        skill_manager: SkillManager,
+    ) -> None:
         self.hvdriver = driver
-        self.battle_dashboard = battle_dashboard
-        self._item_provider = ItemProvider(self.hvdriver, self.battle_dashboard)
-        self._skill_manager = SkillManager(self.hvdriver, self.battle_dashboard)
-        self.element_action_manager = ElementActionManager(
-            self.hvdriver, self.battle_dashboard
-        )
+        self.state_store = state_store
+        self._item_provider = item_provider
+        self._skill_manager = skill_manager
+        self.element_action_manager = element_action_manager
         self.skill2turn: dict[str, int] = defaultdict(lambda: 1)
 
     @property
     def page(self) -> Any:
         return self.hvdriver.page
+
+    def _snapshot(self) -> BattleSnapshot:
+        snapshot = self.state_store.snap
+        if snapshot is None:
+            raise RuntimeError("No battle snapshot is available")
+        return snapshot
 
     def get_buff_remaining_turns(self, key: str) -> int | float:
         """
@@ -68,7 +80,7 @@ class BuffManager:
         if self.has_buff(key) is False:
             return 0
 
-        remaining_turns = self.battle_dashboard.snap.player.buffs[key].remaining_turns
+        remaining_turns = self._snapshot().player.buffs[key].remaining_turns
         turns = int(remaining_turns)
         self.skill2turn[key] = max(self.skill2turn[key], turns)
         return turns
@@ -87,10 +99,11 @@ class BuffManager:
         """
         Check if the buff is active.
         """
-        if key not in self.battle_dashboard.snap.player.buffs:
+        snapshot = self._snapshot()
+        if key not in snapshot.player.buffs:
             return False
 
-        remaining_turns = self.battle_dashboard.snap.player.buffs[key].remaining_turns
+        remaining_turns = snapshot.player.buffs[key].remaining_turns
 
         if key in AUTOCAST_BUFFS:
             return bool(float("inf") > remaining_turns >= 0)

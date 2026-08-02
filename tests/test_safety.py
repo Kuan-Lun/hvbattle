@@ -22,10 +22,13 @@ from hvbattle import (
     BattleRunner,
     BattleSession,
     BattleStopped,
+    BattleTurnPhase,
+    BattleTurnState,
     GrindfestOption,
     PonyChartResolutionError,
     TurnDecision,
 )
+from hvbattle.battle_launcher import BattleLauncher
 from hvbattle.hv_battle_buff_manager import BuffManager
 from hvbattle.hv_battle_observer_pattern import BattleDashboard, LogEntry
 from hvbattle.hv_battle_ponychart import PonyChart
@@ -95,6 +98,14 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(acted)
         session.select_targeted_skill.assert_awaited_once_with("imperil")
         session.attack_monster.assert_not_awaited()
+
+    async def test_armed_skill_with_missing_target_interrupts(self) -> None:
+        session = object.__new__(BattleSession)
+        session.select_targeted_skill = AsyncMock(return_value=True)
+        session.attack_monster = AsyncMock(return_value=False)
+
+        with self.assertRaisesRegex(BattleInterruptedError, "Target disappeared"):
+            await BattleSession.attack_monster_by_skill(session, 3, "imperil")
 
     async def test_challenge_presence_is_checked_before_dashboard_parse(self) -> None:
         session = object.__new__(BattleSession)
@@ -368,6 +379,7 @@ class _FakeSession:
         self.recoverstamina = AsyncMock()
         self.goto_arena = AsyncMock()
         self.goto_grindfest = AsyncMock()
+        self.go_next_floor = AsyncMock(return_value=True)
 
     @property
     async def is_isekai(self) -> bool:
@@ -380,11 +392,11 @@ class _FakeSession:
         self.turn = -1
         self.battle_completion_observed = False
 
-    async def prepare_turn(self) -> tuple[str, ...] | None:
+    async def prepare_turn_state(self) -> BattleTurnState:
         if not self._active:
-            return None
+            return BattleTurnState(BattleTurnPhase.ABSENT)
         self.turn += 1
-        return ()
+        return BattleTurnState(BattleTurnPhase.ACTIVE)
 
     async def resolve_ponychart(self) -> bool:
         return False
@@ -514,6 +526,22 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(events.index("started"), events.index("strategy"))
         self.assertEqual(events.count("strategy"), 1)
 
+    async def test_synchronous_lifecycle_hook_is_rejected(self) -> None:
+        session = _FakeSession(active=True)
+        strategy = Mock()
+        strategy.on_battle_started = Mock(return_value=None)
+        strategy.take_turn = AsyncMock()
+
+        with self.assertRaises(BattleInterruptedError) as raised:
+            await BattleRunner(
+                session,  # type: ignore[arg-type]
+                strategy,
+                sleep=AsyncMock(),
+            ).run_current()
+
+        self.assertIsInstance(raised.exception.__cause__, TypeError)
+        strategy.take_turn.assert_not_awaited()
+
     async def test_page_exit_without_completion_evidence_is_interrupted(self) -> None:
         session = _FakeSession(active=True)
         strategy = Mock()
@@ -536,7 +564,9 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_action_outcome_is_never_retried(self) -> None:
         session = _FakeSession(active=True)
-        session.prepare_turn = AsyncMock(return_value=())
+        session.prepare_turn_state = AsyncMock(
+            return_value=BattleTurnState(BattleTurnPhase.ACTIVE)
+        )
         strategy = Mock()
         action_error = BattleActionOutcomeUnknownError("receipt missing")
         strategy.take_turn = AsyncMock(side_effect=action_error)
@@ -549,12 +579,14 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             ).run_current()
 
         self.assertIs(raised.exception.__cause__, action_error)
-        session.prepare_turn.assert_awaited_once()
+        session.prepare_turn_state.assert_awaited_once()
         strategy.take_turn.assert_awaited_once_with(session)
 
     async def test_read_timeout_is_attempted_three_times(self) -> None:
         session = _FakeSession(active=True)
-        session.prepare_turn = AsyncMock(side_effect=TimeoutError("read timed out"))
+        session.prepare_turn_state = AsyncMock(
+            side_effect=TimeoutError("read timed out")
+        )
         strategy = Mock()
         strategy.take_turn = AsyncMock()
         retry_sleep = AsyncMock()
@@ -568,7 +600,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             ).run_current()
 
         self.assertIsInstance(raised.exception.__cause__, TimeoutError)
-        self.assertEqual(session.prepare_turn.await_count, 3)
+        self.assertEqual(session.prepare_turn_state.await_count, 3)
         self.assertEqual(retry_sleep.await_count, 2)
         strategy.take_turn.assert_not_awaited()
 
@@ -587,6 +619,65 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, BattleStopped(False, 1, 1, 1))
         self.assertTrue(session._active)
+
+    async def test_explicit_completion_state_never_calls_strategy(self) -> None:
+        session = _FakeSession(active=True)
+        session.prepare_turn_state = AsyncMock(
+            return_value=BattleTurnState(BattleTurnPhase.COMPLETE)
+        )
+        strategy = Mock()
+        strategy.take_turn = AsyncMock()
+
+        result = await BattleRunner(
+            session,  # type: ignore[arg-type]
+            strategy,
+            sleep=AsyncMock(),
+        ).run_current()
+
+        self.assertEqual(result, BattleCompleted(False, 0, 1, 1))
+        strategy.take_turn.assert_not_awaited()
+
+    async def test_challenge_state_is_refreshed_before_strategy(self) -> None:
+        session = _FakeSession(active=True)
+        session.prepare_turn_state = AsyncMock(
+            side_effect=[
+                BattleTurnState(BattleTurnPhase.CHALLENGE),
+                BattleTurnState(BattleTurnPhase.ACTIVE),
+            ]
+        )
+        strategy = Mock()
+        strategy.take_turn = AsyncMock(return_value=TurnDecision.STOP)
+
+        result = await BattleRunner(
+            session,  # type: ignore[arg-type]
+            strategy,
+            sleep=AsyncMock(),
+        ).run_current()
+
+        self.assertEqual(result, BattleStopped(False, 0, 1, 1))
+        self.assertEqual(session.prepare_turn_state.await_count, 2)
+        strategy.take_turn.assert_awaited_once_with(session)
+
+    async def test_next_floor_is_progressed_without_strategy_policy(self) -> None:
+        session = _FakeSession(active=True)
+        session.prepare_turn_state = AsyncMock(
+            side_effect=[
+                BattleTurnState(BattleTurnPhase.NEXT_FLOOR),
+                BattleTurnState(BattleTurnPhase.COMPLETE),
+            ]
+        )
+        strategy = Mock()
+        strategy.take_turn = AsyncMock()
+
+        result = await BattleRunner(
+            session,  # type: ignore[arg-type]
+            strategy,
+            sleep=AsyncMock(),
+        ).run_current()
+
+        self.assertIsInstance(result, BattleCompleted)
+        session.go_next_floor.assert_awaited_once_with()
+        strategy.take_turn.assert_not_awaited()
 
     async def test_pause_polling_continues_to_service_ponychart(self) -> None:
         session = _FakeSession(active=True)
@@ -651,65 +742,70 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         strategy.take_turn.assert_awaited_once_with(session)
 
     async def test_false_submission_result_is_not_reported_as_started(self) -> None:
-        session = object.__new__(BattleSession)
-        session.page = Mock()
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client)
         arena_url = "https://hentaiverse.org/?s=Battle&ss=ar"
-        session._get_path_prefix = AsyncMock(return_value="")
-        session.page.evaluate = AsyncMock(side_effect=[arena_url, False])
+        launcher._path_prefix = AsyncMock(return_value="")
+        client.page.evaluate = AsyncMock(side_effect=[arena_url, False])
 
-        started = await BattleSession.start_arena(session, ArenaOption(12))
+        started = await launcher.start_arena(ArenaOption(12))
 
         self.assertFalse(started)
 
     async def test_arena_submission_exception_propagates_as_unknown(self) -> None:
-        session = object.__new__(BattleSession)
-        session.page = Mock()
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client)
         arena_url = "https://hentaiverse.org/?s=Battle&ss=ar"
-        session._get_path_prefix = AsyncMock(return_value="")
-        session.page.evaluate = AsyncMock(
+        launcher._path_prefix = AsyncMock(return_value="")
+        client.page.evaluate = AsyncMock(
             side_effect=[arena_url, ValueError("navigation destroyed context")]
         )
 
         with self.assertRaisesRegex(ValueError, "destroyed context"):
-            await BattleSession.start_arena(session, ArenaOption(12))
+            await launcher.start_arena(ArenaOption(12))
 
     async def test_arena_options_are_returned_without_selecting_the_last(self) -> None:
-        session = object.__new__(BattleSession)
-        session.page = Mock()
-        session.page.evaluate = AsyncMock(
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client)
+        client.page.evaluate = AsyncMock(
             return_value=["init_battle(12, 34)", "init_battle(56, 78, 'token')"]
         )
 
-        options = await BattleSession.list_arena_options(session)
+        options = await launcher.list_arena_options()
 
         self.assertEqual(options, (ArenaOption(12), ArenaOption(56, "token")))
 
     async def test_grindfest_options_are_returned_without_selecting_one(
         self,
     ) -> None:
-        session = object.__new__(BattleSession)
-        session.page = Mock()
-        session.page.evaluate = AsyncMock(
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client)
+        client.page.evaluate = AsyncMock(
             return_value=["init_battle(12)", "not-an-option", "init_battle(56)"]
         )
 
-        options = await BattleSession.list_grindfest_options(session)
+        options = await launcher.list_grindfest_options()
 
         self.assertEqual(options, (GrindfestOption(12), GrindfestOption(56)))
 
     async def test_grindfest_submission_exception_propagates_as_unknown(
         self,
     ) -> None:
-        session = object.__new__(BattleSession)
-        session.page = Mock()
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client)
         grindfest_url = "https://hentaiverse.org/?s=Battle&ss=gr"
-        session._get_path_prefix = AsyncMock(return_value="")
-        session.page.evaluate = AsyncMock(
+        launcher._path_prefix = AsyncMock(return_value="")
+        client.page.evaluate = AsyncMock(
             side_effect=[grindfest_url, ValueError("bad form")]
         )
 
         with self.assertRaisesRegex(ValueError, "bad form"):
-            await BattleSession.start_grindfest(session, GrindfestOption(12))
+            await launcher.start_grindfest(GrindfestOption(12))
 
 
 class PonyChartPreloadTests(unittest.TestCase):
@@ -791,8 +887,7 @@ class BattleLogTests(unittest.TestCase):
         self.assertIsNot(dashboard.log_entries, previous)
         self.assertEqual(list(dashboard.log_entries.prev_lines), [])
         self.assertEqual(dashboard.overview_monsters.alive_monster, [])
-        self.assertNotIn(previous, dashboard.battle_subject._observers)
-        self.assertIn(dashboard.log_entries, dashboard.battle_subject._observers)
+        self.assertIsNone(dashboard.snap)
 
 
 class ArchitectureTests(unittest.TestCase):

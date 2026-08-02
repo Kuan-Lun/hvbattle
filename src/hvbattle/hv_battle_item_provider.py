@@ -1,24 +1,34 @@
 from typing import Any
 
+from hv_bie.types import BattleSnapshot
 from hvbrowser import HVDriver
 
+from .battle_state import BattleStateStore
 from .hv_battle_action_manager import ElementActionManager
-from .hv_battle_observer_pattern import BattleDashboard
 
 GEM_ITEMS = {"mystic gem", "health gem", "mana gem", "spirit gem"}
 
 
 class ItemProvider:
-    def __init__(self, driver: HVDriver, battle_dashboard: BattleDashboard) -> None:
+    def __init__(
+        self,
+        driver: HVDriver,
+        state_store: BattleStateStore,
+        element_action_manager: ElementActionManager,
+    ) -> None:
         self.hvdriver: HVDriver = driver
-        self.battle_dashboard = battle_dashboard
-        self.element_action_manager = ElementActionManager(
-            self.hvdriver, battle_dashboard
-        )
+        self.state_store = state_store
+        self.element_action_manager = element_action_manager
 
     @property
     def page(self) -> Any:
         return self.hvdriver.page
+
+    def _snapshot(self) -> BattleSnapshot:
+        snapshot = self.state_store.snap
+        if snapshot is None:
+            raise RuntimeError("No battle snapshot is available")
+        return snapshot
 
     async def _get_items_menu_element(self) -> Any:
         return await self.hvdriver.page.select("#ckey_items")
@@ -36,10 +46,11 @@ class ItemProvider:
         return "items_s.png" in items_src
 
     async def use(self, item: str) -> bool:
-        if item not in self.battle_dashboard.snap.items.items:
+        snapshot = self._snapshot()
+        if item not in snapshot.items.items:
             return False
 
-        parsed_item = self.battle_dashboard.snap.items.items[item]
+        parsed_item = snapshot.items.items[item]
         if not parsed_item.available:
             return False
 

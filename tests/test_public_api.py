@@ -14,6 +14,9 @@ class PublicApiTests(unittest.TestCase):
         self.assertTrue(hasattr(hvbattle, "BattleSession"))
         self.assertTrue(hasattr(hvbattle, "BattleRunner"))
         self.assertTrue(hasattr(hvbattle, "BattleStrategy"))
+        self.assertTrue(hasattr(hvbattle, "BaseControlPanel"))
+        self.assertTrue(hasattr(hvbattle, "ControlPanel"))
+        self.assertTrue(hasattr(hvbattle, "NullControlPanel"))
         self.assertTrue(hasattr(hvbattle, "BattleCompleted"))
         self.assertTrue(hasattr(hvbattle, "BattleStopped"))
         self.assertTrue(hasattr(hvbattle, "BattleInterruptedError"))
@@ -48,6 +51,20 @@ class PublicApiTests(unittest.TestCase):
         )
 
         self.assertEqual(completed.stdout.strip(), "False")
+
+    def test_import_does_not_require_tkinter(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.modules['tkinter'] = None; import hvbattle; print('ok')",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.stdout.strip(), "ok")
 
 
 if __name__ == "__main__":

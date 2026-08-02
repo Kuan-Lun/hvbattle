@@ -65,6 +65,12 @@ GrindFest uses the equivalent `list_grindfest_options()` and
 `start_grindfest(option)` pair; the package does not silently choose the first
 or last server option.
 
+`BaseControlPanel`, `ControlPanel`, and `NullControlPanel` provide reusable
+pause, skill-selection, and named-toggle mechanisms. The package does not
+register campaign choices or choose their defaults: a calling application owns
+the toggle names, labels, initial values, and the policy that reads their live
+state. Importing `hvbattle` does not import Tk or start a GUI process.
+
 ## Development
 
 Build a clean environment backed by PyPI releases:

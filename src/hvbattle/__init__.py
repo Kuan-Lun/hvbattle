@@ -10,6 +10,7 @@ from .contracts import (
     GrindfestOption,
     TurnDecision,
 )
+from .control_panel import BaseControlPanel, ControlPanel, NullControlPanel
 from .hv_battle import BattleDriver
 from .hv_battle_ponychart import PonyChartResolutionError, preload_ponychart_classifier
 from .runner import BattleRunner
@@ -18,6 +19,7 @@ from .strategy import BattleLifecycle, BattleStrategy
 
 __all__ = [
     "ArenaOption",
+    "BaseControlPanel",
     "BattleCompleted",
     "BattleDriver",
     "BattleInterruptedError",
@@ -26,7 +28,9 @@ __all__ = [
     "BattleSession",
     "BattleStopped",
     "BattleStrategy",
+    "ControlPanel",
     "GrindfestOption",
+    "NullControlPanel",
     "PonyChartResolutionError",
     "TurnDecision",
     "notify",

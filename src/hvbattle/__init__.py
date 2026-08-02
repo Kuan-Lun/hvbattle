@@ -4,6 +4,7 @@ from hvbrowser.runtime import notify
 
 from .contracts import (
     ArenaOption,
+    BattleActionOutcomeUnknownError,
     BattleCompleted,
     BattleInterruptedError,
     BattleStopped,
@@ -20,6 +21,7 @@ from .strategy import BattleLifecycle, BattleStrategy
 __all__ = [
     "ArenaOption",
     "BaseControlPanel",
+    "BattleActionOutcomeUnknownError",
     "BattleCompleted",
     "BattleDriver",
     "BattleInterruptedError",

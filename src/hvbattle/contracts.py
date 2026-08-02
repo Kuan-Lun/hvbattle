@@ -43,6 +43,10 @@ class BattleInterruptedError(RuntimeError):
     """The page left battle without positive completion evidence."""
 
 
+class BattleActionOutcomeUnknownError(RuntimeError):
+    """A submitted action did not produce authoritative completion evidence."""
+
+
 class TurnDecision(StrEnum):
     """What the single-battle runner should do after a strategy decision."""
 

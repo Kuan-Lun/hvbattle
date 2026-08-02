@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from hvbrowser.runtime import setup_logger
 
 from .contracts import (
+    BattleActionOutcomeUnknownError,
     BattleCompleted,
     BattleInterruptedError,
     BattleStopped,
@@ -31,7 +32,7 @@ class BattleRunner:
         strategy: BattleStrategy,
         *,
         wait_if_paused: Callable[[], Awaitable[None]] = _not_paused,
-        timeout_retries: int = 1,
+        timeout_retries: int = 3,
         idle_delay: float = 2,
         retry_delay: float = 5,
         transition_checks: int = 3,
@@ -113,13 +114,22 @@ class BattleRunner:
                             "BattleStrategy.take_turn() must return TurnDecision"
                         )
                     retry_count = 0
+                except BattleActionOutcomeUnknownError as error:
+                    logger.error(
+                        "Battle action completion could not be confirmed: %r", error
+                    )
+                    raise BattleInterruptedError(
+                        "Battle outcome is unknown because the submitted action "
+                        "did not produce completion evidence"
+                    ) from error
                 except TimeoutError as error:
                     retry_count += 1
                     if retry_count >= self.timeout_retries:
                         logger.error(
-                            "Battle turn timed out; retry limit reached (%d/%d)",
+                            "Battle turn timed out; retry limit reached (%d/%d): %r",
                             retry_count,
                             self.timeout_retries,
+                            error,
                         )
                         raise BattleInterruptedError(
                             "Battle outcome is unknown after a turn timeout"

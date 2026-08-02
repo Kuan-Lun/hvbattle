@@ -20,6 +20,7 @@ class PublicApiTests(unittest.TestCase):
         self.assertTrue(hasattr(hvbattle, "BattleCompleted"))
         self.assertTrue(hasattr(hvbattle, "BattleStopped"))
         self.assertTrue(hasattr(hvbattle, "BattleInterruptedError"))
+        self.assertTrue(hasattr(hvbattle, "BattleActionOutcomeUnknownError"))
         self.assertTrue(hasattr(hvbattle, "TurnDecision"))
         self.assertTrue(hasattr(hvbattle, "ArenaOption"))
         self.assertTrue(hasattr(hvbattle, "GrindfestOption"))

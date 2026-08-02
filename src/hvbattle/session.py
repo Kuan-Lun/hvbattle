@@ -20,6 +20,23 @@ from .hv_battle_skill_manager import SkillManager
 
 logger = setup_logger(__name__)
 
+_BATTLE_PHASE_ACTIVE = "active"
+_BATTLE_PHASE_COMPLETE = "complete"
+_BATTLE_PHASE_NEXT_FLOOR = "next-floor"
+_BATTLE_PHASE_JS = r"""
+(() => {
+    const pane = document.getElementById("pane_completion");
+    if (
+        pane
+        && pane.querySelector('img[src*="finishbattle.png"]')
+    ) {
+        return "complete";
+    }
+    if (document.getElementById("btcp")) return "next-floor";
+    return "active";
+})()
+"""
+
 
 class BattleSession(HVDriver):
     """Reusable battle state and action facade without a concrete policy."""
@@ -38,6 +55,7 @@ class BattleSession(HVDriver):
         self._skill_manager: SkillManager | None = None
         self._buff_manager: BuffManager | None = None
         self._completion_observed = False
+        self._last_dialog_category: str | None = None
         self.turn = -1
         self.round = -1
 
@@ -61,7 +79,20 @@ class BattleSession(HVDriver):
         async def dialog_handler(
             event: cdp.page.JavascriptDialogOpening,
         ) -> None:
-            del event
+            message = str(getattr(event, "message", ""))
+            normalized = message.casefold()
+            if "server communication failed" in normalized:
+                category = "server-communication-failed"
+            elif "login" in normalized or "session" in normalized:
+                category = "session-or-login"
+            else:
+                category = "other"
+            self._last_dialog_category = category
+            logger.warning(
+                "Auto-accepting JavaScript dialog category=%s message_length=%d",
+                category,
+                len(message),
+            )
             await self.page.send(cdp.page.handle_java_script_dialog(accept=True))
 
         self.page.add_handler(cdp.page.JavascriptDialogOpening, dialog_handler)
@@ -130,25 +161,50 @@ class BattleSession(HVDriver):
         """Refresh one actionable turn, or return ``None`` at a transition."""
         if not await self._has_battle_marker():
             return None
+
+        phase = await self._read_battle_phase()
+        if phase == _BATTLE_PHASE_COMPLETE:
+            self._completion_observed = True
+            logger.info("Final battle completion control is ready.")
+            return None
+        if phase == _BATTLE_PHASE_NEXT_FLOOR:
+            return self._prepare_round_transition()
+        if await self.is_ponychart_present():
+            return None
+
         try:
             await self._dashboard().update()
-        except TimeoutError:
-            raise
         except Exception as error:
             if is_connection_error(error):
                 raise
             if await self.is_ponychart_present():
                 return None
+            phase = await self._read_battle_phase()
+            if phase == _BATTLE_PHASE_COMPLETE:
+                self._completion_observed = True
+                logger.info("Final battle completion control appeared while parsing.")
+                return None
+            if phase == _BATTLE_PHASE_NEXT_FLOOR:
+                return self._prepare_round_transition()
             raise
-        has_next_floor = await self._has_next_floor_control()
-        if (
-            not self.alive_monster_ids
-            and self.total_rounds > 0
-            and self.current_round >= self.total_rounds
-        ):
+
+        phase = await self._read_battle_phase()
+        if phase == _BATTLE_PHASE_COMPLETE:
             self._completion_observed = True
-        if not self.alive_monster_ids and not has_next_floor:
+            logger.info("Final battle completion control appeared after parsing.")
             return None
+        if phase == _BATTLE_PHASE_NEXT_FLOOR:
+            return self._prepare_round_transition()
+        if self.snapshot.warnings:
+            logger.warning(
+                "Battle parser warnings: %s",
+                ", ".join(self.snapshot.warnings[:5]),
+            )
+        if not self.alive_monster_ids:
+            raise TimeoutError(
+                "Battle DOM has no monsters, round transition, or final "
+                "completion marker"
+            )
         self.turn += 1
         self.round = self.current_round
         turn_text = f"Turn {self.turn:>5}"
@@ -161,12 +217,30 @@ class BattleSession(HVDriver):
             logger.info(line)
         return lines
 
+    def _prepare_round_transition(self) -> tuple[str, ...]:
+        """Expose a transition as a strategy decision without parsing monsters."""
+        self.turn += 1
+        logger.info("Turn %5d: next-round control is ready.", self.turn)
+        return ()
+
     async def is_ponychart_present(self) -> bool:
         """Inspect challenge presence without parsing ordinary battle HTML."""
         return await PonyChart(self).is_present()
 
-    async def _has_next_floor_control(self) -> bool:
-        return bool(await self.page.query_selector_all("#btcp"))
+    async def _read_battle_phase(self) -> str:
+        """Read final and next-floor controls atomically, with final priority."""
+        phase = await self.page.evaluate(_BATTLE_PHASE_JS)
+        if phase not in {
+            _BATTLE_PHASE_ACTIVE,
+            _BATTLE_PHASE_COMPLETE,
+            _BATTLE_PHASE_NEXT_FLOOR,
+        }:
+            raise RuntimeError(f"Invalid battle phase payload: {phase!r}")
+        return str(phase)
+
+    async def _has_battle_completion_marker(self) -> bool:
+        """Recognize the game's explicit final-battle image control."""
+        return await self._read_battle_phase() == _BATTLE_PHASE_COMPLETE
 
     async def _has_battle_marker(self) -> bool:
         return bool(await self.page.xpath("//*[@id='battle_main']", timeout=2))
@@ -230,7 +304,7 @@ class BattleSession(HVDriver):
 
     @property
     def battle_completion_observed(self) -> bool:
-        """Whether a final round with no living monsters was parsed."""
+        """Whether the game's explicit final-battle control was observed."""
         return self._completion_observed
 
     async def resolve_ponychart(self) -> bool:
@@ -260,7 +334,7 @@ class BattleSession(HVDriver):
         elements = await self.page.query_selector_all("#btcp")
         if not elements:
             return False
-        await self._actions().click_and_wait_log_locator("#btcp")
+        await self._actions().click_and_wait_transition_locator("#btcp")
         return True
 
     async def list_arena_options(self) -> tuple[ArenaOption, ...]:
@@ -383,7 +457,11 @@ class BattleSession(HVDriver):
         """Return whether the current page represents an active battle."""
         if await self.is_ponychart_present():
             return True
-        if await self._has_next_floor_control():
+        phase = await self._read_battle_phase()
+        if phase == _BATTLE_PHASE_COMPLETE:
+            self._completion_observed = True
+            return False
+        if phase == _BATTLE_PHASE_NEXT_FLOOR:
             return True
         if not await self._has_battle_marker():
             if await self.is_ponychart_present():
@@ -399,23 +477,43 @@ class BattleSession(HVDriver):
                     return True
                 if await self.is_ponychart_present():
                     return True
-                if await self._has_next_floor_control():
+                phase = await self._read_battle_phase()
+                if phase == _BATTLE_PHASE_COMPLETE:
+                    self._completion_observed = True
+                    return False
+                if phase == _BATTLE_PHASE_NEXT_FLOOR:
                     return True
-                return False
-            except TimeoutError:
-                raise
+                warnings = ", ".join(snapshot.warnings[:5]) or "none"
+                raise RuntimeError(
+                    "Battle marker is present without monsters, a transition, "
+                    "or completion evidence; parser warnings=" + warnings
+                )
             except Exception as error:
                 if is_connection_error(error):
                     raise
                 last_error = error
                 if await self.is_ponychart_present():
                     return True
+                phase = await self._read_battle_phase()
+                if phase == _BATTLE_PHASE_COMPLETE:
+                    self._completion_observed = True
+                    return False
+                if phase == _BATTLE_PHASE_NEXT_FLOOR:
+                    return True
+                if isinstance(error, TimeoutError):
+                    raise
                 if attempt == 0:
                     logger.info(
                         "Battle state parse failed, retrying once after idle wait."
                     )
                     await self.page.wait(1)
 
+        phase = await self._read_battle_phase()
+        if phase == _BATTLE_PHASE_COMPLETE:
+            self._completion_observed = True
+            return False
+        if phase == _BATTLE_PHASE_NEXT_FLOOR:
+            return True
         if await self._has_battle_marker():
             logger.error(
                 "On battle page but failed to parse battle state twice; "

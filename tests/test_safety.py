@@ -1,5 +1,8 @@
 import ast
 import asyncio
+import json
+import shutil
+import subprocess
 import sys
 import types
 import unittest
@@ -13,6 +16,7 @@ import hvbattle.hv_battle_ponychart as ponychart_module
 import hvbattle.session as session_module
 from hvbattle import (
     ArenaOption,
+    BattleActionOutcomeUnknownError,
     BattleCompleted,
     BattleInterruptedError,
     BattleRunner,
@@ -51,6 +55,28 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ["preload", "browser"])
         session._setup_alert_handler.assert_awaited_once_with()
 
+    async def test_dialog_log_records_category_without_raw_server_message(
+        self,
+    ) -> None:
+        session = object.__new__(BattleSession)
+        session.page = Mock()
+        session.page.add_handler = Mock()
+        session.page.send = AsyncMock()
+        session._last_dialog_category = None
+        secret_message = "Server communication failed: response-token-should-not-log"
+
+        with patch.object(session_module.logger, "warning") as warning:
+            await BattleSession._setup_alert_handler(session)
+            handler = session.page.add_handler.call_args.args[1]
+            await handler(SimpleNamespace(message=secret_message))
+
+        self.assertEqual(
+            session._last_dialog_category,
+            "server-communication-failed",
+        )
+        self.assertNotIn(secret_message, str(warning.call_args))
+        session.page.send.assert_awaited_once()
+
     def test_snapshot_is_unavailable_before_first_prepared_turn(self) -> None:
         session = object.__new__(BattleSession)
         session.battle_dashboard = Mock()
@@ -73,7 +99,7 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_challenge_presence_is_checked_before_dashboard_parse(self) -> None:
         session = object.__new__(BattleSession)
         session.is_ponychart_present = AsyncMock(return_value=True)
-        session._has_next_floor_control = AsyncMock()
+        session._read_battle_phase = AsyncMock()
         session._has_battle_marker = AsyncMock()
         session.battle_dashboard = Mock()
         session.battle_dashboard.inspect = AsyncMock(
@@ -84,7 +110,7 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(active)
         session.battle_dashboard.inspect.assert_not_awaited()
-        session._has_next_floor_control.assert_not_awaited()
+        session._read_battle_phase.assert_not_awaited()
         session._has_battle_marker.assert_not_awaited()
 
     async def test_non_battle_transition_does_not_increment_turn(self) -> None:
@@ -98,7 +124,7 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(prepared)
         self.assertEqual(session.turn, 4)
 
-    async def test_final_round_without_monsters_records_completion_evidence(
+    async def test_final_round_numbers_without_dom_marker_are_invalid(
         self,
     ) -> None:
         session = object.__new__(BattleSession)
@@ -106,10 +132,34 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.round = 1
         session._completion_observed = False
         session._has_battle_marker = AsyncMock(return_value=True)
-        session._has_next_floor_control = AsyncMock(return_value=False)
+        session._read_battle_phase = AsyncMock(return_value="active")
         session.is_ponychart_present = AsyncMock(return_value=False)
         session.battle_dashboard = Mock()
         session.battle_dashboard.update = AsyncMock()
+        session.battle_dashboard.snap = SimpleNamespace(warnings=[])
+        session.battle_dashboard.overview_monsters.alive_monster = []
+        session.battle_dashboard.log_entries.current_round = 5
+        session.battle_dashboard.log_entries.total_round = 5
+
+        with self.assertRaisesRegex(TimeoutError, "no monsters"):
+            await BattleSession.prepare_turn(session)
+
+        self.assertFalse(session.battle_completion_observed)
+        self.assertEqual(session.turn, 0)
+
+    async def test_completion_pane_records_positive_completion_evidence(
+        self,
+    ) -> None:
+        session = object.__new__(BattleSession)
+        session.turn = 0
+        session.round = 1
+        session._completion_observed = False
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_phase = AsyncMock(return_value="complete")
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.update = AsyncMock()
+        session.battle_dashboard.snap = SimpleNamespace(warnings=[])
         session.battle_dashboard.overview_monsters.alive_monster = []
         session.battle_dashboard.log_entries.current_round = 5
         session.battle_dashboard.log_entries.total_round = 5
@@ -119,6 +169,154 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(prepared)
         self.assertTrue(session.battle_completion_observed)
         self.assertEqual(session.turn, 0)
+        session.battle_dashboard.update.assert_not_awaited()
+
+    async def test_next_floor_marker_bypasses_parser_failure(self) -> None:
+        session = object.__new__(BattleSession)
+        session.turn = 2
+        session.round = 1
+        session._completion_observed = False
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_phase = AsyncMock(return_value="next-floor")
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.update = AsyncMock(
+            side_effect=AssertionError("parser must not run during transition")
+        )
+
+        prepared = await BattleSession.prepare_turn(session)
+
+        self.assertEqual(prepared, ())
+        self.assertEqual(session.turn, 3)
+        session.battle_dashboard.update.assert_not_awaited()
+
+    async def test_parser_error_reconciles_completion_that_appeared(self) -> None:
+        session = object.__new__(BattleSession)
+        session.turn = 2
+        session.round = 1
+        session._completion_observed = False
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_phase = AsyncMock(side_effect=["active", "complete"])
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.update = AsyncMock(
+            side_effect=TimeoutError("monsters disappeared during parse")
+        )
+
+        prepared = await BattleSession.prepare_turn(session)
+
+        self.assertIsNone(prepared)
+        self.assertTrue(session.battle_completion_observed)
+        session.battle_dashboard.update.assert_awaited_once()
+
+    async def test_finish_image_marker_is_explicit(self) -> None:
+        session = object.__new__(BattleSession)
+        session.page = Mock()
+        session.page.evaluate = AsyncMock(return_value="complete")
+
+        complete = await BattleSession._has_battle_completion_marker(session)
+
+        self.assertTrue(complete)
+        script = session.page.evaluate.await_args.args[0]
+        self.assertIn("finishbattle.png", script)
+        self.assertLess(script.index("finishbattle.png"), script.index("btcp"))
+
+    def test_phase_script_executes_final_priority_when_btcp_coexists(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is required to execute the production phase script")
+        harness = r"""
+const fs = require("node:fs");
+const script = fs.readFileSync(0, "utf8");
+
+const run = (finishPresent, nextFloorPresent) => {
+    const lookups = [];
+    globalThis.document = {
+        getElementById(id) {
+            lookups.push(id);
+            if (id === "pane_completion") {
+                return {
+                    querySelector(selector) {
+                        return finishPresent
+                            && selector.includes("finishbattle.png") ? {} : null;
+                    },
+                };
+            }
+            if (id === "btcp" && nextFloorPresent) return {};
+            return null;
+        },
+    };
+    return {phase: eval(script), lookups};
+};
+
+console.log(JSON.stringify({
+    both: run(true, true),
+    nextFloor: run(false, true),
+    active: run(false, false),
+}));
+"""
+        completed = subprocess.run(
+            [node, "-e", harness],
+            input=session_module._BATTLE_PHASE_JS,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        result = json.loads(completed.stdout)
+
+        self.assertEqual(
+            result["both"],
+            {
+                "phase": "complete",
+                "lookups": ["pane_completion"],
+            },
+        )
+        self.assertEqual(result["nextFloor"]["phase"], "next-floor")
+        self.assertEqual(result["active"]["phase"], "active")
+
+    async def test_final_control_wins_when_btcp_is_also_present(self) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_phase = AsyncMock(return_value="complete")
+
+        active = await BattleSession.is_in_battle(session)
+
+        self.assertFalse(active)
+        self.assertTrue(session.battle_completion_observed)
+
+    async def test_inspect_error_reconciles_completion_phase(self) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_phase = AsyncMock(side_effect=["active", "complete"])
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.inspect = AsyncMock(
+            side_effect=ValueError("monsters disappeared during inspect")
+        )
+
+        active = await BattleSession.is_in_battle(session)
+
+        self.assertFalse(active)
+        self.assertTrue(session.battle_completion_observed)
+        session.battle_dashboard.inspect.assert_awaited_once()
+
+    async def test_inspect_timeout_reconciles_next_floor_phase(self) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_phase = AsyncMock(side_effect=["active", "next-floor"])
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.inspect = AsyncMock(
+            side_effect=TimeoutError("inspect raced with transition")
+        )
+
+        active = await BattleSession.is_in_battle(session)
+
+        self.assertTrue(active)
+        session.battle_dashboard.inspect.assert_awaited_once()
 
     async def test_skill_buff_action_never_uses_an_implicit_mystic_gem(self) -> None:
         manager = object.__new__(BuffManager)
@@ -283,6 +481,44 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             ).run_current()
 
         strategy.take_turn.assert_awaited_once_with(session)
+
+    async def test_unknown_action_outcome_is_never_retried(self) -> None:
+        session = _FakeSession(active=True)
+        session.prepare_turn = AsyncMock(return_value=())
+        strategy = Mock()
+        action_error = BattleActionOutcomeUnknownError("receipt missing")
+        strategy.take_turn = AsyncMock(side_effect=action_error)
+
+        with self.assertRaises(BattleInterruptedError) as raised:
+            await BattleRunner(
+                session,  # type: ignore[arg-type]
+                strategy,
+                sleep=AsyncMock(),
+            ).run_current()
+
+        self.assertIs(raised.exception.__cause__, action_error)
+        session.prepare_turn.assert_awaited_once()
+        strategy.take_turn.assert_awaited_once_with(session)
+
+    async def test_read_timeout_is_attempted_three_times(self) -> None:
+        session = _FakeSession(active=True)
+        session.prepare_turn = AsyncMock(side_effect=TimeoutError("read timed out"))
+        strategy = Mock()
+        strategy.take_turn = AsyncMock()
+        retry_sleep = AsyncMock()
+
+        with self.assertRaises(BattleInterruptedError) as raised:
+            await BattleRunner(
+                session,  # type: ignore[arg-type]
+                strategy,
+                timeout_retries=3,
+                sleep=retry_sleep,
+            ).run_current()
+
+        self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+        self.assertEqual(session.prepare_turn.await_count, 3)
+        self.assertEqual(retry_sleep.await_count, 2)
+        strategy.take_turn.assert_not_awaited()
 
     async def test_strategy_can_return_control_without_claiming_completion(
         self,

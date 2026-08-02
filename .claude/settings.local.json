@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**/*)",
+      "Write(**/*)",
+      "Edit(**/*)",
+      "Bash(docker:*)",
+      "Bash(ls:*)",
+      "Bash(mkdir:*)",
+      "Bash(tree:*)",
+      "Bash(find:*)",
+      "Bash(uv:*)",
+      "Bash(grep:*)",
+      "Bash(xargs cat)",
+      "Bash(git diff:*)",
+      "Bash(git -C * diff:*)",
+      "Bash(cat > *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(uv run *)",
+      "Bash(uv run python -c ' *)",
+      "Bash(python3 -)",
+      "Bash(python3 -c ' *)",
+      "Bash(echo \"exit: $?\")"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "scripts/hooks/finalize-python.sh"
+          },
+          {
+            "type": "command",
+            "command": "scripts/hooks/finalize-markdown.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

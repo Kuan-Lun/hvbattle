@@ -11,6 +11,7 @@ from uuid import uuid4
 from hvbrowser import HVDriver
 from hvbrowser.runtime import ElementAction, setup_logger
 
+from ._zendriver import wait_for_zendriver
 from .contracts import BattleActionOutcomeUnknownError
 
 logger = setup_logger(__name__)
@@ -707,7 +708,7 @@ class ElementActionManager:
         arm_monitor: bool = False,
         probe_timeout: float = 3.0,
     ) -> _BattleActionState:
-        raw = await asyncio.wait_for(
+        raw = await wait_for_zendriver(
             self.page.evaluate(self._state_script(monitor_id, arm_monitor=arm_monitor)),
             timeout=probe_timeout,
         )
@@ -716,7 +717,7 @@ class ElementActionManager:
     async def _read_battle_exit_state(
         self, *, probe_timeout: float = 3.0
     ) -> _BattleExitState:
-        raw = await asyncio.wait_for(
+        raw = await wait_for_zendriver(
             self.page.evaluate(_BATTLE_EXIT_STATE_JS),
             timeout=probe_timeout,
         )
@@ -729,7 +730,7 @@ class ElementActionManager:
             "__MONITOR_ID__", json.dumps(monitor_id)
         )
         try:
-            await asyncio.wait_for(
+            await wait_for_zendriver(
                 self.page.evaluate(script),
                 timeout=probe_timeout,
             )
@@ -829,6 +830,7 @@ class ElementActionManager:
                 click_error: Exception | None = None
                 probe_error: Exception | None = None
                 post_click_probe_succeeded = False
+                probe_timed_out = False
                 started = asyncio.get_running_loop().time()
                 click_started = True
                 try:
@@ -837,12 +839,22 @@ class ElementActionManager:
                     click_error = error
 
                 deadline = started + timeout
-                while asyncio.get_running_loop().time() < deadline:
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
                     try:
                         current = await self._read_action_state(
                             monitor_id,
-                            probe_timeout=probe_timeout,
+                            # Keep one CDP probe in flight for at most the
+                            # remaining action deadline.  Short per-probe
+                            # cancellation corrupts Zendriver's response mapper.
+                            probe_timeout=remaining,
                         )
+                    except TimeoutError as error:
+                        probe_error = error
+                        probe_timed_out = True
+                        break
                     except Exception as error:
                         probe_error = error
                     else:
@@ -873,15 +885,16 @@ class ElementActionManager:
                     if remaining > 0:
                         await asyncio.sleep(min(check_interval, remaining))
 
-                last, final_error = await self._final_action_probe(
-                    monitor_id,
-                    probe_timeout=probe_timeout,
-                    fallback=last,
-                )
-                if final_error is not None:
-                    probe_error = final_error
-                else:
-                    post_click_probe_succeeded = True
+                if not probe_timed_out:
+                    last, final_error = await self._final_action_probe(
+                        monitor_id,
+                        probe_timeout=probe_timeout,
+                        fallback=last,
+                    )
+                    if final_error is not None:
+                        probe_error = final_error
+                    else:
+                        post_click_probe_succeeded = True
                 evidence = _confirmed_action_evidence(before, last)
                 if evidence is not None:
                     elapsed = asyncio.get_running_loop().time() - started
@@ -932,7 +945,7 @@ class ElementActionManager:
         self,
         selector: str,
         stale_retries: int = 3,
-        timeout: float = 20.0,
+        timeout: float = 60.0,
         check_interval: float = 0.25,
         probe_timeout: float = 3.0,
     ) -> None:
@@ -955,6 +968,7 @@ class ElementActionManager:
             started = asyncio.get_running_loop().time()
             click_error: Exception | None = None
             probe_error: Exception | None = None
+            probe_timed_out = False
             last = before
             try:
                 await self._click(element)
@@ -962,12 +976,23 @@ class ElementActionManager:
                 click_error = error
 
             deadline = started + timeout
-            while asyncio.get_running_loop().time() < deadline:
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
                 try:
                     current = await self._read_action_state(
                         state_id,
-                        probe_timeout=probe_timeout,
+                        # A navigation-time probe may be delayed well beyond
+                        # the normal three-second read bound.  Await that one
+                        # command through the transition deadline instead of
+                        # stacking cancellable probes every few seconds.
+                        probe_timeout=remaining,
                     )
+                except TimeoutError as error:
+                    probe_error = error
+                    probe_timed_out = True
+                    break
                 except Exception as error:
                     probe_error = error
                 else:
@@ -988,13 +1013,14 @@ class ElementActionManager:
                 if remaining > 0:
                     await asyncio.sleep(min(check_interval, remaining))
 
-            try:
-                last = await self._read_action_state(
-                    state_id,
-                    probe_timeout=probe_timeout,
-                )
-            except Exception as error:
-                probe_error = error
+            if not probe_timed_out:
+                try:
+                    last = await self._read_action_state(
+                        state_id,
+                        probe_timeout=probe_timeout,
+                    )
+                except Exception as error:
+                    probe_error = error
             evidence = _confirmed_transition_evidence(before, last)
             if evidence is not None:
                 logger.info(
@@ -1154,6 +1180,7 @@ class ElementActionManager:
             started = asyncio.get_running_loop().time()
             click_error: Exception | None = None
             probe_error: Exception | None = None
+            probe_timed_out = False
             last = before
             try:
                 await self._click(element)
@@ -1161,11 +1188,18 @@ class ElementActionManager:
                 click_error = error
 
             deadline = started + timeout
-            while asyncio.get_running_loop().time() < deadline:
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
                 try:
                     current = await self._read_battle_exit_state(
-                        probe_timeout=probe_timeout
+                        probe_timeout=remaining
                     )
+                except TimeoutError as error:
+                    probe_error = error
+                    probe_timed_out = True
+                    break
                 except Exception as error:
                     probe_error = error
                 else:
@@ -1188,12 +1222,13 @@ class ElementActionManager:
                 if remaining > 0:
                     await asyncio.sleep(min(check_interval, remaining))
 
-            last, final_error = await self._final_battle_exit_probe(
-                probe_timeout=probe_timeout,
-                fallback=last,
-            )
-            if final_error is not None:
-                probe_error = final_error
+            if not probe_timed_out:
+                last, final_error = await self._final_battle_exit_probe(
+                    probe_timeout=probe_timeout,
+                    fallback=last,
+                )
+                if final_error is not None:
+                    probe_error = final_error
             evidence = _confirmed_battle_exit_evidence(expected_is_isekai, before, last)
             if evidence is not None:
                 logger.info(

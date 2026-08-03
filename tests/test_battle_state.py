@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -28,6 +29,19 @@ class CombatLogTrackerTests(unittest.TestCase):
 
 
 class BattleStateStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_content_timeout_keeps_late_protocol_future_alive(self) -> None:
+        driver = Mock()
+        content: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        driver.page.get_content = Mock(return_value=content)
+        store = BattleStateStore(driver)
+
+        with self.assertRaises(TimeoutError):
+            await store._get_content(timeout=0)
+
+        self.assertFalse(content.cancelled())
+        content.set_result("<html>late</html>")
+        await asyncio.sleep(0)
+
     async def test_refresh_does_not_mutate_driver_connection_mapper(self) -> None:
         driver = Mock()
         sentinel = object()

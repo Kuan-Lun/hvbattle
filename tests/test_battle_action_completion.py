@@ -3,7 +3,7 @@ import json
 import shutil
 import subprocess
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from hvbattle import BattleActionOutcomeUnknownError
 from hvbattle.hv_battle_action_manager import (
@@ -358,6 +358,27 @@ def _state(
         action_controls=action_controls,
         monitor=monitor,
     )
+
+
+def _raw_state(state: _BattleActionState) -> dict[str, object]:
+    return {
+        "documentId": state.document_id,
+        "battleNodeId": state.battle_node_id,
+        "readyState": state.ready_state,
+        "battlePresent": state.battle_present,
+        "logRevision": state.log_revision,
+        "logRows": state.log_rows,
+        "latestLog": state.latest_log,
+        "roundText": state.round_text,
+        "completionPresent": state.completion_present,
+        "battleCompletePresent": state.battle_complete_present,
+        "finishImagePresent": state.finish_image_present,
+        "completionRevision": state.completion_revision,
+        "nextFloorPresent": state.next_floor_present,
+        "ponychartPresent": state.ponychart_present,
+        "actionControls": state.action_controls,
+        "monitor": None,
+    }
 
 
 def _exit_state(
@@ -1105,6 +1126,103 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         manager._click.assert_awaited_once()
         manager._select_for_single_click.assert_awaited_once()
+
+    async def test_slow_next_floor_probe_uses_remaining_transition_deadline(
+        self,
+    ) -> None:
+        manager = _manager()
+        before = _state(
+            round_text="Initializing Grindfest (Round 223 / 1000)",
+            next_floor_present=True,
+            action_controls=0,
+        )
+        current = _state(
+            document_id="document-224",
+            battle_node_id="battle-node-224",
+            round_text="Initializing Grindfest (Round 224 / 1000)",
+            next_floor_present=False,
+            action_controls=7,
+        )
+        read_count = 0
+        active_probes = 0
+        maximum_active_probes = 0
+        post_click_timeouts: list[float] = []
+
+        async def read_state(
+            _state_id: str,
+            *,
+            arm_monitor: bool = False,
+            probe_timeout: float = 3,
+        ) -> _BattleActionState:
+            nonlocal active_probes, maximum_active_probes, read_count
+            self.assertFalse(arm_monitor)
+            read_count += 1
+            if read_count == 1:
+                return before
+
+            post_click_timeouts.append(probe_timeout)
+            if probe_timeout < 0.01:
+                raise TimeoutError("old per-probe deadline was too short")
+            active_probes += 1
+            maximum_active_probes = max(maximum_active_probes, active_probes)
+            try:
+                await asyncio.sleep(0.01)
+                return current
+            finally:
+                active_probes -= 1
+
+        manager._read_action_state = AsyncMock(side_effect=read_state)
+
+        await manager.click_and_wait_transition_locator(
+            "#btcp",
+            timeout=0.1,
+            probe_timeout=1e-6,
+        )
+
+        self.assertEqual(read_count, 2)
+        self.assertEqual(maximum_active_probes, 1)
+        self.assertGreater(post_click_timeouts[0], 0.01)
+        manager._click.assert_awaited_once()
+        manager._select_for_single_click.assert_awaited_once()
+
+    async def test_next_floor_hard_deadline_keeps_one_late_probe_alive(
+        self,
+    ) -> None:
+        driver = Mock()
+        manager = ElementActionManager(driver)
+        manager._select_for_single_click = AsyncMock(return_value=object())
+        manager._click = AsyncMock()
+        before = _state(
+            round_text="Initializing Grindfest (Round 223 / 1000)",
+            next_floor_present=True,
+            action_controls=0,
+        )
+        current = _state(
+            document_id="document-224",
+            battle_node_id="battle-node-224",
+            round_text="Initializing Grindfest (Round 224 / 1000)",
+            next_floor_present=False,
+            action_controls=7,
+        )
+        loop = asyncio.get_running_loop()
+        initial_probe: asyncio.Future[dict[str, object]] = loop.create_future()
+        initial_probe.set_result(_raw_state(before))
+        late_probe: asyncio.Future[dict[str, object]] = loop.create_future()
+        driver.page.evaluate = Mock(side_effect=[initial_probe, late_probe])
+
+        with self.assertRaises(BattleActionOutcomeUnknownError):
+            await manager.click_and_wait_transition_locator(
+                "#btcp",
+                timeout=0.001,
+                probe_timeout=0.1,
+            )
+
+        self.assertEqual(driver.page.evaluate.call_count, 2)
+        self.assertFalse(late_probe.cancelled())
+        manager._click.assert_awaited_once()
+
+        late_probe.set_result(_raw_state(current))
+        await asyncio.sleep(0)
 
     async def test_final_completion_click_is_sent_once_after_safe_probe(self) -> None:
         manager = _manager()

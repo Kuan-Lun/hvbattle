@@ -68,7 +68,10 @@ class BattleLauncher:
                 onclick,
             )
             if match is None:
-                logger.debug("Arena action did not match: %s", onclick)
+                logger.debug(
+                    "Arena action did not match expected shape: length=%d",
+                    len(onclick),
+                )
                 continue
             options.append(
                 ArenaOption(battle_id=int(match.group(1)), token=match.group(3))
@@ -129,7 +132,10 @@ class BattleLauncher:
         for onclick in onclick_list or ():
             match = re.match(r"init_battle\(\s*(\d+)\s*\)", onclick)
             if match is None:
-                logger.debug("GrindFest action did not match: %s", onclick)
+                logger.debug(
+                    "GrindFest action did not match expected shape: length=%d",
+                    len(onclick),
+                )
                 continue
             options.append(GrindfestOption(battle_id=int(match.group(1))))
         return tuple(options)

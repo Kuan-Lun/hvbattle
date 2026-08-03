@@ -778,6 +778,24 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(options, (ArenaOption(12), ArenaOption(56, "token")))
 
+    async def test_malformed_arena_option_log_does_not_expose_token(self) -> None:
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client)
+        secret = "secret-battle-token"
+        malformed = f"init_battle(bad, 34, '{secret}')"
+        client.page.evaluate = AsyncMock(return_value=[malformed])
+
+        with patch("hvbattle.battle_launcher.logger") as launcher_logger:
+            options = await launcher.list_arena_options()
+
+        self.assertEqual(options, ())
+        launcher_logger.debug.assert_called_once_with(
+            "Arena action did not match expected shape: length=%d",
+            len(malformed),
+        )
+        self.assertNotIn(secret, repr(launcher_logger.method_calls))
+
     async def test_grindfest_options_are_returned_without_selecting_one(
         self,
     ) -> None:

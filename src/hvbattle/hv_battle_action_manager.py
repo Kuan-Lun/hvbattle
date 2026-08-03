@@ -488,13 +488,14 @@ def _confirmed_transition_evidence(
         and not current.next_floor_present
         and current.action_controls > 0
     )
+    generation_ready = current.ready_state in {"interactive", "complete"}
     if round_advanced and actionable_battle:
-        if generation_changed and current.ready_state == "complete":
+        if generation_changed and generation_ready:
             return "battle-generation+round-advanced"
         if not generation_changed:
             return "battle-round-advanced"
     if round_initialized and actionable_battle:
-        if generation_changed and current.ready_state == "complete":
+        if generation_changed and generation_ready:
             return "battle-generation+round-initialized"
         if (
             not generation_changed

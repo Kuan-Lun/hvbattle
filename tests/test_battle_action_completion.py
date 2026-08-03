@@ -544,6 +544,35 @@ class BattleActionEvidenceTests(unittest.TestCase):
             "battle-generation+round-advanced",
         )
 
+    def test_new_interactive_document_confirms_round_21_to_22(self) -> None:
+        before = _state(
+            document_id="mscpcv0c-90y",
+            battle_node_id="mscpcv0c-2gw",
+            ready_state="complete",
+            log_revision="757b3dcb:6593",
+            latest_log="You gain 15550118 EXP!",
+            round_text="Initializing arena challenge #29 (Round 21 / 80)",
+            completion_present=True,
+            next_floor_present=True,
+            action_controls=0,
+        )
+        current = _state(
+            document_id="mscpdaug-fzv",
+            battle_node_id="mscpdaug-syv",
+            ready_state="interactive",
+            log_revision="5373d31e:382",
+            latest_log="Spawned Monster C: MID=34028 (Silver Cow) LV=500 HP=174260",
+            round_text="Initializing arena challenge #29 (Round 22 / 80)",
+            completion_present=False,
+            next_floor_present=False,
+            action_controls=3,
+        )
+
+        self.assertEqual(
+            _confirmed_transition_evidence(before, current),
+            "battle-generation+round-advanced",
+        )
+
     def test_same_document_ajax_round_advance_confirms_transition(self) -> None:
         before = _state(
             round_text="Initializing arena (Round 1 / 10)",
@@ -616,25 +645,48 @@ class BattleActionEvidenceTests(unittest.TestCase):
 
         self.assertIsNone(_confirmed_transition_evidence(before, current))
 
-    def test_new_document_must_finish_loading_before_transition_confirms(
+    def test_new_document_rejects_loading_and_unknown_ready_states(self) -> None:
+        before = _state(
+            round_text="Initializing arena (Round 1 / 10)",
+            next_floor_present=True,
+            action_controls=0,
+        )
+
+        for ready_state in ("loading", "unknown"):
+            with self.subTest(ready_state=ready_state):
+                current = _state(
+                    document_id="document-2",
+                    battle_node_id="battle-node-2",
+                    ready_state=ready_state,
+                    round_text="Initializing arena (Round 2 / 10)",
+                    log_revision="round-2-log",
+                    next_floor_present=False,
+                    action_controls=3,
+                )
+
+                self.assertIsNone(_confirmed_transition_evidence(before, current))
+
+    def test_new_interactive_document_confirms_unknown_round_initialization(
         self,
     ) -> None:
         before = _state(
-            round_text="Initializing arena (Round 1 / 10)",
+            round_text=None,
             next_floor_present=True,
             action_controls=0,
         )
         current = _state(
             document_id="document-2",
             battle_node_id="battle-node-2",
-            ready_state="loading",
+            ready_state="interactive",
             round_text="Initializing arena (Round 2 / 10)",
-            log_revision="round-2-log",
             next_floor_present=False,
             action_controls=3,
         )
 
-        self.assertIsNone(_confirmed_transition_evidence(before, current))
+        self.assertEqual(
+            _confirmed_transition_evidence(before, current),
+            "battle-generation+round-initialized",
+        )
 
 
 class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):

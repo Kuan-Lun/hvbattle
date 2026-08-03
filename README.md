@@ -95,6 +95,18 @@ Tk or start a GUI process.
 
 ## Development
 
+The dependency-free Lean model in `formal/` covers the safety-critical action
+and transition evidence predicates, error-record ordering, and supervisor
+no-retry exit policy. Run it separately from the Python checks:
+
+```bash
+(cd formal && lake build)
+```
+
+This is a proved model of the observable decision boundary, not an automatic
+translation of the Python, browser, network, or log-sink implementations. The
+offline Python and shell tests cover those implementation boundaries.
+
 Build a clean environment backed by PyPI releases:
 
 ```bash

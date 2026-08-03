@@ -1,0 +1,6 @@
+name = "hvbattle_formal"
+version = "0.1.0"
+defaultTargets = ["HVBattle"]
+
+[[lean_lib]]
+name = "HVBattle"

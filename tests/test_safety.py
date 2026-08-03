@@ -321,6 +321,42 @@ console.log(JSON.stringify({
         self.assertFalse(active)
         self.assertTrue(session.battle_completion_observed)
 
+    async def test_final_completion_ack_uses_dedicated_exact_selector(
+        self,
+    ) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = True
+        session.element_action_manager = Mock()
+        session.element_action_manager.click_and_wait_battle_exit_locator = AsyncMock()
+
+        await BattleSession.acknowledge_battle_completion(
+            session,
+            expected_is_isekai=True,
+        )
+
+        (
+            session.element_action_manager.click_and_wait_battle_exit_locator
+        ).assert_awaited_once_with(
+            '#pane_completion img[src*="finishbattle.png"]',
+            expected_is_isekai=True,
+        )
+
+    async def test_final_completion_ack_requires_prior_observation(self) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.element_action_manager = Mock()
+        session.element_action_manager.click_and_wait_battle_exit_locator = AsyncMock()
+
+        with self.assertRaises(BattleActionOutcomeUnknownError):
+            await BattleSession.acknowledge_battle_completion(
+                session,
+                expected_is_isekai=False,
+            )
+
+        (
+            session.element_action_manager.click_and_wait_battle_exit_locator
+        ).assert_not_awaited()
+
     async def test_inspect_error_reconciles_completion_phase(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
@@ -380,6 +416,7 @@ class _FakeSession:
         self.goto_arena = AsyncMock()
         self.goto_grindfest = AsyncMock()
         self.go_next_floor = AsyncMock(return_value=True)
+        self.acknowledge_battle_completion = AsyncMock()
 
     @property
     async def is_isekai(self) -> bool:
@@ -432,6 +469,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         session.recoverstamina.assert_not_awaited()
         session.goto_arena.assert_not_awaited()
         session.goto_grindfest.assert_not_awaited()
+        session.acknowledge_battle_completion.assert_not_awaited()
 
     async def test_active_battle_returns_immutable_completion_summary(self) -> None:
         session = _FakeSession(active=True)
@@ -461,6 +499,9 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         strategy.on_battle_started.assert_awaited_once_with(session)
         strategy.take_turn.assert_awaited_once_with(session)
+        session.acknowledge_battle_completion.assert_awaited_once_with(
+            expected_is_isekai=False
+        )
 
     async def test_unknown_round_completion_log_does_not_report_round_zero(
         self,
@@ -619,6 +660,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, BattleStopped(False, 1, 1, 1))
         self.assertTrue(session._active)
+        session.acknowledge_battle_completion.assert_not_awaited()
 
     async def test_explicit_completion_state_never_calls_strategy(self) -> None:
         session = _FakeSession(active=True)
@@ -635,6 +677,63 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         ).run_current()
 
         self.assertEqual(result, BattleCompleted(False, 0, 1, 1))
+        strategy.take_turn.assert_not_awaited()
+        session.acknowledge_battle_completion.assert_awaited_once_with(
+            expected_is_isekai=False
+        )
+
+    async def test_completion_summary_is_captured_before_ack_navigation(
+        self,
+    ) -> None:
+        session = _FakeSession(active=True)
+        session.current_round = 7
+        session.total_rounds = 10
+        session.prepare_turn_state = AsyncMock(
+            return_value=BattleTurnState(BattleTurnPhase.COMPLETE)
+        )
+
+        async def navigate_after_ack(**_kwargs: object) -> None:
+            session.current_round = 0
+            session.total_rounds = 0
+
+        session.acknowledge_battle_completion = AsyncMock(
+            side_effect=navigate_after_ack
+        )
+        strategy = Mock()
+        strategy.take_turn = AsyncMock()
+
+        result = await BattleRunner(
+            session,  # type: ignore[arg-type]
+            strategy,
+            sleep=AsyncMock(),
+        ).run_current()
+
+        self.assertEqual(result, BattleCompleted(False, 0, 7, 10))
+        session.acknowledge_battle_completion.assert_awaited_once_with(
+            expected_is_isekai=False
+        )
+
+    async def test_unknown_final_ack_is_terminal_and_never_retried(self) -> None:
+        session = _FakeSession(active=True)
+        session.prepare_turn_state = AsyncMock(
+            return_value=BattleTurnState(BattleTurnPhase.COMPLETE)
+        )
+        ack_error = BattleActionOutcomeUnknownError("exit evidence missing")
+        session.acknowledge_battle_completion = AsyncMock(side_effect=ack_error)
+        strategy = Mock()
+        strategy.take_turn = AsyncMock()
+
+        with self.assertRaises(BattleInterruptedError) as raised:
+            await BattleRunner(
+                session,  # type: ignore[arg-type]
+                strategy,
+                sleep=AsyncMock(),
+            ).run_current()
+
+        self.assertIs(raised.exception.__cause__, ack_error)
+        session.acknowledge_battle_completion.assert_awaited_once_with(
+            expected_is_isekai=False
+        )
         strategy.take_turn.assert_not_awaited()
 
     async def test_challenge_state_is_refreshed_before_strategy(self) -> None:
@@ -677,6 +776,9 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(result, BattleCompleted)
         session.go_next_floor.assert_awaited_once_with()
+        session.acknowledge_battle_completion.assert_awaited_once_with(
+            expected_is_isekai=False
+        )
         strategy.take_turn.assert_not_awaited()
 
     async def test_pause_polling_continues_to_service_ponychart(self) -> None:

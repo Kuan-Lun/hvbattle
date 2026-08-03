@@ -175,6 +175,20 @@ class BattleRunner:
                 final_round=self.session.current_round,
                 total_rounds=self.session.total_rounds,
             )
+            try:
+                await self.session.acknowledge_battle_completion(
+                    expected_is_isekai=result.is_isekai
+                )
+            except BattleActionOutcomeUnknownError as error:
+                logger.error(
+                    "Final battle completion acknowledgement could not be "
+                    "confirmed: %r",
+                    error,
+                )
+                raise BattleInterruptedError(
+                    "Battle outcome is unknown because the final completion "
+                    "acknowledgement did not produce positive exit evidence"
+                ) from error
             if result.final_round > 0 and result.total_rounds > 0:
                 logger.info("Battle complete: %s", result)
             else:

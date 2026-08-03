@@ -17,6 +17,16 @@ action/item/skill/buff collaborators. Callers that also need non-battle
 maintenance APIs from leaking into the battle-domain surface. The legacy
 `battle_dashboard` name remains a compatibility alias for the state store.
 
+Version 0.2.7 restores the game's final completion acknowledgement as a
+runner-owned safety step. `BattleRunner` captures the immutable completion and
+round summary before clicking the exact `finishbattle.png` control at most
+once, revalidating that the selected control still belongs to the observed
+completion document first. It returns `BattleCompleted` only after a new,
+ready document on the same realm has no battle, finish, next-floor, or
+PonyChart controls. A click or navigation error is reconciled through read-only
+state probes and is never resent; missing positive exit evidence raises
+`BattleInterruptedError`.
+
 Turn preparation uses `BattleTurnState` and `BattleTurnPhase` to distinguish an
 active turn, next-floor transition, PonyChart challenge, positive completion,
 and an absent battle page. `BattleRunner` consumes this typed state directly;
@@ -96,8 +106,9 @@ Tk or start a GUI process.
 ## Development
 
 The dependency-free Lean model in `formal/` covers the safety-critical action
-and transition evidence predicates, error-record ordering, and supervisor
-no-retry exit policy. Run it separately from the Python checks:
+and transition evidence predicates, the final-completion acknowledgement click
+bound, error-record ordering, and supervisor no-retry exit policy. Run it
+separately from the Python checks:
 
 ```bash
 (cd formal && lake build)

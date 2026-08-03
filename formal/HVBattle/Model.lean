@@ -367,6 +367,85 @@ theorem malformedReceiptIsNeverAccepted
     confirmedActionEvidence before current = none := by
   simp [confirmedActionEvidence, observed, malformed]
 
+inductive BattleRealm where
+  | persistent
+  | isekai
+  | outside
+  deriving DecidableEq, Repr
+
+structure CompletionExitSnapshot where
+  document : Nat
+  realm : BattleRealm
+  readiness : DocumentReadiness
+  battlePresent : Bool
+  finishControlPresent : Bool
+  nextFloorPresent : Bool
+  ponychartPresent : Bool
+  deriving DecidableEq, Repr
+
+def completionControlReady
+    (expectedRealm : BattleRealm) (current : CompletionExitSnapshot) : Bool :=
+  decide (current.realm = expectedRealm) && readyEnough current.readiness &&
+    current.battlePresent && current.finishControlPresent
+
+def positiveCompletionExitEvidence
+    (expectedRealm : BattleRealm)
+    (before current : CompletionExitSnapshot) : Bool :=
+  decide (current.document ≠ before.document) &&
+    decide (current.realm = expectedRealm) && readyEnough current.readiness &&
+    !current.battlePresent && !current.finishControlPresent &&
+    !current.nextFloorPresent && !current.ponychartPresent
+
+structure CompletionAckObservation where
+  before : CompletionExitSnapshot
+  after : CompletionExitSnapshot
+  selectorResolved : Bool
+  selectedDocumentStable : Bool
+  deriving DecidableEq, Repr
+
+def completionAckClickCount
+    (expectedRealm : BattleRealm) (observed : CompletionAckObservation) : Nat :=
+  if completionControlReady expectedRealm observed.before &&
+      observed.selectorResolved && observed.selectedDocumentStable then 1 else 0
+
+inductive CompletionAckOutcome where
+  | confirmed
+  | outcomeUnknown
+  deriving DecidableEq, Repr
+
+def completionAckOutcome
+    (expectedRealm : BattleRealm)
+    (observed : CompletionAckObservation) : CompletionAckOutcome :=
+  if completionControlReady expectedRealm observed.before &&
+      positiveCompletionExitEvidence expectedRealm
+        observed.before observed.after then
+    .confirmed
+  else
+    .outcomeUnknown
+
+theorem completionAckClicksAtMostOnce
+    (expectedRealm : BattleRealm) (observed : CompletionAckObservation) :
+    completionAckClickCount expectedRealm observed ≤ 1 := by
+  unfold completionAckClickCount
+  split <;> simp
+
+theorem confirmedCompletionAckRequiresPositiveNewDocumentExit
+    (expectedRealm : BattleRealm) (observed : CompletionAckObservation)
+    (confirmed : completionAckOutcome expectedRealm observed = .confirmed) :
+    positiveCompletionExitEvidence expectedRealm
+      observed.before observed.after = true := by
+  cases controlCase : completionControlReady expectedRealm observed.before <;>
+    cases exitCase : positiveCompletionExitEvidence expectedRealm
+      observed.before observed.after <;>
+    simp_all [completionAckOutcome]
+
+theorem sameDocumentCannotConfirmCompletionExit
+    (expectedRealm : BattleRealm)
+    (before current : CompletionExitSnapshot)
+    (sameDocument : current.document = before.document) :
+    positiveCompletionExitEvidence expectedRealm before current = false := by
+  simp [positiveCompletionExitEvidence, sameDocument]
+
 inductive LogSeverity where
   | info
   | error
@@ -376,6 +455,9 @@ inductive LogCode where
   | transitionConfirmed
   | transitionOutcomeUnknown
   | runnerCompletionUnconfirmed
+  | completionAckConfirmed
+  | completionAckOutcomeUnknown
+  | runnerCompletionAckUnconfirmed
   | driverException
   | applicationBattleInterrupted
   | applicationPostBattleFailure
@@ -429,6 +511,17 @@ def runTransition
     (before current : BattleSnapshot) : Audited RunnerOutcome :=
   mapManagerOutcomeToRunner
     (auditTransitionSelection (confirmedTransitionEvidence before current))
+
+def runCompletionAck
+    (expectedRealm : BattleRealm)
+    (observed : CompletionAckObservation) : Audited RunnerOutcome :=
+  match completionAckOutcome expectedRealm observed with
+  | .confirmed =>
+      ⟨.continueBattle, [.completionAckConfirmed |> infoRecord]⟩
+  | .outcomeUnknown =>
+      ⟨.battleInterrupted,
+        [.completionAckOutcomeUnknown |> errorRecord,
+          .runnerCompletionAckUnconfirmed |> errorRecord]⟩
 
 def configurationFailureExitCode : Nat := 2
 def postBattleFailureExitCode : Nat := 3
@@ -777,6 +870,28 @@ theorem unknownTransitionStopsApplicationWithoutRetry
     auditTransitionSelection, mapManagerOutcomeToRunner,
     mapRunnerOutcomeToApplication, battleInterruptedExitCode,
     loggedCommandExitCode, loggingFailureExitCode,
+    containerSupervisorShouldRetry, launcherShouldRetry,
+    configurationFailureExitCode, postBattleFailureExitCode]
+
+theorem unknownCompletionAckStopsApplicationWithoutRetry
+    (expectedRealm : BattleRealm)
+    (observed : CompletionAckObservation)
+    (unknown : completionAckOutcome expectedRealm observed = .outcomeUnknown)
+    (failureKind : LauncherFailureKind)
+    (teeSucceeded : Bool)
+    (attempt maxAttempts retriesUsed maxRetries : Nat) :
+    let result := mapRunnerOutcomeToApplication
+      (runCompletionAck expectedRealm observed)
+    result.outcome = .exited 4 ∧
+      errorRecord .completionAckOutcomeUnknown ∈ result.records ∧
+      errorRecord .runnerCompletionAckUnconfirmed ∈ result.records ∧
+      errorRecord .driverException ∈ result.records ∧
+      errorRecord .applicationBattleInterrupted ∈ result.records ∧
+      loggedCommandExitCode 4 teeSucceeded = 4 ∧
+      containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
+      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false := by
+  simp [runCompletionAck, unknown, mapRunnerOutcomeToApplication,
+    battleInterruptedExitCode, loggedCommandExitCode, loggingFailureExitCode,
     containerSupervisorShouldRetry, launcherShouldRetry,
     configurationFailureExitCode, postBattleFailureExitCode]
 

@@ -7,6 +7,8 @@ It covers:
 
 - next-round transition evidence and document readiness;
 - authoritative XHR/action receipts;
+- final-completion acknowledgement with at most one click and a new, ready,
+  same-realm out-of-battle document receipt;
 - fail-closed unknown outcomes;
 - manager/runner/browser-driver/application error-record obligations; and
 - the application's exit 2/3/4/5 terminal stops at both shell retry layers,
@@ -46,3 +48,10 @@ accepted only when the round has advanced or initialized and the new battle is
 actionable. `loading` and `unknown` are rejected. A same-document AJAX round
 advance is instead justified by the round/log evidence and does not depend on
 document load readiness.
+
+Final completion is modeled separately from next-floor progression. The exact
+final control is revalidated in its original document before it may be clicked
+at most once. Success requires a changed document on the expected realm whose
+ready state is `interactive` or `complete`, with the battle, finish,
+next-floor, and PonyChart controls all absent. Missing or ambiguous evidence is
+a terminal interruption and is never eligible for either supervisor retry.

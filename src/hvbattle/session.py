@@ -13,6 +13,7 @@ from .battle_launcher import BattleLauncher
 from .battle_state import BattleStateStore
 from .contracts import (
     ArenaOption,
+    BattleActionOutcomeUnknownError,
     BattleInterruptedError,
     BattleTurnPhase,
     BattleTurnState,
@@ -29,6 +30,7 @@ logger = setup_logger(__name__)
 _BATTLE_PHASE_ACTIVE = "active"
 _BATTLE_PHASE_COMPLETE = "complete"
 _BATTLE_PHASE_NEXT_FLOOR = "next-floor"
+_FINAL_COMPLETION_SELECTOR = '#pane_completion img[src*="finishbattle.png"]'
 _BATTLE_PHASE_JS = r"""
 (() => {
     const pane = document.getElementById("pane_completion");
@@ -476,6 +478,17 @@ class BattleSession:
             return False
         await self._actions().click_and_wait_transition_locator("#btcp")
         return True
+
+    async def acknowledge_battle_completion(self, *, expected_is_isekai: bool) -> None:
+        """Click the observed final control once and confirm battle exit."""
+        if not self._completion_observed:
+            raise BattleActionOutcomeUnknownError(
+                "Final battle completion was not observed before acknowledgement"
+            )
+        await self._actions().click_and_wait_battle_exit_locator(
+            _FINAL_COMPLETION_SELECTOR,
+            expected_is_isekai=expected_is_isekai,
+        )
 
     async def list_arena_options(self) -> tuple[ArenaOption, ...]:
         return await self._launcher.list_arena_options()

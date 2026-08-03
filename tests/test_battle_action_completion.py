@@ -7,12 +7,16 @@ from unittest.mock import AsyncMock
 
 from hvbattle import BattleActionOutcomeUnknownError
 from hvbattle.hv_battle_action_manager import (
+    _BATTLE_EXIT_STATE_JS,
     _CLEANUP_ACTION_MONITOR_JS,
     ElementActionManager,
     _ActionMonitorState,
     _BattleActionState,
+    _BattleExitState,
     _confirmed_action_evidence,
+    _confirmed_battle_exit_evidence,
     _confirmed_transition_evidence,
+    _final_completion_control_ready,
     _normal_action_response,
 )
 
@@ -356,6 +360,27 @@ def _state(
     )
 
 
+def _exit_state(
+    *,
+    document_id: str = "document-1",
+    realm: str = "persistent",
+    ready_state: str = "complete",
+    battle_present: bool = True,
+    finish_image_present: bool = True,
+    next_floor_present: bool = False,
+    ponychart_present: bool = False,
+) -> _BattleExitState:
+    return _BattleExitState(
+        document_id=document_id,
+        realm=realm,
+        ready_state=ready_state,
+        battle_present=battle_present,
+        finish_image_present=finish_image_present,
+        next_floor_present=next_floor_present,
+        ponychart_present=ponychart_present,
+    )
+
+
 def _manager() -> ElementActionManager:
     manager = object.__new__(ElementActionManager)
     manager._action_lock = asyncio.Lock()
@@ -475,6 +500,62 @@ class BattleActionJavaScriptHookTests(unittest.TestCase):
                 "sendRestored": True,
             },
         )
+
+    def test_battle_exit_probe_classifies_realm_and_exact_markers(self) -> None:
+        harness = r"""
+const fs = require("node:fs");
+const script = fs.readFileSync(0, "utf8");
+const run = (href, readyState, markers) => {
+    delete globalThis.__hvbattleDocumentId;
+    globalThis.window = {location: {href}};
+    const completion = markers.finish ? {
+        querySelector(selector) {
+            return selector.includes("finishbattle.png") ? {} : null;
+        },
+    } : null;
+    globalThis.document = {
+        readyState,
+        getElementById(id) {
+            if (id === "pane_completion") return completion;
+            if (id === "battle_main" && markers.battle) return {};
+            if (id === "btcp" && markers.nextFloor) return {};
+            if (id === "riddlesubmit" && markers.ponychart) return {};
+            return null;
+        },
+    };
+    return eval(script);
+};
+const absent = {battle: false, finish: false, nextFloor: false, ponychart: false};
+console.log(JSON.stringify({
+    persistent: run("https://hentaiverse.org/?s=Battle", "complete", {
+        battle: true, finish: true, nextFloor: false, ponychart: false,
+    }),
+    isekai: run("https://hentaiverse.org/isekai/?s=Battle", "interactive", absent),
+    spoofed: run("https://hentaiverse.org.example/isekai", "complete", absent),
+    credentials: run("https://user@hentaiverse.org/", "complete", absent),
+    http: run("http://hentaiverse.org/", "complete", absent),
+}));
+"""
+        completed = subprocess.run(
+            [shutil.which("node") or "node", "-e", harness],
+            input=_BATTLE_EXIT_STATE_JS,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["persistent"]["realm"], "persistent")
+        self.assertTrue(result["persistent"]["battlePresent"])
+        self.assertTrue(result["persistent"]["finishImagePresent"])
+        self.assertEqual(result["isekai"]["realm"], "isekai")
+        self.assertEqual(result["isekai"]["readyState"], "interactive")
+        self.assertFalse(result["isekai"]["battlePresent"])
+        self.assertFalse(result["isekai"]["finishImagePresent"])
+        self.assertEqual(result["spoofed"]["realm"], "outside")
+        self.assertEqual(result["credentials"]["realm"], "outside")
+        self.assertEqual(result["http"]["realm"], "outside")
 
 
 class BattleActionEvidenceTests(unittest.TestCase):
@@ -687,6 +768,109 @@ class BattleActionEvidenceTests(unittest.TestCase):
             _confirmed_transition_evidence(before, current),
             "battle-generation+round-initialized",
         )
+
+    def test_final_exit_requires_new_ready_same_realm_document(self) -> None:
+        before = _exit_state()
+        current = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+
+        self.assertEqual(
+            _confirmed_battle_exit_evidence(False, before, current),
+            "new-document+same-realm-ready+battle-controls-absent",
+        )
+
+    def test_final_exit_rejects_ambiguous_landing_states(self) -> None:
+        before = _exit_state()
+        cases = {
+            "same-document": _exit_state(
+                battle_present=False, finish_image_present=False
+            ),
+            "wrong-realm": _exit_state(
+                document_id="document-2",
+                realm="isekai",
+                battle_present=False,
+                finish_image_present=False,
+            ),
+            "outside": _exit_state(
+                document_id="document-2",
+                realm="outside",
+                battle_present=False,
+                finish_image_present=False,
+            ),
+            "loading": _exit_state(
+                document_id="document-2",
+                ready_state="loading",
+                battle_present=False,
+                finish_image_present=False,
+            ),
+            "battle-remains": _exit_state(document_id="document-2"),
+            "finish-remains": _exit_state(
+                document_id="document-2", battle_present=False
+            ),
+            "next-floor": _exit_state(
+                document_id="document-2",
+                battle_present=False,
+                finish_image_present=False,
+                next_floor_present=True,
+            ),
+            "ponychart": _exit_state(
+                document_id="document-2",
+                battle_present=False,
+                finish_image_present=False,
+                ponychart_present=True,
+            ),
+        }
+
+        for name, current in cases.items():
+            with self.subTest(name=name):
+                self.assertIsNone(
+                    _confirmed_battle_exit_evidence(False, before, current)
+                )
+
+    def test_final_completion_control_precondition_is_exact(self) -> None:
+        self.assertTrue(_final_completion_control_ready(False, _exit_state()))
+        self.assertFalse(
+            _final_completion_control_ready(
+                False, _exit_state(finish_image_present=False)
+            )
+        )
+        self.assertTrue(
+            _final_completion_control_ready(False, _exit_state(next_floor_present=True))
+        )
+        self.assertFalse(
+            _final_completion_control_ready(False, _exit_state(realm="isekai"))
+        )
+
+    def test_battle_exit_state_parser_rejects_malformed_fields(self) -> None:
+        raw = {
+            "documentId": "document-1",
+            "realm": "persistent",
+            "readyState": "complete",
+            "battlePresent": True,
+            "finishImagePresent": True,
+            "nextFloorPresent": False,
+            "ponychartPresent": False,
+        }
+        self.assertEqual(_BattleExitState.from_raw(raw), _exit_state())
+
+        malformed = {
+            "documentId": None,
+            "realm": "other",
+            "readyState": "unknown",
+            "battlePresent": "false",
+            "finishImagePresent": 0,
+            "nextFloorPresent": None,
+            "ponychartPresent": "",
+        }
+        for field, invalid in malformed.items():
+            with self.subTest(field=field):
+                candidate = dict(raw)
+                candidate[field] = invalid
+                with self.assertRaises(RuntimeError):
+                    _BattleExitState.from_raw(candidate)
 
 
 class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -921,6 +1105,144 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         manager._click.assert_awaited_once()
         manager._select_for_single_click.assert_awaited_once()
+
+    async def test_final_completion_click_is_sent_once_after_safe_probe(self) -> None:
+        manager = _manager()
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        manager._read_battle_exit_state = AsyncMock(
+            side_effect=[before, before, exited]
+        )
+
+        await manager.click_and_wait_battle_exit_locator(
+            '#pane_completion img[src*="finishbattle.png"]',
+            expected_is_isekai=False,
+            timeout=1,
+        )
+
+        manager._select_for_single_click.assert_awaited_once()
+        manager._click.assert_awaited_once()
+
+    async def test_final_completion_click_error_only_reconciles_post_state(
+        self,
+    ) -> None:
+        manager = _manager()
+        manager._click = AsyncMock(
+            side_effect=RuntimeError("execution context destroyed by navigation")
+        )
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        manager._read_battle_exit_state = AsyncMock(
+            side_effect=[before, before, exited]
+        )
+
+        await manager.click_and_wait_battle_exit_locator(
+            '#pane_completion img[src*="finishbattle.png"]',
+            expected_is_isekai=False,
+            timeout=1,
+        )
+
+        manager._select_for_single_click.assert_awaited_once()
+        manager._click.assert_awaited_once()
+
+    async def test_final_completion_unknown_never_retries_click(self) -> None:
+        manager = _manager()
+        click_error = RuntimeError("click outcome unknown")
+        manager._click = AsyncMock(side_effect=click_error)
+        before = _exit_state()
+        manager._read_battle_exit_state = AsyncMock(return_value=before)
+
+        with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1e-9,
+                check_interval=1e-9,
+            )
+
+        self.assertIs(raised.exception.__cause__, click_error)
+        manager._select_for_single_click.assert_awaited_once()
+        manager._click.assert_awaited_once()
+
+    async def test_same_document_dom_clear_never_confirms_final_exit(self) -> None:
+        manager = _manager()
+        before = _exit_state()
+        cleared = _exit_state(battle_present=False, finish_image_present=False)
+        manager._read_battle_exit_state = AsyncMock(
+            side_effect=[before, before, cleared]
+        )
+
+        with self.assertRaises(BattleActionOutcomeUnknownError):
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1e-9,
+                check_interval=1e-9,
+            )
+
+        manager._click.assert_awaited_once()
+
+    async def test_selector_error_reconciles_new_exit_without_click(self) -> None:
+        manager = _manager()
+        manager._select_for_single_click = AsyncMock(
+            side_effect=RuntimeError("control detached during navigation")
+        )
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        manager._read_battle_exit_state = AsyncMock(side_effect=[before, exited])
+
+        await manager.click_and_wait_battle_exit_locator(
+            '#pane_completion img[src*="finishbattle.png"]',
+            expected_is_isekai=False,
+            timeout=1,
+        )
+
+        manager._select_for_single_click.assert_awaited_once()
+        manager._click.assert_not_awaited()
+
+    async def test_unsafe_preclick_state_is_unknown_without_click(self) -> None:
+        manager = _manager()
+        manager._read_battle_exit_state = AsyncMock(
+            return_value=_exit_state(realm="outside")
+        )
+
+        with self.assertRaises(BattleActionOutcomeUnknownError):
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+            )
+
+        manager._select_for_single_click.assert_not_awaited()
+        manager._click.assert_not_awaited()
+
+    async def test_replaced_completion_document_is_not_clicked(self) -> None:
+        manager = _manager()
+        before = _exit_state()
+        replacement = _exit_state(document_id="document-2")
+        manager._read_battle_exit_state = AsyncMock(side_effect=[before, replacement])
+
+        with self.assertRaises(BattleActionOutcomeUnknownError):
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+            )
+
+        manager._select_for_single_click.assert_awaited_once()
+        manager._click.assert_not_awaited()
 
 
 if __name__ == "__main__":

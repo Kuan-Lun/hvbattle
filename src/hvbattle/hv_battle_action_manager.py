@@ -271,6 +271,54 @@ _CLEANUP_ACTION_MONITOR_JS = """
 """
 
 
+# Final completion is neither a combat XHR nor a next-floor transition. Its
+# dedicated receipt returns only realm/DOM markers, never the current URL.
+_BATTLE_EXIT_STATE_JS = r"""
+(() => {
+    const makeId = () =>
+        `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+
+    if (!globalThis.__hvbattleDocumentId) {
+        globalThis.__hvbattleDocumentId = makeId();
+    }
+
+    let realm = "outside";
+    try {
+        const url = new URL(window.location.href);
+        const trustedOrigin = (
+            url.protocol.toLowerCase() === "https:"
+            && url.hostname.toLowerCase() === "hentaiverse.org"
+            && (url.port === "" || url.port === "443")
+            && url.username === ""
+            && url.password === ""
+        );
+        if (trustedOrigin) {
+            realm = (
+                url.pathname === "/isekai"
+                || url.pathname.startsWith("/isekai/")
+            ) ? "isekai" : "persistent";
+        }
+    } catch (_) {
+        realm = "outside";
+    }
+
+    const completion = document.getElementById("pane_completion");
+    return {
+        documentId: globalThis.__hvbattleDocumentId,
+        realm,
+        readyState: document.readyState,
+        battlePresent: Boolean(document.getElementById("battle_main")),
+        finishImagePresent: Boolean(
+            completion
+            && completion.querySelector('img[src*="finishbattle.png"]')
+        ),
+        nextFloorPresent: Boolean(document.getElementById("btcp")),
+        ponychartPresent: Boolean(document.getElementById("riddlesubmit")),
+    };
+})()
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class _ActionMonitorState:
     sent: bool
@@ -406,6 +454,58 @@ class _BattleActionState:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _BattleExitState:
+    document_id: str
+    realm: str
+    ready_state: str
+    battle_present: bool
+    finish_image_present: bool
+    next_floor_present: bool
+    ponychart_present: bool
+
+    @classmethod
+    def from_raw(cls, raw: object) -> _BattleExitState:
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("Invalid battle exit state payload")
+
+        def strict_bool(key: str) -> bool:
+            value = raw.get(key)
+            if value is True:
+                return True
+            if value is False:
+                return False
+            raise RuntimeError("Invalid battle exit marker payload")
+
+        document_id = raw.get("documentId")
+        realm = raw.get("realm")
+        ready_state = raw.get("readyState")
+        if not isinstance(document_id, str) or not document_id:
+            raise RuntimeError("Invalid battle exit document identity")
+        if realm not in {"persistent", "isekai", "outside"}:
+            raise RuntimeError("Invalid battle exit realm")
+        if ready_state not in {"loading", "interactive", "complete"}:
+            raise RuntimeError("Invalid battle exit document readiness")
+        return cls(
+            document_id=document_id,
+            realm=str(realm),
+            ready_state=str(ready_state),
+            battle_present=strict_bool("battlePresent"),
+            finish_image_present=strict_bool("finishImagePresent"),
+            next_floor_present=strict_bool("nextFloorPresent"),
+            ponychart_present=strict_bool("ponychartPresent"),
+        )
+
+    def summary(self) -> str:
+        return (
+            f"doc={self.document_id[:12]},realm={self.realm},"
+            f"ready={self.ready_state},battle={int(self.battle_present)},"
+            f"finish_image={int(self.finish_image_present)},"
+            f"next_floor={int(self.next_floor_present)},"
+            f"ponychart={int(self.ponychart_present)}"
+        )
+
+
 def _normal_action_response(monitor: _ActionMonitorState | None) -> bool:
     return bool(
         monitor
@@ -506,6 +606,43 @@ def _confirmed_transition_evidence(
     return None
 
 
+def _expected_realm(expected_is_isekai: bool) -> str:
+    if not isinstance(expected_is_isekai, bool):
+        raise TypeError("expected_is_isekai must be bool")
+    return "isekai" if expected_is_isekai else "persistent"
+
+
+def _confirmed_battle_exit_evidence(
+    expected_is_isekai: bool,
+    before: _BattleExitState,
+    current: _BattleExitState,
+) -> str | None:
+    """Return evidence only for a new, ready, same-realm landing page."""
+    if (
+        current.document_id != before.document_id
+        and current.realm == _expected_realm(expected_is_isekai)
+        and current.ready_state in {"interactive", "complete"}
+        and not current.battle_present
+        and not current.finish_image_present
+        and not current.next_floor_present
+        and not current.ponychart_present
+    ):
+        return "new-document+same-realm-ready+battle-controls-absent"
+    return None
+
+
+def _final_completion_control_ready(
+    expected_is_isekai: bool, current: _BattleExitState
+) -> bool:
+    """Require the exact final control in a ready battle on the same realm."""
+    return bool(
+        current.realm == _expected_realm(expected_is_isekai)
+        and current.ready_state in {"interactive", "complete"}
+        and current.battle_present
+        and current.finish_image_present
+    )
+
+
 class ElementActionManager:
     def __init__(self, driver: HVDriver) -> None:
         self.hvdriver = driver
@@ -576,6 +713,15 @@ class ElementActionManager:
         )
         return _BattleActionState.from_raw(raw)
 
+    async def _read_battle_exit_state(
+        self, *, probe_timeout: float = 3.0
+    ) -> _BattleExitState:
+        raw = await asyncio.wait_for(
+            self.page.evaluate(_BATTLE_EXIT_STATE_JS),
+            timeout=probe_timeout,
+        )
+        return _BattleExitState.from_raw(raw)
+
     async def _cleanup_action_monitor(
         self, monitor_id: str, *, probe_timeout: float
     ) -> None:
@@ -629,6 +775,20 @@ class ElementActionManager:
                     monitor_id,
                     probe_timeout=probe_timeout,
                 ),
+                None,
+            )
+        except Exception as error:
+            return fallback, error
+
+    async def _final_battle_exit_probe(
+        self,
+        *,
+        probe_timeout: float,
+        fallback: _BattleExitState,
+    ) -> tuple[_BattleExitState, Exception | None]:
+        try:
+            return (
+                await self._read_battle_exit_state(probe_timeout=probe_timeout),
                 None,
             )
         except Exception as error:
@@ -853,6 +1013,208 @@ class ElementActionManager:
             )
             unknown = BattleActionOutcomeUnknownError(
                 "Battle transition lacks positive next-phase evidence; "
+                f"selector={selector!r}; last_state={last.summary()}"
+            )
+            cause = click_error or probe_error
+            if cause is not None:
+                raise unknown from cause
+            raise unknown
+
+    async def click_and_wait_battle_exit_locator(
+        self,
+        selector: str,
+        *,
+        expected_is_isekai: bool,
+        stale_retries: int = 3,
+        timeout: float = 20.0,
+        check_interval: float = 0.25,
+        probe_timeout: float = 3.0,
+    ) -> None:
+        """Click final completion once and require a new same-realm page."""
+        _expected_realm(expected_is_isekai)
+        if timeout <= 0 or check_interval <= 0 or probe_timeout <= 0:
+            raise ValueError("battle exit timeouts must be positive")
+
+        async with self._action_lock:
+            try:
+                before = await self._read_battle_exit_state(probe_timeout=probe_timeout)
+            except Exception as error:
+                raise BattleActionOutcomeUnknownError(
+                    "Final battle completion acknowledgement could not establish "
+                    "its pre-click state"
+                ) from error
+
+            if not _final_completion_control_ready(expected_is_isekai, before):
+                logger.error(
+                    "Final battle completion acknowledgement precondition unknown "
+                    "selector=%r state=(%s)",
+                    selector,
+                    before.summary(),
+                )
+                raise BattleActionOutcomeUnknownError(
+                    "Final completion control lacks a safe same-realm pre-click "
+                    f"state; selector={selector!r}; state={before.summary()}"
+                )
+
+            try:
+                element = await self._select_for_single_click(
+                    selector,
+                    retries=stale_retries,
+                    wait_timeout=2.0,
+                    delay=0.1,
+                )
+            except Exception as select_error:
+                last, _ = await self._final_battle_exit_probe(
+                    probe_timeout=probe_timeout,
+                    fallback=before,
+                )
+                evidence = _confirmed_battle_exit_evidence(
+                    expected_is_isekai, before, last
+                )
+                if evidence is not None:
+                    logger.info(
+                        "Final battle completion reconciled before click "
+                        "selector=%r evidence=%s state=(%s)",
+                        selector,
+                        evidence,
+                        last.summary(),
+                    )
+                    return
+                logger.error(
+                    "Final battle completion selector outcome unknown selector=%r "
+                    "before=(%s) last=(%s)",
+                    selector,
+                    before.summary(),
+                    last.summary(),
+                )
+                raise BattleActionOutcomeUnknownError(
+                    "Final completion control could not be selected and no "
+                    "positive out-of-battle evidence appeared; "
+                    f"selector={selector!r}; last_state={last.summary()}"
+                ) from select_error
+
+            try:
+                selected_state = await self._read_battle_exit_state(
+                    probe_timeout=probe_timeout
+                )
+            except Exception as selection_probe_error:
+                last, _ = await self._final_battle_exit_probe(
+                    probe_timeout=probe_timeout,
+                    fallback=before,
+                )
+                evidence = _confirmed_battle_exit_evidence(
+                    expected_is_isekai, before, last
+                )
+                if evidence is not None:
+                    logger.info(
+                        "Final battle completion reconciled after selection "
+                        "selector=%r evidence=%s state=(%s)",
+                        selector,
+                        evidence,
+                        last.summary(),
+                    )
+                    return
+                raise BattleActionOutcomeUnknownError(
+                    "Final completion control state could not be revalidated "
+                    "before its single click; "
+                    f"selector={selector!r}; last_state={last.summary()}"
+                ) from selection_probe_error
+
+            evidence = _confirmed_battle_exit_evidence(
+                expected_is_isekai, before, selected_state
+            )
+            if evidence is not None:
+                logger.info(
+                    "Final battle completion reconciled after selection "
+                    "selector=%r evidence=%s state=(%s)",
+                    selector,
+                    evidence,
+                    selected_state.summary(),
+                )
+                return
+            if (
+                selected_state.document_id != before.document_id
+                or not _final_completion_control_ready(
+                    expected_is_isekai, selected_state
+                )
+            ):
+                logger.error(
+                    "Final battle completion control changed before click "
+                    "selector=%r before=(%s) selected=(%s)",
+                    selector,
+                    before.summary(),
+                    selected_state.summary(),
+                )
+                raise BattleActionOutcomeUnknownError(
+                    "Final completion control changed after selection; refusing "
+                    "to click an unverified document; "
+                    f"selector={selector!r}; state={selected_state.summary()}"
+                )
+
+            started = asyncio.get_running_loop().time()
+            click_error: Exception | None = None
+            probe_error: Exception | None = None
+            last = before
+            try:
+                await self._click(element)
+            except Exception as error:
+                click_error = error
+
+            deadline = started + timeout
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    current = await self._read_battle_exit_state(
+                        probe_timeout=probe_timeout
+                    )
+                except Exception as error:
+                    probe_error = error
+                else:
+                    last = current
+                    evidence = _confirmed_battle_exit_evidence(
+                        expected_is_isekai, before, current
+                    )
+                    if evidence is not None:
+                        elapsed = asyncio.get_running_loop().time() - started
+                        logger.info(
+                            "Final battle completion acknowledged selector=%r "
+                            "evidence=%s elapsed=%.2fs",
+                            selector,
+                            evidence,
+                            elapsed,
+                        )
+                        logger.debug("Final battle exit state: %s", current.summary())
+                        return
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining > 0:
+                    await asyncio.sleep(min(check_interval, remaining))
+
+            last, final_error = await self._final_battle_exit_probe(
+                probe_timeout=probe_timeout,
+                fallback=last,
+            )
+            if final_error is not None:
+                probe_error = final_error
+            evidence = _confirmed_battle_exit_evidence(expected_is_isekai, before, last)
+            if evidence is not None:
+                logger.info(
+                    "Final battle completion acknowledged during final "
+                    "reconciliation selector=%r evidence=%s state=(%s)",
+                    selector,
+                    evidence,
+                    last.summary(),
+                )
+                return
+
+            logger.error(
+                "Final battle completion acknowledgement outcome unknown "
+                "selector=%r before=(%s) last=(%s)",
+                selector,
+                before.summary(),
+                last.summary(),
+            )
+            unknown = BattleActionOutcomeUnknownError(
+                "Final battle completion acknowledgement lacks positive "
+                "new-document same-realm out-of-battle evidence; "
                 f"selector={selector!r}; last_state={last.summary()}"
             )
             cause = click_error or probe_error

@@ -3,7 +3,7 @@ import json
 import shutil
 import subprocess
 import unittest
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from hvbattle import BattleActionOutcomeUnknownError
 from hvbattle.hv_battle_action_manager import (
@@ -948,10 +948,54 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         current = _state(monitor=_monitor(log_mutations=1))
         manager._read_action_state = AsyncMock(side_effect=[before, current])
 
-        await manager.click_and_wait_log_locator("#mkey_1", timeout=1)
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_log_locator("#mkey_1", timeout=1)
 
         manager._click.assert_awaited_once()
         manager._cleanup_action_monitor.assert_awaited_once()
+        self.assertTrue(
+            any(
+                call.args[0].startswith("Battle action confirmed selector=")
+                for call in action_logger.debug.call_args_list
+            )
+        )
+        action_logger.info.assert_not_called()
+        action_logger.warning.assert_not_called()
+
+    async def test_click_and_probe_exceptions_with_receipt_warn_without_retry(
+        self,
+    ) -> None:
+        manager = _manager()
+        click_error = RuntimeError("execution context destroyed after dispatch")
+        probe_error = ValueError("transient probe payload")
+        manager._click = AsyncMock(side_effect=click_error)
+        before = _state(monitor=_pending_monitor())
+        current = _state(monitor=_monitor(log_mutations=1))
+        manager._read_action_state = AsyncMock(
+            side_effect=[before, probe_error, current]
+        )
+
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_log_locator(
+                "#mkey_1",
+                timeout=1,
+                check_interval=1e-9,
+            )
+
+        manager._click.assert_awaited_once()
+        action_logger.warning.assert_called_once()
+        self.assertIn(
+            "confirmed after transient error", action_logger.warning.call_args.args[0]
+        )
+        self.assertIn("click_error=%s", action_logger.warning.call_args.args[0])
+        self.assertIn("probe_error=%s", action_logger.warning.call_args.args[0])
+        self.assertEqual(
+            action_logger.warning.call_args.args[-2:],
+            ("RuntimeError", "ValueError"),
+        )
+        self.assertNotIn(str(click_error), repr(action_logger.warning.call_args))
+        self.assertNotIn(str(probe_error), repr(action_logger.warning.call_args))
+        action_logger.info.assert_not_called()
 
     async def test_rejected_xhr_never_accepts_dom_evidence(self) -> None:
         before = _state(monitor=_pending_monitor())
@@ -1096,15 +1140,21 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         manager._read_action_state = AsyncMock(return_value=before)
         manager._final_action_probe = AsyncMock(return_value=(final, None))
 
-        await manager.click_and_wait_log_locator(
-            "#mkey_1",
-            timeout=1e-9,
-            check_interval=1e-9,
-        )
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_log_locator(
+                "#mkey_1",
+                timeout=1e-9,
+                check_interval=1e-9,
+            )
 
         manager._click.assert_awaited_once()
         manager._final_action_probe.assert_awaited_once()
         manager._cleanup_action_monitor.assert_awaited_once()
+        action_logger.warning.assert_called_once()
+        self.assertIn(
+            "during final reconciliation", action_logger.warning.call_args.args[0]
+        )
+        action_logger.info.assert_not_called()
 
     async def test_next_floor_click_waits_for_advanced_round(self) -> None:
         manager = _manager()
@@ -1122,10 +1172,88 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         manager._read_action_state = AsyncMock(side_effect=[before, current])
 
-        await manager.click_and_wait_transition_locator("#btcp", timeout=1)
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_transition_locator("#btcp", timeout=1)
 
         manager._click.assert_awaited_once()
         manager._select_for_single_click.assert_awaited_once()
+        self.assertTrue(
+            any(
+                call.args[0].startswith("Battle transition confirmed selector=")
+                for call in action_logger.debug.call_args_list
+            )
+        )
+        action_logger.info.assert_not_called()
+        action_logger.warning.assert_not_called()
+
+    async def test_transition_click_exception_with_evidence_warns(self) -> None:
+        manager = _manager()
+        click_error = RuntimeError("execution context destroyed by navigation")
+        manager._click = AsyncMock(side_effect=click_error)
+        before = _state(
+            round_text="Initializing arena (Round 1 / 10)",
+            next_floor_present=True,
+            action_controls=0,
+        )
+        current = _state(
+            document_id="document-2",
+            battle_node_id="battle-node-2",
+            round_text="Initializing arena (Round 2 / 10)",
+            next_floor_present=False,
+            action_controls=3,
+        )
+        manager._read_action_state = AsyncMock(side_effect=[before, current])
+
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_transition_locator("#btcp", timeout=1)
+
+        manager._click.assert_awaited_once()
+        action_logger.warning.assert_called_once()
+        self.assertIn(
+            "confirmed after transient error", action_logger.warning.call_args.args[0]
+        )
+        self.assertEqual(
+            action_logger.warning.call_args.args[-2:],
+            ("RuntimeError", "none"),
+        )
+        action_logger.info.assert_not_called()
+
+    async def test_transition_probe_error_with_evidence_warns(self) -> None:
+        manager = _manager()
+        probe_error = RuntimeError("transient transition probe")
+        before = _state(
+            round_text="Initializing arena (Round 1 / 10)",
+            next_floor_present=True,
+            action_controls=0,
+        )
+        current = _state(
+            document_id="document-2",
+            battle_node_id="battle-node-2",
+            round_text="Initializing arena (Round 2 / 10)",
+            next_floor_present=False,
+            action_controls=3,
+        )
+        manager._read_action_state = AsyncMock(
+            side_effect=[before, probe_error, current]
+        )
+
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_transition_locator(
+                "#btcp",
+                timeout=1,
+                check_interval=1e-9,
+            )
+
+        manager._click.assert_awaited_once()
+        action_logger.warning.assert_called_once()
+        self.assertIn(
+            "confirmed after transient error", action_logger.warning.call_args.args[0]
+        )
+        self.assertEqual(
+            action_logger.warning.call_args.args[-2:],
+            ("none", "RuntimeError"),
+        )
+        action_logger.info.assert_not_called()
 
     async def test_slow_next_floor_probe_uses_remaining_transition_deadline(
         self,
@@ -1236,22 +1364,32 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
             side_effect=[before, before, exited]
         )
 
-        await manager.click_and_wait_battle_exit_locator(
-            '#pane_completion img[src*="finishbattle.png"]',
-            expected_is_isekai=False,
-            timeout=1,
-        )
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+            )
 
         manager._select_for_single_click.assert_awaited_once()
         manager._click.assert_awaited_once()
+        self.assertTrue(
+            any(
+                call.args[0].startswith(
+                    "Final battle completion acknowledged selector="
+                )
+                for call in action_logger.debug.call_args_list
+            )
+        )
+        action_logger.info.assert_not_called()
+        action_logger.warning.assert_not_called()
 
     async def test_final_completion_click_error_only_reconciles_post_state(
         self,
     ) -> None:
         manager = _manager()
-        manager._click = AsyncMock(
-            side_effect=RuntimeError("execution context destroyed by navigation")
-        )
+        click_error = RuntimeError("execution context destroyed by navigation")
+        manager._click = AsyncMock(side_effect=click_error)
         before = _exit_state()
         exited = _exit_state(
             document_id="document-2",
@@ -1262,14 +1400,86 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
             side_effect=[before, before, exited]
         )
 
-        await manager.click_and_wait_battle_exit_locator(
-            '#pane_completion img[src*="finishbattle.png"]',
-            expected_is_isekai=False,
-            timeout=1,
-        )
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+            )
 
         manager._select_for_single_click.assert_awaited_once()
         manager._click.assert_awaited_once()
+        action_logger.warning.assert_called_once()
+        self.assertIn(
+            "acknowledged after transient error",
+            action_logger.warning.call_args.args[0],
+        )
+        self.assertEqual(
+            action_logger.warning.call_args.args[-2:],
+            ("RuntimeError", "none"),
+        )
+        action_logger.info.assert_not_called()
+
+    async def test_final_completion_probe_error_with_evidence_warns(self) -> None:
+        manager = _manager()
+        probe_error = RuntimeError("transient final-exit probe")
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        manager._read_battle_exit_state = AsyncMock(
+            side_effect=[before, before, probe_error, exited]
+        )
+
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+                check_interval=1e-9,
+            )
+
+        manager._select_for_single_click.assert_awaited_once()
+        manager._click.assert_awaited_once()
+        action_logger.warning.assert_called_once()
+        self.assertIn(
+            "acknowledged after transient error",
+            action_logger.warning.call_args.args[0],
+        )
+        self.assertEqual(
+            action_logger.warning.call_args.args[-2:],
+            ("none", "RuntimeError"),
+        )
+        action_logger.info.assert_not_called()
+
+    async def test_final_completion_reconciliation_warns(self) -> None:
+        manager = _manager()
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        manager._read_battle_exit_state = AsyncMock(side_effect=[before, before])
+        manager._final_battle_exit_probe = AsyncMock(return_value=(exited, None))
+
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1e-9,
+                check_interval=1e-9,
+            )
+
+        manager._click.assert_awaited_once()
+        manager._final_battle_exit_probe.assert_awaited_once()
+        action_logger.warning.assert_called_once()
+        self.assertIn(
+            "during final reconciliation", action_logger.warning.call_args.args[0]
+        )
+        action_logger.info.assert_not_called()
 
     async def test_final_completion_unknown_never_retries_click(self) -> None:
         manager = _manager()
@@ -1310,9 +1520,8 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_selector_error_reconciles_new_exit_without_click(self) -> None:
         manager = _manager()
-        manager._select_for_single_click = AsyncMock(
-            side_effect=RuntimeError("control detached during navigation")
-        )
+        select_error = RuntimeError("control detached during navigation")
+        manager._select_for_single_click = AsyncMock(side_effect=select_error)
         before = _exit_state()
         exited = _exit_state(
             document_id="document-2",
@@ -1321,14 +1530,84 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         manager._read_battle_exit_state = AsyncMock(side_effect=[before, exited])
 
-        await manager.click_and_wait_battle_exit_locator(
-            '#pane_completion img[src*="finishbattle.png"]',
-            expected_is_isekai=False,
-            timeout=1,
-        )
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+            )
 
         manager._select_for_single_click.assert_awaited_once()
         manager._click.assert_not_awaited()
+        action_logger.warning.assert_called_once()
+        self.assertIn(
+            "reconciled before click", action_logger.warning.call_args.args[0]
+        )
+        self.assertIn("select_error_type=%s", action_logger.warning.call_args.args[0])
+        self.assertIn("no_click_issued=true", action_logger.warning.call_args.args[0])
+        self.assertEqual(action_logger.warning.call_args.args[-2], "RuntimeError")
+        self.assertNotIn(str(select_error), repr(action_logger.warning.call_args))
+        action_logger.info.assert_not_called()
+
+    async def test_selection_probe_error_reconciliation_includes_type(self) -> None:
+        manager = _manager()
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        selection_probe_error = RuntimeError("selection probe leaked a secret")
+        manager._read_battle_exit_state = AsyncMock(
+            side_effect=[before, selection_probe_error]
+        )
+        manager._final_battle_exit_probe = AsyncMock(return_value=(exited, None))
+
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+            )
+
+        manager._select_for_single_click.assert_awaited_once()
+        manager._click.assert_not_awaited()
+        action_logger.warning.assert_called_once()
+        self.assertIn(
+            "selection_probe_error_type=%s",
+            action_logger.warning.call_args.args[0],
+        )
+        self.assertIn("no_click_issued=true", action_logger.warning.call_args.args[0])
+        self.assertEqual(action_logger.warning.call_args.args[-2], "RuntimeError")
+        self.assertNotIn(
+            str(selection_probe_error), repr(action_logger.warning.call_args)
+        )
+
+    async def test_exit_observed_before_click_logs_no_click_issued(self) -> None:
+        manager = _manager()
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        manager._read_battle_exit_state = AsyncMock(side_effect=[before, exited])
+
+        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+            )
+
+        manager._select_for_single_click.assert_awaited_once()
+        manager._click.assert_not_awaited()
+        action_logger.warning.assert_called_once()
+        self.assertIn(
+            "already exited before click", action_logger.warning.call_args.args[0]
+        )
+        self.assertIn("no_click_issued=true", action_logger.warning.call_args.args[0])
+        action_logger.info.assert_not_called()
 
     async def test_unsafe_preclick_state_is_unknown_without_click(self) -> None:
         manager = _manager()

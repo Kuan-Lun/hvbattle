@@ -143,7 +143,9 @@ class BattleRunner:
                     retry_count = 0
                 except BattleActionOutcomeUnknownError as error:
                     logger.error(
-                        "Battle action completion could not be confirmed: %r", error
+                        "Battle action completion could not be confirmed: "
+                        "error_type=%s",
+                        type(error).__name__,
                     )
                     raise BattleInterruptedError(
                         "Battle outcome is unknown because the submitted action "
@@ -153,19 +155,24 @@ class BattleRunner:
                     retry_count += 1
                     if retry_count >= self.timeout_retries:
                         logger.error(
-                            "Battle turn timed out; retry limit reached (%d/%d): %r",
+                            "Battle turn timed out; retry limit reached (%d/%d) "
+                            "error_type=%s",
                             retry_count,
                             self.timeout_retries,
-                            error,
+                            type(error).__name__,
                         )
                         raise BattleInterruptedError(
                             "Battle outcome is unknown after a turn timeout"
                         ) from error
                     logger.warning(
-                        "Battle turn timed out: %r; retrying (%d/%d)",
-                        error,
+                        "Battle turn timed out; retrying (%d/%d) error_type=%s",
                         retry_count,
                         self.timeout_retries,
+                        type(error).__name__,
+                    )
+                    logger.debug(
+                        "Battle turn timeout error detail",
+                        exc_info=True,
                     )
                     await self._sleep(self.retry_delay)
 
@@ -182,21 +189,28 @@ class BattleRunner:
             except BattleActionOutcomeUnknownError as error:
                 logger.error(
                     "Final battle completion acknowledgement could not be "
-                    "confirmed: %r",
-                    error,
+                    "confirmed: error_type=%s",
+                    type(error).__name__,
                 )
                 raise BattleInterruptedError(
                     "Battle outcome is unknown because the final completion "
                     "acknowledgement did not produce positive exit evidence"
                 ) from error
+            realm = "Isekai" if result.is_isekai else "Persistent"
             if result.final_round > 0 and result.total_rounds > 0:
-                logger.info("Battle complete: %s", result)
+                logger.info(
+                    "Battle complete: realm=%s decisions=%d round=%d/%d",
+                    realm,
+                    result.decision_count,
+                    result.final_round,
+                    result.total_rounds,
+                )
             else:
                 logger.info(
-                    "Battle complete: is_isekai=%s decision_count=%d "
-                    "round=<unknown>; the positive completion control appeared "
-                    "before round metadata became available",
-                    result.is_isekai,
+                    "Battle complete: realm=%s decisions=%d round=unknown; "
+                    "the positive completion control appeared before round "
+                    "metadata became available",
+                    realm,
                     result.decision_count,
                 )
             return result

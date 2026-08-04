@@ -84,7 +84,8 @@ class BattleSession:
         self._buff_manager: BuffManager | None = None
         self._completion_observed = False
         self._last_dialog_category: str | None = None
-        self._missing_round_metadata_logged = False
+        self._last_parser_warning_signature: tuple[int, tuple[str, ...]] | None = None
+        self._last_reported_round_progress: tuple[int, int] | None = None
         self.turn = -1
         self.round = -1
         self._initialize_battle_components()
@@ -263,7 +264,8 @@ class BattleSession:
         self.turn = -1
         self.round = -1
         self._completion_observed = False
-        self._missing_round_metadata_logged = False
+        self._last_parser_warning_signature = None
+        self._last_reported_round_progress = None
         if self.battle_state is not None:
             self.battle_state.reset()
 
@@ -286,7 +288,7 @@ class BattleSession:
         phase = await self._read_battle_phase()
         if phase == _BATTLE_PHASE_COMPLETE:
             self._completion_observed = True
-            logger.info("Final battle completion control is ready.")
+            logger.debug("Final battle completion control is ready.")
             return BattleTurnState(BattleTurnPhase.COMPLETE)
         if phase == _BATTLE_PHASE_NEXT_FLOOR:
             return self._prepare_round_transition()
@@ -303,7 +305,7 @@ class BattleSession:
             phase = await self._read_battle_phase()
             if phase == _BATTLE_PHASE_COMPLETE:
                 self._completion_observed = True
-                logger.info("Final battle completion control appeared while parsing.")
+                logger.debug("Final battle completion control appeared while parsing.")
                 return BattleTurnState(BattleTurnPhase.COMPLETE)
             if phase == _BATTLE_PHASE_NEXT_FLOOR:
                 return self._prepare_round_transition()
@@ -312,44 +314,59 @@ class BattleSession:
         phase = await self._read_battle_phase()
         if phase == _BATTLE_PHASE_COMPLETE:
             self._completion_observed = True
-            logger.info("Final battle completion control appeared after parsing.")
+            logger.debug("Final battle completion control appeared after parsing.")
             return BattleTurnState(BattleTurnPhase.COMPLETE)
         if phase == _BATTLE_PHASE_NEXT_FLOOR:
             return self._prepare_round_transition()
-        if self.snapshot.warnings:
-            logger.warning(
-                "Battle parser warnings: %s",
-                ", ".join(self.snapshot.warnings[:5]),
+        parser_warnings = tuple(self.snapshot.warnings)
+        if parser_warnings:
+            displayed_warnings = parser_warnings[:5]
+            warning_signature = (len(parser_warnings), displayed_warnings)
+            log_parser_warnings = (
+                logger.warning
+                if warning_signature
+                != getattr(self, "_last_parser_warning_signature", None)
+                else logger.debug
             )
+            log_parser_warnings(
+                "Battle parser warnings count=%d first=%s",
+                len(parser_warnings),
+                ", ".join(displayed_warnings),
+            )
+            self._last_parser_warning_signature = warning_signature
+        else:
+            self._last_parser_warning_signature = None
         if not self.alive_monster_ids:
             raise TimeoutError(
                 "Battle DOM has no monsters, round transition, or final "
                 "completion marker"
             )
+        current_round = self.current_round
+        total_rounds = self.total_rounds
+        progress_key = (
+            (current_round, total_rounds)
+            if current_round > 0 and total_rounds > 0
+            else (0, 0)
+        )
         self.turn += 1
-        self.round = self.current_round
+        self.round = current_round
         turn_text = f"Turn {self.turn:>5}"
         round_text = self._round_progress_text()
-        if "?" in round_text and not getattr(
-            self, "_missing_round_metadata_logged", False
-        ):
-            logger.info(
-                "Round metadata is unavailable on this active page; it will "
-                "become available after a later round initialization is observed."
-            )
-            self._missing_round_metadata_logged = True
+        if progress_key != getattr(self, "_last_reported_round_progress", None):
+            logger.info("Battle progress: %s", round_text.rstrip())
+            self._last_reported_round_progress = progress_key
         lines = tuple(
             f"{turn_text} {round_text} {line}"
             for line in self._state().log_entries.current_lines
         )
         for line in lines:
-            logger.info(line)
+            logger.debug("%s", line)
         return BattleTurnState(BattleTurnPhase.ACTIVE, lines)
 
     def _prepare_round_transition(self) -> BattleTurnState:
         """Expose a transition as a strategy decision without parsing monsters."""
         self.turn += 1
-        logger.info("Turn %5d: next-round control is ready.", self.turn)
+        logger.debug("Turn %5d: next-round control is ready.", self.turn)
         return BattleTurnState(BattleTurnPhase.NEXT_FLOOR)
 
     async def is_ponychart_present(self) -> bool:
@@ -515,11 +532,13 @@ class BattleSession:
         if not await self._has_battle_marker():
             if await self.is_ponychart_present():
                 return True
-            logger.info("No active battle detected.")
+            logger.debug("No active battle detected.")
             return False
 
         last_error: Exception | None = None
-        for attempt in range(2):
+        parse_attempts = 2
+        retry_delay = 1.0
+        for attempt in range(parse_attempts):
             try:
                 snapshot = await self._state().inspect()
                 if any(monster.alive for monster in snapshot.monsters.values()):
@@ -551,11 +570,20 @@ class BattleSession:
                     return True
                 if isinstance(error, TimeoutError):
                     raise
-                if attempt == 0:
-                    logger.info(
-                        "Battle state parse failed, retrying once after idle wait."
+                if attempt + 1 < parse_attempts:
+                    logger.warning(
+                        "Battle state parse failed; retrying next_attempt=%d/%d "
+                        "delay=%.1fs error_type=%s",
+                        attempt + 2,
+                        parse_attempts,
+                        retry_delay,
+                        type(error).__name__,
                     )
-                    await self.page.wait(1)
+                    logger.debug(
+                        "Battle state parse retry error detail",
+                        exc_info=True,
+                    )
+                    await self.page.wait(retry_delay)
 
         phase = await self._read_battle_phase()
         if phase == _BATTLE_PHASE_COMPLETE:
@@ -565,11 +593,13 @@ class BattleSession:
             return True
         if await self._has_battle_marker():
             logger.error(
-                "On battle page but failed to parse battle state twice; "
-                "refusing to report 'not in battle'."
+                "Battle state parse failed after %d attempts on an active battle "
+                "page; refusing to report no battle: error_type=%s",
+                parse_attempts,
+                type(last_error).__name__,
             )
             assert last_error is not None
             raise last_error
 
-        logger.info("No active battle detected.")
+        logger.debug("No active battle detected.")
         return False

@@ -152,7 +152,14 @@ class PonyChart:
             for obsolete in diagnostics[: -self._diagnostic_file_limit]:
                 obsolete.unlink()
         except OSError as error:
-            logger.warning("Unable to retain PonyChart diagnostic: %r", error)
+            logger.warning(
+                "Unable to retain PonyChart diagnostic: error_type=%s",
+                type(error).__name__,
+            )
+            logger.debug(
+                "PonyChart diagnostic retention error detail",
+                exc_info=True,
+            )
             return None
         return destination
 
@@ -164,24 +171,47 @@ class PonyChart:
             )
         result = _predict(img_path)
         labels: frozenset[str] = result.labels
+        ordered_labels = tuple(
+            sorted(labels, key=lambda label: (label.casefold(), label))
+        )
         label_elements = await self.page.select_all("label.lc", timeout=2)
         norm_map = {}
         for lab in label_elements:
             txt = lab.text.strip()
             if txt:
                 norm_map[txt.lower()] = lab
-        clicked = []
+        clicked: list[str] = []
         for name in labels:
             _lab = norm_map.get(name.lower().strip())
             if _lab is None:
+                logger.warning(
+                    "PonyChart predicted label was not clicked "
+                    "label=%r reason=not-found",
+                    name,
+                )
                 continue
             try:
                 await _lab.click()
                 clicked.append(name)
-            except Exception as e:
-                if is_connection_error(e):
+            except Exception as error:
+                if is_connection_error(error):
                     raise
-        logger.info(f"[PonyChart][ML] Prediction: {labels} -> Clicked text: {clicked}")
+                logger.warning(
+                    "PonyChart predicted label was not clicked "
+                    "label=%r reason=click-error error_type=%s",
+                    name,
+                    type(error).__name__,
+                )
+                logger.debug(
+                    "PonyChart label click error detail: label=%r",
+                    name,
+                    exc_info=True,
+                )
+        logger.debug(
+            "PonyChart prediction labels=%s clicked_labels=%s",
+            ordered_labels,
+            tuple(sorted(clicked, key=lambda label: (label.casefold(), label))),
+        )
         return labels
 
     async def _check(self) -> bool:
@@ -214,14 +244,19 @@ class PonyChart:
 
             try:
                 await self._auto_answer(img_path)
-            except Exception as e:
-                if is_connection_error(e):
+            except Exception as error:
+                if is_connection_error(error):
                     raise
                 retained = retain_diagnostic_once()
-                logger.error(
-                    "[PonyChart] Auto-check failed: %r diagnostic=%s",
-                    e,
+                logger.warning(
+                    "PonyChart auto-answer failed; challenge handling will continue "
+                    "error_type=%s diagnostic=%s",
+                    type(error).__name__,
                     retained,
+                )
+                logger.debug(
+                    "PonyChart auto-answer error detail",
+                    exc_info=True,
                 )
 
             wait_seconds = 10
@@ -231,12 +266,14 @@ class PonyChart:
                 waitlimit -= 1
 
             if waitlimit <= 1 and await self._check():
-                logger.info(
-                    "[PonyChart] Auto-answer did not trigger submission within "
-                    "%ds, attempting fallback submit",
+                logger.warning(
+                    "PonyChart remained present after %ds; "
+                    "attempting fallback submission",
                     wait_seconds,
                 )
                 clicked = False
+                xpath_error_type: str | None = None
+                selector_error_type: str | None = None
                 try:
                     submit_elements = await self.hvdriver.page.xpath(
                         "//input[@type='submit' and @value='Submit Answer']",
@@ -245,38 +282,59 @@ class PonyChart:
                     if submit_elements:
                         await submit_elements[0].click()
                         clicked = True
-                except Exception as e:
-                    if is_connection_error(e):
+                except Exception as error:
+                    if is_connection_error(error):
                         raise
+                    xpath_error_type = type(error).__name__
+                    logger.debug(
+                        "PonyChart XPath fallback click error detail",
+                        exc_info=True,
+                    )
 
                 if not clicked:
                     try:
                         riddle_submit = await self.hvdriver.page.select("#riddlesubmit")
                         await riddle_submit.click()
                         clicked = True
-                    except Exception as e2:
-                        if is_connection_error(e2):
+                    except Exception as error:
+                        if is_connection_error(error):
                             raise
+                        selector_error_type = type(error).__name__
+                        logger.debug(
+                            "PonyChart selector fallback click error detail",
+                            exc_info=True,
+                        )
 
                 await asyncio.sleep(1)
                 if await self._check():
                     retained = retain_diagnostic_once()
                     logger.warning(
-                        "[PonyChart] Fallback submit click did not dismiss riddle "
-                        "(clicked=%s); likely auto-failed by game timeout; "
-                        "diagnostic=%s",
+                        "PonyChart remained present after fallback submission "
+                        "attempt clicked=%s xpath_error_type=%s "
+                        "selector_error_type=%s diagnostic=%s",
                         clicked,
+                        xpath_error_type or "none",
+                        selector_error_type or "none",
                         retained,
                     )
                     raise PonyChartResolutionError(
                         "PonyChart remained present after fallback submission"
                     )
 
-                logger.info(
-                    "[PonyChart] Fallback submit click dismissed riddle "
-                    "(clicked=%s)",
-                    clicked,
-                )
+                if xpath_error_type is not None or selector_error_type is not None:
+                    logger.warning(
+                        "PonyChart fallback submission recovered after click error "
+                        "clicked=%s xpath_error_type=%s selector_error_type=%s",
+                        clicked,
+                        xpath_error_type or "none",
+                        selector_error_type or "none",
+                    )
+                else:
+                    logger.debug(
+                        "PonyChart challenge absent after fallback submission "
+                        "attempt clicked=%s",
+                        clicked,
+                    )
                 return isponychart
 
             await asyncio.sleep(1)

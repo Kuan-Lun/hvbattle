@@ -83,6 +83,13 @@ class BattleLauncher:
         arena_url = f"{HENTAIVERSE_ROOT_URL}{await self._path_prefix()}/?s=Battle&ss=ar"
         current_url = await self.page.evaluate("window.location.href")
         if current_url != arena_url:
+            logger.debug(
+                "Battle form submission skipped kind=arena id=%s "
+                "reason=unexpected-page expected=%s current=%s",
+                option.battle_id,
+                arena_url,
+                current_url,
+            )
             return False
 
         token_js = json.dumps(option.token)
@@ -102,18 +109,22 @@ class BattleLauncher:
                     return true;
                 }})()
                 """)
-        except Exception:
-            logger.exception("Arena battle form submission outcome is unknown")
+        except Exception as error:
+            logger.error(
+                "Battle form submission outcome is unknown kind=arena id=%s "
+                "error_type=%s",
+                option.battle_id,
+                type(error).__name__,
+            )
             raise
         if submitted is not True:
-            logger.warning("Arena battle form was not submitted")
+            logger.warning(
+                "Battle form was not submitted kind=arena id=%s",
+                option.battle_id,
+            )
             return False
 
-        logger.info(
-            "Started Arena battle id=%s token=%s",
-            option.battle_id,
-            "<present>" if option.token else "<none>",
-        )
+        logger.info("Submitted Arena battle form id=%s", option.battle_id)
         return True
 
     async def list_grindfest_options(self) -> tuple[GrindfestOption, ...]:
@@ -147,6 +158,13 @@ class BattleLauncher:
         )
         current_url = await self.page.evaluate("window.location.href")
         if current_url != grindfest_url:
+            logger.debug(
+                "Battle form submission skipped kind=grindfest id=%s "
+                "reason=unexpected-page expected=%s current=%s",
+                option.battle_id,
+                grindfest_url,
+                current_url,
+            )
             return False
 
         try:
@@ -160,14 +178,22 @@ class BattleLauncher:
                     return true;
                 }})()
                 """)
-        except Exception:
-            logger.exception("GrindFest battle form submission outcome is unknown")
+        except Exception as error:
+            logger.error(
+                "Battle form submission outcome is unknown kind=grindfest id=%s "
+                "error_type=%s",
+                option.battle_id,
+                type(error).__name__,
+            )
             raise
         if submitted is not True:
-            logger.warning("GrindFest battle form was not submitted")
+            logger.warning(
+                "Battle form was not submitted kind=grindfest id=%s",
+                option.battle_id,
+            )
             return False
 
-        logger.info("Started GrindFest id=%s", option.battle_id)
+        logger.info("Submitted GrindFest battle form id=%s", option.battle_id)
         return True
 
 

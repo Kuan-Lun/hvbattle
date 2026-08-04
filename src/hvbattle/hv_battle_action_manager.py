@@ -523,6 +523,10 @@ def _normal_action_response(monitor: _ActionMonitorState | None) -> bool:
     )
 
 
+def _error_type_name(error: BaseException | None) -> str:
+    return type(error).__name__ if error is not None else "none"
+
+
 def _confirmed_action_evidence(
     before: _BattleActionState, current: _BattleActionState
 ) -> str | None:
@@ -864,14 +868,27 @@ class ElementActionManager:
                         if evidence is not None:
                             elapsed = asyncio.get_running_loop().time() - started
                             status = current.monitor.status if current.monitor else None
-                            logger.info(
-                                "Battle action confirmed selector=%r "
-                                "evidence=%s elapsed=%.2fs xhr_status=%s",
-                                selector,
-                                evidence,
-                                elapsed,
-                                status,
-                            )
+                            if click_error is None and probe_error is None:
+                                logger.debug(
+                                    "Battle action confirmed selector=%r "
+                                    "evidence=%s elapsed=%.2fs xhr_status=%s",
+                                    selector,
+                                    evidence,
+                                    elapsed,
+                                    status,
+                                )
+                            else:
+                                logger.warning(
+                                    "Battle action confirmed after transient error "
+                                    "selector=%r evidence=%s elapsed=%.2fs "
+                                    "xhr_status=%s click_error=%s probe_error=%s",
+                                    selector,
+                                    evidence,
+                                    elapsed,
+                                    status,
+                                    _error_type_name(click_error),
+                                    _error_type_name(probe_error),
+                                )
                             logger.debug("Battle action state: %s", current.summary())
                             return
                         monitor = current.monitor
@@ -899,13 +916,16 @@ class ElementActionManager:
                 if evidence is not None:
                     elapsed = asyncio.get_running_loop().time() - started
                     status = last.monitor.status if last.monitor else None
-                    logger.info(
+                    logger.warning(
                         "Battle action confirmed during final reconciliation "
-                        "selector=%r evidence=%s elapsed=%.2fs xhr_status=%s",
+                        "selector=%r evidence=%s elapsed=%.2fs xhr_status=%s "
+                        "click_error=%s probe_error=%s",
                         selector,
                         evidence,
                         elapsed,
                         status,
+                        _error_type_name(click_error),
+                        _error_type_name(probe_error),
                     )
                     return
 
@@ -1000,13 +1020,25 @@ class ElementActionManager:
                     evidence = _confirmed_transition_evidence(before, current)
                     if evidence is not None:
                         elapsed = asyncio.get_running_loop().time() - started
-                        logger.info(
-                            "Battle transition confirmed selector=%r "
-                            "evidence=%s elapsed=%.2fs",
-                            selector,
-                            evidence,
-                            elapsed,
-                        )
+                        if click_error is None and probe_error is None:
+                            logger.debug(
+                                "Battle transition confirmed selector=%r "
+                                "evidence=%s elapsed=%.2fs",
+                                selector,
+                                evidence,
+                                elapsed,
+                            )
+                        else:
+                            logger.warning(
+                                "Battle transition confirmed after transient error "
+                                "selector=%r evidence=%s elapsed=%.2fs "
+                                "click_error=%s probe_error=%s",
+                                selector,
+                                evidence,
+                                elapsed,
+                                _error_type_name(click_error),
+                                _error_type_name(probe_error),
+                            )
                         logger.debug("Battle transition state: %s", current.summary())
                         return
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -1023,11 +1055,13 @@ class ElementActionManager:
                     probe_error = error
             evidence = _confirmed_transition_evidence(before, last)
             if evidence is not None:
-                logger.info(
+                logger.warning(
                     "Battle transition confirmed during final reconciliation "
-                    "selector=%r evidence=%s",
+                    "selector=%r evidence=%s click_error=%s probe_error=%s",
                     selector,
                     evidence,
+                    _error_type_name(click_error),
+                    _error_type_name(probe_error),
                 )
                 return
 
@@ -1098,11 +1132,13 @@ class ElementActionManager:
                     expected_is_isekai, before, last
                 )
                 if evidence is not None:
-                    logger.info(
+                    logger.warning(
                         "Final battle completion reconciled before click "
-                        "selector=%r evidence=%s state=(%s)",
+                        "selector=%r evidence=%s select_error_type=%s "
+                        "no_click_issued=true state=(%s)",
                         selector,
                         evidence,
+                        _error_type_name(select_error),
                         last.summary(),
                     )
                     return
@@ -1132,11 +1168,13 @@ class ElementActionManager:
                     expected_is_isekai, before, last
                 )
                 if evidence is not None:
-                    logger.info(
+                    logger.warning(
                         "Final battle completion reconciled after selection "
-                        "selector=%r evidence=%s state=(%s)",
+                        "selector=%r evidence=%s selection_probe_error_type=%s "
+                        "no_click_issued=true state=(%s)",
                         selector,
                         evidence,
+                        _error_type_name(selection_probe_error),
                         last.summary(),
                     )
                     return
@@ -1150,9 +1188,9 @@ class ElementActionManager:
                 expected_is_isekai, before, selected_state
             )
             if evidence is not None:
-                logger.info(
-                    "Final battle completion reconciled after selection "
-                    "selector=%r evidence=%s state=(%s)",
+                logger.warning(
+                    "Final battle completion already exited before click "
+                    "selector=%r evidence=%s no_click_issued=true state=(%s)",
                     selector,
                     evidence,
                     selected_state.summary(),
@@ -1209,13 +1247,25 @@ class ElementActionManager:
                     )
                     if evidence is not None:
                         elapsed = asyncio.get_running_loop().time() - started
-                        logger.info(
-                            "Final battle completion acknowledged selector=%r "
-                            "evidence=%s elapsed=%.2fs",
-                            selector,
-                            evidence,
-                            elapsed,
-                        )
+                        if click_error is None and probe_error is None:
+                            logger.debug(
+                                "Final battle completion acknowledged selector=%r "
+                                "evidence=%s elapsed=%.2fs",
+                                selector,
+                                evidence,
+                                elapsed,
+                            )
+                        else:
+                            logger.warning(
+                                "Final battle completion acknowledged after transient "
+                                "error selector=%r evidence=%s elapsed=%.2fs "
+                                "click_error=%s probe_error=%s",
+                                selector,
+                                evidence,
+                                elapsed,
+                                _error_type_name(click_error),
+                                _error_type_name(probe_error),
+                            )
                         logger.debug("Final battle exit state: %s", current.summary())
                         return
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -1231,11 +1281,14 @@ class ElementActionManager:
                     probe_error = final_error
             evidence = _confirmed_battle_exit_evidence(expected_is_isekai, before, last)
             if evidence is not None:
-                logger.info(
+                logger.warning(
                     "Final battle completion acknowledged during final "
-                    "reconciliation selector=%r evidence=%s state=(%s)",
+                    "reconciliation selector=%r evidence=%s click_error=%s "
+                    "probe_error=%s state=(%s)",
                     selector,
                     evidence,
+                    _error_type_name(click_error),
+                    _error_type_name(probe_error),
                     last.summary(),
                 )
                 return

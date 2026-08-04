@@ -8,7 +8,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 from hvbrowser import HVDriver
 
@@ -135,7 +135,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(prepared)
         self.assertEqual(session.turn, 4)
 
-    async def test_resumed_turn_logs_unknown_round_metadata_once(self) -> None:
+    async def test_resumed_turn_logs_unknown_then_available_progress_once(
+        self,
+    ) -> None:
         session = object.__new__(BattleSession)
         session.turn = -1
         session.round = -1
@@ -147,18 +149,184 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.battle_dashboard.update = AsyncMock()
         session.battle_dashboard.snap = SimpleNamespace(warnings=[])
         session.battle_dashboard.overview_monsters.alive_monster = [0]
-        session.battle_dashboard.log_entries.current_round = 0
+        session.battle_dashboard.log_entries.current_round = 2
         session.battle_dashboard.log_entries.total_round = 0
         session.battle_dashboard.log_entries.current_lines = ["You hit a monster."]
 
         with self.assertLogs("hvbattle.session", level="INFO") as captured:
             await BattleSession.prepare_turn(session)
             await BattleSession.prepare_turn(session)
+            session.battle_dashboard.log_entries.total_round = 10
+            await BattleSession.prepare_turn(session)
 
         output = "\n".join(captured.output)
-        self.assertEqual(output.count("Round metadata is unavailable"), 1)
-        self.assertIn("Round   ? / ?", output)
+        self.assertEqual(output.count("Battle progress: Round   ? / ?"), 1)
+        self.assertEqual(output.count("Battle progress: Round   2 / 10"), 1)
+        self.assertNotIn("You hit a monster.", output)
         self.assertNotIn("Round   0 / 0", output)
+
+    async def test_combat_details_are_debug_and_round_progress_is_deduplicated(
+        self,
+    ) -> None:
+        session = object.__new__(BattleSession)
+        session.turn = -1
+        session.round = -1
+        session._completion_observed = False
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_phase = AsyncMock(return_value="active")
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.update = AsyncMock()
+        session.battle_dashboard.snap = SimpleNamespace(warnings=[])
+        session.battle_dashboard.overview_monsters.alive_monster = [0]
+        session.battle_dashboard.log_entries.current_round = 2
+        session.battle_dashboard.log_entries.total_round = 10
+        session.battle_dashboard.log_entries.current_lines = ["You hit a monster."]
+
+        with (
+            patch.object(session_module.logger, "info") as info,
+            patch.object(session_module.logger, "debug") as debug,
+        ):
+            first_lines = await BattleSession.prepare_turn(session)
+            second_lines = await BattleSession.prepare_turn(session)
+            session.battle_dashboard.log_entries.current_round = 3
+            third_lines = await BattleSession.prepare_turn(session)
+
+        self.assertEqual(
+            info.call_args_list,
+            [
+                call("Battle progress: %s", "Round   2 / 10"),
+                call("Battle progress: %s", "Round   3 / 10"),
+            ],
+        )
+        self.assertEqual(
+            debug.call_args_list,
+            [
+                call("%s", "Turn     0 Round   2 / 10  You hit a monster."),
+                call("%s", "Turn     1 Round   2 / 10  You hit a monster."),
+                call("%s", "Turn     2 Round   3 / 10  You hit a monster."),
+            ],
+        )
+        self.assertEqual(
+            first_lines,
+            ("Turn     0 Round   2 / 10  You hit a monster.",),
+        )
+        self.assertEqual(
+            second_lines,
+            ("Turn     1 Round   2 / 10  You hit a monster.",),
+        )
+        self.assertEqual(
+            third_lines,
+            ("Turn     2 Round   3 / 10  You hit a monster.",),
+        )
+
+    def test_round_transition_detail_is_debug(self) -> None:
+        session = object.__new__(BattleSession)
+        session.turn = 4
+
+        with (
+            patch.object(session_module.logger, "info") as info,
+            patch.object(session_module.logger, "debug") as debug,
+        ):
+            state = BattleSession._prepare_round_transition(session)
+
+        self.assertEqual(state.phase, BattleTurnPhase.NEXT_FLOOR)
+        info.assert_not_called()
+        debug.assert_called_once_with(
+            "Turn %5d: next-round control is ready.",
+            5,
+        )
+
+    async def test_parser_warnings_log_changes_once_and_repeats_at_debug(
+        self,
+    ) -> None:
+        first_warnings = [
+            "missing player hp",
+            "missing player mp",
+            "missing player sp",
+            "missing monster 1",
+            "missing monster 2",
+            "missing monster 3 hp",
+        ]
+        hidden_warning_changed = [*first_warnings[:5], "missing monster 3 mp"]
+        visible_warning_changed = ["invalid player hp", *first_warnings[1:]]
+        session = object.__new__(BattleSession)
+        session.turn = -1
+        session.round = -1
+        session._completion_observed = False
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_phase = AsyncMock(return_value="active")
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.update = AsyncMock()
+        session.battle_dashboard.snap = SimpleNamespace(warnings=first_warnings)
+        session.battle_dashboard.overview_monsters.alive_monster = [0]
+        session.battle_dashboard.log_entries.current_round = 2
+        session.battle_dashboard.log_entries.total_round = 10
+        session.battle_dashboard.log_entries.current_lines = []
+
+        with (
+            patch.object(session_module.logger, "info"),
+            patch.object(session_module.logger, "warning") as warning,
+            patch.object(session_module.logger, "debug") as debug,
+        ):
+            await BattleSession.prepare_turn(session)
+            await BattleSession.prepare_turn(session)
+            session.battle_dashboard.snap.warnings = hidden_warning_changed
+            await BattleSession.prepare_turn(session)
+            session.battle_dashboard.snap.warnings = visible_warning_changed
+            await BattleSession.prepare_turn(session)
+
+        displayed_warnings = ", ".join(first_warnings[:5])
+        changed_displayed_warnings = ", ".join(visible_warning_changed[:5])
+        self.assertEqual(
+            warning.call_args_list,
+            [
+                call(
+                    "Battle parser warnings count=%d first=%s",
+                    6,
+                    displayed_warnings,
+                ),
+                call(
+                    "Battle parser warnings count=%d first=%s",
+                    6,
+                    changed_displayed_warnings,
+                ),
+            ],
+        )
+        self.assertEqual(
+            debug.call_args_list,
+            [
+                call(
+                    "Battle parser warnings count=%d first=%s",
+                    6,
+                    displayed_warnings,
+                ),
+                call(
+                    "Battle parser warnings count=%d first=%s",
+                    6,
+                    displayed_warnings,
+                ),
+            ],
+        )
+
+    def test_reset_clears_battle_scoped_log_deduplication(self) -> None:
+        session = object.__new__(BattleSession)
+        session.turn = 12
+        session.round = 3
+        session._completion_observed = True
+        session._last_parser_warning_signature = (1, ("old warning",))
+        session._last_reported_round_progress = (3, 10)
+        session.battle_state = Mock()
+
+        BattleSession.reset_battle_tracking(session)
+
+        self.assertEqual(session.turn, -1)
+        self.assertEqual(session.round, -1)
+        self.assertFalse(session._completion_observed)
+        self.assertIsNone(session._last_parser_warning_signature)
+        self.assertIsNone(session._last_reported_round_progress)
+        session.battle_state.reset.assert_called_once_with()
 
     async def test_final_round_numbers_without_dom_marker_are_invalid(
         self,
@@ -200,12 +368,18 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.battle_dashboard.log_entries.current_round = 5
         session.battle_dashboard.log_entries.total_round = 5
 
-        prepared = await BattleSession.prepare_turn(session)
+        with (
+            patch.object(session_module.logger, "info") as info,
+            patch.object(session_module.logger, "debug") as debug,
+        ):
+            prepared = await BattleSession.prepare_turn(session)
 
         self.assertIsNone(prepared)
         self.assertTrue(session.battle_completion_observed)
         self.assertEqual(session.turn, 0)
         session.battle_dashboard.update.assert_not_awaited()
+        info.assert_not_called()
+        debug.assert_called_once_with("Final battle completion control is ready.")
 
     async def test_next_floor_marker_bypasses_parser_failure(self) -> None:
         session = object.__new__(BattleSession)
@@ -239,11 +413,44 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
             side_effect=TimeoutError("monsters disappeared during parse")
         )
 
-        prepared = await BattleSession.prepare_turn(session)
+        with (
+            patch.object(session_module.logger, "info") as info,
+            patch.object(session_module.logger, "debug") as debug,
+        ):
+            prepared = await BattleSession.prepare_turn(session)
 
         self.assertIsNone(prepared)
         self.assertTrue(session.battle_completion_observed)
         session.battle_dashboard.update.assert_awaited_once()
+        info.assert_not_called()
+        debug.assert_called_once_with(
+            "Final battle completion control appeared while parsing."
+        )
+
+    async def test_completion_after_parse_is_debug_detail(self) -> None:
+        session = object.__new__(BattleSession)
+        session.turn = 2
+        session.round = 1
+        session._completion_observed = False
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_phase = AsyncMock(side_effect=["active", "complete"])
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.update = AsyncMock()
+
+        with (
+            patch.object(session_module.logger, "info") as info,
+            patch.object(session_module.logger, "debug") as debug,
+        ):
+            prepared = await BattleSession.prepare_turn(session)
+
+        self.assertIsNone(prepared)
+        self.assertTrue(session.battle_completion_observed)
+        session.battle_dashboard.update.assert_awaited_once_with()
+        info.assert_not_called()
+        debug.assert_called_once_with(
+            "Final battle completion control appeared after parsing."
+        )
 
     async def test_finish_image_marker_is_explicit(self) -> None:
         session = object.__new__(BattleSession)
@@ -320,6 +527,66 @@ console.log(JSON.stringify({
 
         self.assertFalse(active)
         self.assertTrue(session.battle_completion_observed)
+
+    async def test_no_active_battle_probe_is_debug_detail(self) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_phase = AsyncMock(return_value="active")
+        session._has_battle_marker = AsyncMock(return_value=False)
+
+        with (
+            patch.object(session_module.logger, "info") as info,
+            patch.object(session_module.logger, "debug") as debug,
+        ):
+            active = await BattleSession.is_in_battle(session)
+
+        self.assertFalse(active)
+        info.assert_not_called()
+        debug.assert_called_once_with("No active battle detected.")
+
+    async def test_battle_parse_retry_and_terminal_error_have_context(self) -> None:
+        first_error = ValueError("first parse failure")
+        last_error = ValueError("second parse failure")
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_phase = AsyncMock(return_value="active")
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session.page = Mock()
+        session.page.wait = AsyncMock()
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.inspect = AsyncMock(
+            side_effect=[first_error, last_error]
+        )
+
+        with (
+            patch.object(session_module.logger, "warning") as warning,
+            patch.object(session_module.logger, "debug") as debug,
+            patch.object(session_module.logger, "error") as error,
+            self.assertRaisesRegex(ValueError, "second parse failure"),
+        ):
+            await BattleSession.is_in_battle(session)
+
+        warning.assert_called_once_with(
+            "Battle state parse failed; retrying next_attempt=%d/%d "
+            "delay=%.1fs error_type=%s",
+            2,
+            2,
+            1.0,
+            "ValueError",
+        )
+        debug.assert_called_once_with(
+            "Battle state parse retry error detail",
+            exc_info=True,
+        )
+        session.page.wait.assert_awaited_once_with(1.0)
+        error.assert_called_once_with(
+            "Battle state parse failed after %d attempts on an active battle "
+            "page; refusing to report no battle: error_type=%s",
+            2,
+            "ValueError",
+        )
 
     async def test_final_completion_ack_uses_dedicated_exact_selector(
         self,
@@ -527,7 +794,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(result, BattleCompleted)
         output = "\n".join(captured.output)
-        self.assertIn("round=<unknown>", output)
+        self.assertIn("round=unknown", output)
         self.assertNotIn("final_round=0", output)
 
     async def test_ponychart_runs_before_optional_strategy_lifecycle(self) -> None:
@@ -612,7 +879,10 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         action_error = BattleActionOutcomeUnknownError("receipt missing")
         strategy.take_turn = AsyncMock(side_effect=action_error)
 
-        with self.assertRaises(BattleInterruptedError) as raised:
+        with (
+            patch("hvbattle.runner.logger") as runner_logger,
+            self.assertRaises(BattleInterruptedError) as raised,
+        ):
             await BattleRunner(
                 session,  # type: ignore[arg-type]
                 strategy,
@@ -620,6 +890,10 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             ).run_current()
 
         self.assertIs(raised.exception.__cause__, action_error)
+        runner_logger.error.assert_called_once_with(
+            "Battle action completion could not be confirmed: error_type=%s",
+            "BattleActionOutcomeUnknownError",
+        )
         session.prepare_turn_state.assert_awaited_once()
         strategy.take_turn.assert_awaited_once_with(session)
 
@@ -632,7 +906,10 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         strategy.take_turn = AsyncMock()
         retry_sleep = AsyncMock()
 
-        with self.assertRaises(BattleInterruptedError) as raised:
+        with (
+            patch("hvbattle.runner.logger") as runner_logger,
+            self.assertRaises(BattleInterruptedError) as raised,
+        ):
             await BattleRunner(
                 session,  # type: ignore[arg-type]
                 strategy,
@@ -641,6 +918,36 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             ).run_current()
 
         self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+        self.assertEqual(
+            runner_logger.warning.call_args_list,
+            [
+                call(
+                    "Battle turn timed out; retrying (%d/%d) error_type=%s",
+                    1,
+                    3,
+                    "TimeoutError",
+                ),
+                call(
+                    "Battle turn timed out; retrying (%d/%d) error_type=%s",
+                    2,
+                    3,
+                    "TimeoutError",
+                ),
+            ],
+        )
+        self.assertEqual(
+            runner_logger.debug.call_args_list,
+            [
+                call("Battle turn timeout error detail", exc_info=True),
+                call("Battle turn timeout error detail", exc_info=True),
+            ],
+        )
+        runner_logger.error.assert_called_once_with(
+            "Battle turn timed out; retry limit reached (%d/%d) error_type=%s",
+            3,
+            3,
+            "TimeoutError",
+        )
         self.assertEqual(session.prepare_turn_state.await_count, 3)
         self.assertEqual(retry_sleep.await_count, 2)
         strategy.take_turn.assert_not_awaited()
@@ -670,13 +977,21 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         strategy = Mock()
         strategy.take_turn = AsyncMock()
 
-        result = await BattleRunner(
-            session,  # type: ignore[arg-type]
-            strategy,
-            sleep=AsyncMock(),
-        ).run_current()
+        with patch("hvbattle.runner.logger") as runner_logger:
+            result = await BattleRunner(
+                session,  # type: ignore[arg-type]
+                strategy,
+                sleep=AsyncMock(),
+            ).run_current()
 
         self.assertEqual(result, BattleCompleted(False, 0, 1, 1))
+        runner_logger.info.assert_called_once_with(
+            "Battle complete: realm=%s decisions=%d round=%d/%d",
+            "Persistent",
+            0,
+            1,
+            1,
+        )
         strategy.take_turn.assert_not_awaited()
         session.acknowledge_battle_completion.assert_awaited_once_with(
             expected_is_isekai=False

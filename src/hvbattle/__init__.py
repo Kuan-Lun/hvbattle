@@ -2,9 +2,12 @@
 
 from .contracts import (
     ArenaOption,
+    BattleActionKind,
     BattleActionOutcomeUnknownError,
+    BattleActionRecoveryEvidence,
     BattleCompleted,
     BattleInterruptedError,
+    BattleRecoveryExhaustedError,
     BattleStopped,
     BattleTurnPhase,
     BattleTurnState,
@@ -21,10 +24,13 @@ from .strategy import BattleLifecycle, BattleStrategy
 __all__ = [
     "ArenaOption",
     "BaseControlPanel",
+    "BattleActionKind",
     "BattleActionOutcomeUnknownError",
+    "BattleActionRecoveryEvidence",
     "BattleCompleted",
     "BattleDriver",
     "BattleInterruptedError",
+    "BattleRecoveryExhaustedError",
     "BattleLifecycle",
     "BattleRunner",
     "BattleSession",

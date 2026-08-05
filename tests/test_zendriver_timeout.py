@@ -6,6 +6,7 @@ from zendriver.core.connection import Transaction
 
 from hvbattle._zendriver import (
     _BACKGROUND_ZENDRIVER_OPERATIONS,
+    ZendriverOperationTimeout,
     wait_for_zendriver,
 )
 
@@ -14,7 +15,7 @@ class ZendriverTimeoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_does_not_cancel_late_protocol_transaction(self) -> None:
         transaction = Transaction(cdp.runtime.evaluate("1", return_by_value=True))
 
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(ZendriverOperationTimeout):
             await wait_for_zendriver(transaction, timeout=0)
 
         self.assertFalse(transaction.cancelled())

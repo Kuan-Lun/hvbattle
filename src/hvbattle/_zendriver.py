@@ -14,6 +14,10 @@ from typing import Any
 _BACKGROUND_ZENDRIVER_OPERATIONS: set[asyncio.Future[Any]] = set()
 
 
+class ZendriverOperationTimeout(TimeoutError):
+    """A timed-out protocol operation that deliberately remains in flight."""
+
+
 def _observe_zendriver_completion(operation: asyncio.Future[Any]) -> None:
     _BACKGROUND_ZENDRIVER_OPERATIONS.discard(operation)
     if operation.cancelled():
@@ -45,5 +49,5 @@ async def wait_for_zendriver[T](
 
     done, _ = await asyncio.wait((operation,), timeout=timeout)
     if not done:
-        raise TimeoutError
+        raise ZendriverOperationTimeout
     return operation.result()

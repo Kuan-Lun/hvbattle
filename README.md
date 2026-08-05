@@ -33,6 +33,38 @@ and an absent battle page. `BattleRunner` consumes this typed state directly;
 the former sentinel-returning `prepare_turn()` remains only as a compatibility
 adapter.
 
+Next-floor transition DOM is never accepted over a retained duplicate XHR
+receipt: a matching monitor must be either unsent with count zero or sent once
+with count one, even when the next round is already visible. If transition
+evidence remains unknown, recovery evidence freezes its XHR fields from that
+same retained monitor, so a duplicate cannot be hidden behind an unrelated
+count-one record.
+
+An ambiguous turn or next-floor action is eligible for same-browser recovery
+only when immutable evidence binds the `server-communication-failed` dialog to
+that exact action token and the XHR is either the precise terminal status-zero
+error shape or has an incomplete zero/one-send receipt with null status and
+outcome. Recovery never replays the cached action. It accepts only a new, ready
+document on the expected persistent/Isekai realm after at least two stable
+state signatures. Complete and next-floor controls take priority over
+PonyChart; an active phase additionally needs its log/action-control markers
+and must parse with a live monster. The runner then returns to turn preparation
+and asks strategy for a fresh decision. A second ambiguity before a confirmed
+`ACTED` or next-floor receipt exhausts that browser's recovery budget. Only
+this typed exhaustion may open one fresh authenticated browser, whose own
+same-browser budget starts unused; it can never open a third browser.
+Final-completion acknowledgement ambiguity never enters that fresh-browser
+path.
+
+A `ZendriverOperationTimeout` is not treated like an ordinary retryable
+`TimeoutError`, because its CDP command deliberately remains live. A live
+timeout while arming or cleaning an action monitor, or while parsing session
+state, interrupts and closes the current browser without retry. After a click,
+it leaves the post-click document unobservable, so that unknown action is not
+eligible for first-use recovery. If it occurs inside recovery after incident
+evidence was already established, the failed old-browser reconciliation is
+typed exhaustion and may use only the one fresh-browser stage described above.
+
 `BattleSession` preloads the PonyChart classifier and ONNX model before opening
 the browser, so a timed challenge never pays the first-load cost. The runner
 checks for and resolves PonyChart before parsing an ordinary battle turn or
@@ -106,9 +138,10 @@ Tk or start a GUI process.
 ## Development
 
 The dependency-free Lean model in `formal/` covers the safety-critical action
-and transition evidence predicates, the final-completion acknowledgement click
-bound, error-record ordering, and supervisor no-retry exit policy. Run it
-separately from the Python checks:
+and transition evidence predicates, the guarded same-browser recovery budget
+and no-replay boundary, the final-completion acknowledgement click bound,
+error-record ordering, and supervisor no-retry exit policy. Run it separately
+from the Python checks:
 
 ```bash
 (cd formal && lake build)

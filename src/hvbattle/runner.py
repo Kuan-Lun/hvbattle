@@ -6,10 +6,12 @@ from collections.abc import Awaitable, Callable
 
 from hvbrowser.runtime import setup_logger
 
+from ._zendriver import ZendriverOperationTimeout
 from .contracts import (
     BattleActionOutcomeUnknownError,
     BattleCompleted,
     BattleInterruptedError,
+    BattleRecoveryExhaustedError,
     BattleStopped,
     BattleTurnPhase,
     TurnDecision,
@@ -67,6 +69,7 @@ class BattleRunner:
             is_isekai = await self.session.is_isekai
             self.session.reset_battle_tracking()
             retry_count = 0
+            recovery_pending_receipt = False
 
             await self.session.resolve_ponychart()
             lifecycle_declared = inspect.getattr_static(
@@ -114,6 +117,7 @@ class BattleRunner:
                             raise TimeoutError(
                                 "Next-floor control disappeared before progression"
                             )
+                        recovery_pending_receipt = False
                         retry_count = 0
                         continue
                     if not prepared.strategy_actionable:
@@ -136,20 +140,71 @@ class BattleRunner:
                         )
                     if decision is TurnDecision.IDLE:
                         await self._sleep(self.idle_delay)
-                    elif decision is not TurnDecision.ACTED:
+                    elif decision is TurnDecision.ACTED:
+                        # A normally returned ACTED decision has already waited
+                        # for its authoritative receipt through BattleSession.
+                        recovery_pending_receipt = False
+                    else:
                         raise TypeError(
                             "BattleStrategy.take_turn() must return TurnDecision"
                         )
                     retry_count = 0
                 except BattleActionOutcomeUnknownError as error:
+                    recovered = False
+                    evidence = error.recovery_evidence
+                    recovery_eligible = bool(
+                        evidence is not None
+                        and evidence.matches_server_communication_failure
+                    )
+                    if recovery_eligible and not recovery_pending_receipt:
+                        recover = getattr(
+                            self.session,
+                            "recover_unknown_action",
+                            None,
+                        )
+                        if recover is not None:
+                            try:
+                                recovered = bool(
+                                    await recover(
+                                        error,
+                                        expected_is_isekai=is_isekai,
+                                    )
+                                )
+                            except Exception as recovery_error:
+                                logger.debug(
+                                    "Battle action reload recovery failed "
+                                    "error_type=%s",
+                                    type(recovery_error).__name__,
+                                )
+                    if recovered:
+                        recovery_pending_receipt = True
+                        retry_count = 0
+                        logger.warning(
+                            "Battle action outcome was unknown after a known "
+                            "communication failure; continuing from reloaded "
+                            "server state"
+                        )
+                        continue
                     logger.error(
                         "Battle action completion could not be confirmed: "
                         "error_type=%s",
                         type(error).__name__,
                     )
-                    raise BattleInterruptedError(
+                    interruption_type = (
+                        BattleRecoveryExhaustedError
+                        if recovery_eligible or recovery_pending_receipt
+                        else BattleInterruptedError
+                    )
+                    raise interruption_type(
                         "Battle outcome is unknown because the submitted action "
                         "did not produce completion evidence"
+                    ) from error
+                except ZendriverOperationTimeout as error:
+                    logger.error(
+                        "Battle browser operation timed out and remains in flight"
+                    )
+                    raise BattleInterruptedError(
+                        "Battle browser operation remains in flight after timeout"
                     ) from error
                 except TimeoutError as error:
                     retry_count += 1

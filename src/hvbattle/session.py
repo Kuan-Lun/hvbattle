@@ -9,6 +9,7 @@ from hvbrowser import HVDriver
 from hvbrowser.runtime import is_connection_error, setup_logger
 from zendriver import cdp
 
+from ._zendriver import ZendriverOperationTimeout
 from .battle_launcher import BattleLauncher
 from .battle_state import BattleStateStore
 from .contracts import (
@@ -24,6 +25,7 @@ from .hv_battle_buff_manager import BuffManager
 from .hv_battle_item_provider import ItemProvider
 from .hv_battle_ponychart import PonyChart, preload_ponychart_classifier
 from .hv_battle_skill_manager import SkillManager
+from .recovery import ActionDialogTracker, BattleRecoveryCoordinator
 
 logger = setup_logger(__name__)
 
@@ -83,7 +85,7 @@ class BattleSession:
         self._skill_manager: SkillManager | None = None
         self._buff_manager: BuffManager | None = None
         self._completion_observed = False
-        self._last_dialog_category: str | None = None
+        self.action_dialog_tracker = ActionDialogTracker()
         self._last_parser_warning_signature: tuple[int, tuple[str, ...]] | None = None
         self._last_reported_round_progress: tuple[int, int] | None = None
         self.turn = -1
@@ -169,7 +171,11 @@ class BattleSession:
         if self.battle_state is not None:
             return
         state_store = BattleStateStore(self.browser_client)
-        actions = ElementActionManager(self.browser_client)
+        actions = ElementActionManager(
+            self.browser_client,
+            begin_dialog_observation=self.action_dialog_tracker.begin,
+            get_dialog_category=self.action_dialog_tracker.category_for,
+        )
         items = ItemProvider(self.browser_client, state_store, actions)
         skills = SkillManager(self.browser_client, state_store, actions)
         buffs = BuffManager(
@@ -184,6 +190,7 @@ class BattleSession:
         self._item_provider = items
         self._skill_manager = skills
         self._buff_manager = buffs
+        self.battle_recovery = BattleRecoveryCoordinator(actions, state_store)
 
     async def _setup_alert_handler(self) -> None:
         async def dialog_handler(
@@ -197,7 +204,7 @@ class BattleSession:
                 category = "session-or-login"
             else:
                 category = "other"
-            self._last_dialog_category = category
+            self.action_dialog_tracker.record(category)
             logger.warning(
                 "Auto-accepting JavaScript dialog category=%s message_length=%d",
                 category,
@@ -269,6 +276,46 @@ class BattleSession:
         if self.battle_state is not None:
             self.battle_state.reset()
 
+    async def recover_unknown_action(
+        self,
+        error: BattleActionOutcomeUnknownError,
+        *,
+        expected_is_isekai: bool,
+        auto_reload_checks: int = 4,
+        recovery_checks: int = 12,
+        stable_checks: int = 2,
+        check_interval: float = 0.25,
+        probe_timeout: float = 2.0,
+    ) -> bool:
+        """Delegate reload reconciliation, then clear only session-owned caches."""
+        if not isinstance(error, BattleActionOutcomeUnknownError):
+            raise TypeError("error must be BattleActionOutcomeUnknownError")
+        if not isinstance(expected_is_isekai, bool):
+            raise TypeError("expected_is_isekai must be bool")
+        evidence = error.recovery_evidence
+        if evidence is None:
+            return False
+
+        expected_realm = "isekai" if expected_is_isekai else "persistent"
+        recovered = await self.battle_recovery.recover(
+            evidence,
+            expected_realm=expected_realm,
+            auto_reload_checks=auto_reload_checks,
+            recovery_checks=recovery_checks,
+            stable_checks=stable_checks,
+            check_interval=check_interval,
+            probe_timeout=probe_timeout,
+        )
+        if not recovered:
+            return False
+
+        self.action_dialog_tracker.clear()
+        self.round = -1
+        self._completion_observed = False
+        self._last_parser_warning_signature = None
+        self._last_reported_round_progress = None
+        return True
+
     def _round_progress_text(self) -> str:
         """Render unavailable resumed-battle metadata without inventing round zero."""
         if self.current_round <= 0 or self.total_rounds <= 0:
@@ -298,6 +345,8 @@ class BattleSession:
         try:
             await self._state().update()
         except Exception as error:
+            if isinstance(error, ZendriverOperationTimeout):
+                raise
             if is_connection_error(error):
                 raise
             if await self.is_ponychart_present():
@@ -463,8 +512,19 @@ class BattleSession:
     async def attack_monster_by_skill(self, slot: int, skill_name: str) -> bool:
         if not await self.select_targeted_skill(skill_name):
             return False
+        return await self.submit_selected_skill_target(slot, skill_name)
+
+    async def submit_selected_skill_target(
+        self,
+        slot: int,
+        skill_name: str,
+    ) -> bool:
+        """Submit the target for an already-selected skill through one boundary."""
         try:
             acted = await self.attack_monster(slot)
+        except BattleActionOutcomeUnknownError:
+            # Recovery can only be authorized later from the immutable evidence.
+            raise
         except Exception as error:
             raise BattleInterruptedError(
                 f"Target submission did not clear armed skill {skill_name!r}"
@@ -557,6 +617,8 @@ class BattleSession:
                     "or completion evidence; parser warnings=" + warnings
                 )
             except Exception as error:
+                if isinstance(error, ZendriverOperationTimeout):
+                    raise
                 if is_connection_error(error):
                     raise
                 last_error = error

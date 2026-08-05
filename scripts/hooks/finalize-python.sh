@@ -9,10 +9,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-FORMAT_PATHS=(src/hvbattle tests)
+PY_FILES=()
+while IFS= read -r -d '' file; do
+    if [[ -f "$file" ]]; then
+        PY_FILES+=("$file")
+    fi
+done < <(
+    git ls-files --cached --others --exclude-standard -z -- '*.py' '*.pyi'
+)
+
+if [[ ${#PY_FILES[@]} -eq 0 ]]; then
+    exit 0
+fi
+
 TYPE_PATHS=(src/hvbattle)
 
-uv run --no-sync black "${FORMAT_PATHS[@]}" >&2
-uv run --no-sync ruff check --fix "${FORMAT_PATHS[@]}" >&2
-uv run --no-sync black "${FORMAT_PATHS[@]}" >&2
+uv run --no-sync black "${PY_FILES[@]}" >&2
+uv run --no-sync ruff check --fix "${PY_FILES[@]}" >&2
+uv run --no-sync black "${PY_FILES[@]}" >&2
 uv run --no-sync mypy "${TYPE_PATHS[@]}" >&2

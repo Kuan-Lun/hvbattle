@@ -5,11 +5,17 @@ import subprocess
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from hvbattle import BattleActionOutcomeUnknownError
+from hvbattle import (
+    BattleActionKind,
+    BattleActionOutcomeUnknownError,
+    BattleInterruptedError,
+)
+from hvbattle._zendriver import ZendriverOperationTimeout
 from hvbattle.hv_battle_action_manager import (
     _BATTLE_EXIT_STATE_JS,
     _CLEANUP_ACTION_MONITOR_JS,
     ElementActionManager,
+    _action_recovery_evidence,
     _ActionMonitorState,
     _BattleActionState,
     _BattleExitState,
@@ -877,21 +883,157 @@ class BattleActionEvidenceTests(unittest.TestCase):
         }
         self.assertEqual(_BattleExitState.from_raw(raw), _exit_state())
 
-        malformed = {
-            "documentId": None,
-            "realm": "other",
-            "readyState": "unknown",
-            "battlePresent": "false",
-            "finishImagePresent": 0,
-            "nextFloorPresent": None,
-            "ponychartPresent": "",
-        }
-        for field, invalid in malformed.items():
+        malformed = (
+            ("documentId", None),
+            ("documentId", "unknown"),
+            ("realm", "other"),
+            ("readyState", "unknown"),
+            ("battlePresent", "false"),
+            ("finishImagePresent", 0),
+            ("nextFloorPresent", None),
+            ("ponychartPresent", ""),
+        )
+        for field, invalid in malformed:
             with self.subTest(field=field):
                 candidate = dict(raw)
                 candidate[field] = invalid
                 with self.assertRaises(RuntimeError):
                     _BattleExitState.from_raw(candidate)
+
+    def test_battle_action_state_parser_rejects_monitor_type_coercion(self) -> None:
+        raw = _raw_state(_state())
+        valid_monitor = {
+            "sent": True,
+            "sentCount": 1,
+            "completed": False,
+            "status": None,
+            "outcome": None,
+            "logMutations": 0,
+            "responseParseOk": None,
+            "responseHasTextlog": False,
+            "responseHasPaneCompletion": False,
+            "responseHasError": False,
+            "responseHasReload": False,
+            "responseHasLogin": False,
+        }
+        raw["monitor"] = valid_monitor
+        self.assertEqual(_BattleActionState.from_raw(raw).monitor.sent_count, 1)
+
+        malformed = {
+            "sent": 1,
+            "sentCount": True,
+            "completed": 0,
+            "status": True,
+            "outcome": 7,
+            "logMutations": -1,
+            "responseParseOk": 1,
+            "responseHasTextlog": 0,
+        }
+        for field, invalid in malformed.items():
+            with self.subTest(field=field):
+                candidate = dict(raw)
+                candidate["monitor"] = dict(valid_monitor, **{field: invalid})
+                with self.assertRaises(RuntimeError):
+                    _BattleActionState.from_raw(candidate)
+
+        for field in valid_monitor:
+            with self.subTest(missing_monitor_field=field):
+                candidate = dict(raw)
+                incomplete_monitor = dict(valid_monitor)
+                incomplete_monitor.pop(field)
+                candidate["monitor"] = incomplete_monitor
+                with self.assertRaises(RuntimeError):
+                    _BattleActionState.from_raw(candidate)
+
+    def test_battle_action_state_parser_requires_explicit_monitor_value(
+        self,
+    ) -> None:
+        raw = _raw_state(_state())
+
+        for invalid in (1, False, "", []):
+            with self.subTest(invalid_monitor=invalid):
+                candidate = dict(raw)
+                candidate["monitor"] = invalid
+                with self.assertRaises(RuntimeError):
+                    _BattleActionState.from_raw(candidate)
+
+        raw.pop("monitor")
+        with self.assertRaises(RuntimeError):
+            _BattleActionState.from_raw(raw)
+
+    def test_battle_action_state_parser_rejects_top_level_type_coercion(self) -> None:
+        raw = _raw_state(_state())
+        malformed = (
+            ("documentId", 1),
+            ("documentId", "unknown"),
+            ("battleNodeId", 1),
+            ("battleNodeId", "unknown"),
+            ("readyState", "unknown"),
+            ("battlePresent", 1),
+            ("logRows", True),
+            ("completionPresent", 0),
+            ("actionControls", -1),
+        )
+        for field, invalid in malformed:
+            with self.subTest(field=field):
+                candidate = dict(raw)
+                candidate[field] = invalid
+                with self.assertRaises(RuntimeError):
+                    _BattleActionState.from_raw(candidate)
+
+        for field in raw:
+            with self.subTest(missing_top_level_field=field):
+                candidate = dict(raw)
+                candidate.pop(field)
+                with self.assertRaises(RuntimeError):
+                    _BattleActionState.from_raw(candidate)
+
+    def test_normal_action_response_rejects_runtime_type_coercion(self) -> None:
+        malformed = _ActionMonitorState(
+            sent=1,  # type: ignore[arg-type]
+            sent_count=1,
+            completed=True,
+            status=200,
+            outcome="load",
+            log_mutations=0,
+            response_parse_ok=True,
+            response_has_textlog=False,
+            response_has_pane_completion=False,
+            response_has_error=False,
+            response_has_reload=False,
+            response_has_login=False,
+        )
+
+        self.assertFalse(_normal_action_response(malformed))
+
+    def test_recovery_evidence_freeze_does_not_coerce_malformed_monitor(self) -> None:
+        malformed = _ActionMonitorState(
+            sent=1,  # type: ignore[arg-type]
+            sent_count=1,
+            completed=0,  # type: ignore[arg-type]
+            status=None,
+            outcome=None,
+            log_mutations=0,
+            response_parse_ok=None,
+            response_has_textlog=False,
+            response_has_pane_completion=False,
+            response_has_error=False,
+            response_has_reload=False,
+            response_has_login=False,
+        )
+
+        evidence = _action_recovery_evidence(
+            action_id="action-1",
+            action_kind=BattleActionKind.TURN,
+            selector="#mkey_3",
+            click_started=True,
+            pre_click_document_id="document-before",
+            post_click_document_id="document-after",
+            dialog_category="server-communication-failed",
+            monitor=malformed,
+        )
+
+        self.assertFalse(evidence.matches_server_communication_failure)
 
 
 class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -929,18 +1071,37 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[:3], ["select", "arm", "click"])
         manager._click.assert_awaited_once()
 
-    async def test_monitor_arm_failure_is_cleaned_without_clicking(self) -> None:
+    async def test_monitor_arm_timeout_does_not_stack_cleanup_or_click(self) -> None:
         manager = _manager()
-        arm_error = TimeoutError("arm probe failed after possible injection")
+        arm_error = ZendriverOperationTimeout(
+            "arm probe failed after possible injection"
+        )
         manager._read_action_state = AsyncMock(side_effect=arm_error)
 
-        with self.assertRaises(TimeoutError) as raised:
+        with self.assertRaises(BattleInterruptedError) as raised:
             await manager.click_and_wait_log_locator("#mkey_1", timeout=1)
 
-        self.assertIs(raised.exception, arm_error)
+        self.assertIs(raised.exception.__cause__, arm_error)
         manager._select_for_single_click.assert_awaited_once()
         manager._click.assert_not_awaited()
-        manager._cleanup_action_monitor.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
+    async def test_monitor_cleanup_live_timeout_interrupts_browser(self) -> None:
+        manager = object.__new__(ElementActionManager)
+        manager.hvdriver = Mock()
+        manager.hvdriver.page.evaluate = Mock()
+        cleanup_timeout = ZendriverOperationTimeout("cleanup command still live")
+
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.wait_for_zendriver",
+                new=AsyncMock(side_effect=cleanup_timeout),
+            ),
+            self.assertRaises(BattleInterruptedError) as raised,
+        ):
+            await manager._cleanup_action_monitor("action-1", probe_timeout=1)
+
+        self.assertIs(raised.exception.__cause__, cleanup_timeout)
 
     async def test_normal_xhr_and_log_mutation_complete_without_sleep(self) -> None:
         manager = _manager()
@@ -1021,7 +1182,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
                     await manager.click_and_wait_log_locator("#mkey_1", timeout=1)
 
                 manager._click.assert_awaited_once()
-                manager._cleanup_action_monitor.assert_awaited_once()
+                manager._cleanup_action_monitor.assert_not_awaited()
 
     async def test_no_dispatch_raises_retryable_timeout(self) -> None:
         manager = _manager()
@@ -1068,7 +1229,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         manager._click.assert_awaited_once()
-        manager._cleanup_action_monitor.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
 
     async def test_click_exception_is_never_retried(self) -> None:
         manager = _manager()
@@ -1100,6 +1261,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(raised.exception.__cause__, click_error)
         manager._click.assert_awaited_once()
         manager._select_for_single_click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
 
     async def test_click_exception_without_post_click_probe_is_unknown(self) -> None:
         manager = _manager()
@@ -1119,8 +1281,14 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIs(raised.exception.__cause__, click_error)
+        evidence = raised.exception.recovery_evidence
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence.post_click_document_id, "unknown")
+        self.assertFalse(evidence.matches_server_communication_failure)
         manager._click.assert_awaited_once()
         manager._select_for_single_click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
 
     async def test_final_reconciliation_accepts_late_battle_completion(self) -> None:
         manager = _manager()
@@ -1177,6 +1345,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         manager._click.assert_awaited_once()
         manager._select_for_single_click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_awaited_once()
         self.assertTrue(
             any(
                 call.args[0].startswith("Battle transition confirmed selector=")
@@ -1255,6 +1424,32 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         action_logger.info.assert_not_called()
 
+    async def test_duplicate_transition_xhr_rejects_advanced_dom(self) -> None:
+        manager = _manager()
+        before = _state(
+            round_text="Initializing arena (Round 1 / 10)",
+            next_floor_present=True,
+            action_controls=0,
+            monitor=_pending_monitor(),
+        )
+        duplicate = _state(
+            round_text="Initializing arena (Round 2 / 10)",
+            next_floor_present=False,
+            action_controls=3,
+            monitor=_monitor(sent_count=2),
+        )
+        manager._read_action_state = AsyncMock(side_effect=[before, duplicate])
+
+        with self.assertRaises(BattleActionOutcomeUnknownError):
+            await manager.click_and_wait_transition_locator(
+                "#btcp",
+                timeout=1e-9,
+                check_interval=1e-9,
+            )
+
+        manager._click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
     async def test_slow_next_floor_probe_uses_remaining_transition_deadline(
         self,
     ) -> None:
@@ -1283,10 +1478,11 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
             probe_timeout: float = 3,
         ) -> _BattleActionState:
             nonlocal active_probes, maximum_active_probes, read_count
-            self.assertFalse(arm_monitor)
             read_count += 1
             if read_count == 1:
+                self.assertTrue(arm_monitor)
                 return before
+            self.assertFalse(arm_monitor)
 
             post_click_timeouts.append(probe_timeout)
             if probe_timeout < 0.01:
@@ -1582,6 +1778,28 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             str(selection_probe_error), repr(action_logger.warning.call_args)
         )
+
+    async def test_selection_live_timeout_never_stacks_final_probe(self) -> None:
+        manager = _manager()
+        before = _exit_state()
+        selection_timeout = ZendriverOperationTimeout(
+            "selection probe command still live"
+        )
+        manager._read_battle_exit_state = AsyncMock(
+            side_effect=[before, selection_timeout]
+        )
+        manager._final_battle_exit_probe = AsyncMock()
+
+        with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+            )
+
+        self.assertIs(raised.exception.__cause__, selection_timeout)
+        manager._final_battle_exit_probe.assert_not_awaited()
+        manager._click.assert_not_awaited()
 
     async def test_exit_observed_before_click_logs_no_click_issued(self) -> None:
         manager = _manager()

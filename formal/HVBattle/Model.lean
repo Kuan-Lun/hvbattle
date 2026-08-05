@@ -131,6 +131,49 @@ def confirmedTransitionEvidence
   else
     none
 
+/-!
+The manager retains the last monitor associated with the submitted next-floor
+action even if navigation removes it from the current document. DOM progress
+may confirm the transition only when that retained monitor proves at most one
+dispatch. An absent monitor is not evidence of duplication and remains allowed;
+a present monitor must be exactly unsent/count-zero or sent/count-one.
+-/
+def transitionReceiptHasAtMostOneDispatch
+    (retainedMonitor : Option ActionMonitor) : Bool :=
+  match retainedMonitor with
+  | none => true
+  | some monitor =>
+      (!monitor.sent && decide (monitor.sentCount = 0)) ||
+        (monitor.sent && decide (monitor.sentCount = 1))
+
+def acceptedTransitionEvidence
+    (before current : BattleSnapshot)
+    (retainedMonitor : Option ActionMonitor) : Option TransitionEvidenceKind :=
+  if transitionReceiptHasAtMostOneDispatch retainedMonitor then
+    confirmedTransitionEvidence before current
+  else
+    none
+
+theorem acceptedTransitionRequiresAtMostOneDispatch
+    (before current : BattleSnapshot)
+    (retainedMonitor : Option ActionMonitor)
+    (evidence : TransitionEvidenceKind)
+    (accepted :
+      acceptedTransitionEvidence before current retainedMonitor = some evidence) :
+    transitionReceiptHasAtMostOneDispatch retainedMonitor = true ∧
+      confirmedTransitionEvidence before current = some evidence := by
+  cases receiptCase :
+      transitionReceiptHasAtMostOneDispatch retainedMonitor <;>
+    simp_all [acceptedTransitionEvidence]
+
+theorem duplicateTransitionDispatchIsNeverAccepted
+    (before current : BattleSnapshot)
+    (retainedMonitor : Option ActionMonitor)
+    (duplicate :
+      transitionReceiptHasAtMostOneDispatch retainedMonitor = false) :
+    acceptedTransitionEvidence before current retainedMonitor = none := by
+  simp [acceptedTransitionEvidence, duplicate]
+
 theorem interactiveGeneratedRoundAdvanceAccepted
     (before current : BattleSnapshot)
     (noPonychart : ponychartAppeared before current = false)
@@ -251,6 +294,20 @@ def observedRound22Interactive : BattleSnapshot where
 def observedRound22Loading : BattleSnapshot :=
   { observedRound22Interactive with readiness := .loading }
 
+def observedDuplicateTransitionMonitor : ActionMonitor where
+  sent := true
+  sentCount := 2
+  completed := false
+  status := none
+  outcome := none
+  responseParseOk := false
+  responseHasError := false
+  responseHasReload := false
+  responseHasLogin := false
+  responseHasTextLog := false
+  responseHasPaneCompletion := false
+  logMutations := 0
+
 theorem observedRound21To22InteractiveIsAccepted :
     confirmedTransitionEvidence observedRound21 observedRound22Interactive =
       some .battleGenerationRoundAdvanced := by
@@ -258,6 +315,11 @@ theorem observedRound21To22InteractiveIsAccepted :
 
 theorem observedRound21To22LoadingIsRejected :
     confirmedTransitionEvidence observedRound21 observedRound22Loading = none := by
+  native_decide
+
+theorem observedRound21To22DuplicateDispatchIsRejected :
+    acceptedTransitionEvidence observedRound21 observedRound22Interactive
+      (some observedDuplicateTransitionMonitor) = none := by
   native_decide
 
 /-!
@@ -373,6 +435,726 @@ inductive BattleRealm where
   | outside
   deriving DecidableEq, Repr
 
+def validExpectedRealm : BattleRealm → Bool
+  | .persistent | .isekai => true
+  | .outside => false
+
+/-!
+## Same-browser reconciliation of an ambiguous submitted action
+
+The action manager freezes the evidence below before the exception leaves its
+exactly-once submission boundary. Tokens model the immutable association
+between the submitted action and the sanitized JavaScript-dialog observation.
+Known pre/post document identities are required even though the post-click
+document may still be the old one; the coordinator separately proves that the
+accepted server state belongs to a new document.
+
+The field types are part of the boundary: `actionKind` has no untyped fallback,
+click/XHR flags are actual `Bool` values, and `xhrSentCount` is a `Nat`. Thus a
+boolean cannot masquerade as send count `1`, matching the runtime's strict
+Python type validation before this structure is constructed.
+-/
+
+inductive BattleActionKind where
+  | turn
+  | nextFloor
+  deriving DecidableEq, Repr
+
+inductive DialogCategory where
+  | serverCommunicationFailed
+  | sessionOrLogin
+  | other
+  deriving DecidableEq, Repr
+
+structure ActionRecoveryEvidence where
+  actionToken : Nat
+  actionKind : BattleActionKind
+  selectorPresent : Bool
+  clickStarted : Bool
+  preDocument : Option Nat
+  postDocument : Option Nat
+  dialogActionToken : Option Nat
+  dialogCategory : Option DialogCategory
+  xhrSent : Bool
+  xhrSentCount : Nat
+  xhrCompleted : Bool
+  xhrStatus : Option Nat
+  xhrOutcome : Option ResponseOutcome
+  deriving DecidableEq, Repr
+
+/-!
+The runtime freezes recovery evidence from the same retained matching monitor
+that gates next-floor transition acceptance. The caller supplies only the
+action/dialog/document envelope; every XHR field below is overwritten from
+that monitor (or with the exact no-monitor defaults), so a duplicate receipt
+cannot be hidden by injecting an unrelated count-one recovery record.
+-/
+def freezeTransitionRecoveryEvidence
+    (envelope : ActionRecoveryEvidence)
+    (retainedMonitor : Option ActionMonitor) : ActionRecoveryEvidence :=
+  match retainedMonitor with
+  | none =>
+      { envelope with
+        xhrSent := false
+        xhrSentCount := 0
+        xhrCompleted := false
+        xhrStatus := none
+        xhrOutcome := none }
+  | some monitor =>
+      { envelope with
+        xhrSent := monitor.sent
+        xhrSentCount := monitor.sentCount
+        xhrCompleted := monitor.completed
+        xhrStatus := monitor.status
+        xhrOutcome := monitor.outcome }
+
+theorem frozenTransitionEvidenceUsesExactRetainedReceipt
+    (envelope : ActionRecoveryEvidence)
+    (monitor : ActionMonitor) :
+    let frozen := freezeTransitionRecoveryEvidence envelope (some monitor)
+    frozen.xhrSent = monitor.sent ∧
+      frozen.xhrSentCount = monitor.sentCount ∧
+      frozen.xhrCompleted = monitor.completed ∧
+      frozen.xhrStatus = monitor.status ∧
+      frozen.xhrOutcome = monitor.outcome := by
+  simp [freezeTransitionRecoveryEvidence]
+
+def exactStatusZeroErrorReceipt (evidence : ActionRecoveryEvidence) : Bool :=
+  evidence.xhrCompleted && evidence.xhrSent &&
+    decide (evidence.xhrSentCount = 1) &&
+    decide (evidence.xhrStatus = some 0) &&
+    decide (evidence.xhrOutcome = some .networkError)
+
+def terminalReceiptUnavailable (evidence : ActionRecoveryEvidence) : Bool :=
+  !evidence.xhrCompleted &&
+    decide (evidence.xhrStatus = none) &&
+    decide (evidence.xhrOutcome = none) &&
+    ((!evidence.xhrSent && decide (evidence.xhrSentCount = 0)) ||
+      (evidence.xhrSent && decide (evidence.xhrSentCount = 1)))
+
+def actionDialogEvidenceBound (evidence : ActionRecoveryEvidence) : Bool :=
+  decide (0 < evidence.actionToken) && evidence.selectorPresent &&
+    evidence.clickStarted && evidence.preDocument.isSome &&
+    evidence.postDocument.isSome &&
+    decide (evidence.dialogActionToken = some evidence.actionToken) &&
+    decide (evidence.dialogCategory = some .serverCommunicationFailed)
+
+def matchesServerCommunicationFailure
+    (evidence : ActionRecoveryEvidence) : Bool :=
+  actionDialogEvidenceBound evidence &&
+    (exactStatusZeroErrorReceipt evidence ||
+      terminalReceiptUnavailable evidence)
+
+/-!
+A post-click Zendriver operation timeout leaves the protocol command alive, so
+the runtime deliberately does not issue another document probe. At this model
+boundary that fact is represented by an unobservable post-click document.
+-/
+theorem unobservablePostDocumentCannotMatchRecoveryIncident
+    (evidence : ActionRecoveryEvidence)
+    (unobservable : evidence.postDocument = none) :
+    matchesServerCommunicationFailure evidence = false := by
+  simp [matchesServerCommunicationFailure, actionDialogEvidenceBound,
+    unobservable]
+
+inductive RecoveryPhase where
+  | active
+  | nextFloor
+  | complete
+  | challenge
+  | ineligible
+  deriving DecidableEq, Repr
+
+/-!
+PonyChart temporarily replaces the ordinary battle container. The runtime
+therefore accepts the visible challenge before falling through to an
+ineligible missing-container state, while complete and next-floor controls on
+an existing battle container retain their higher priority.
+-/
+def classifyRecoverySurface
+    (battlePresent finishControlPresent nextFloorControlPresent
+      ponychartPresent activeLogRevisionPresent
+      activeActionControlsPresent : Bool) :
+    RecoveryPhase :=
+  if battlePresent && finishControlPresent then
+    .complete
+  else if battlePresent && nextFloorControlPresent then
+    .nextFloor
+  else if ponychartPresent then
+    .challenge
+  else if battlePresent && activeLogRevisionPresent &&
+      activeActionControlsPresent then
+    .active
+  else
+    .ineligible
+
+theorem ponychartWithoutBattleContainerIsChallenge :
+    classifyRecoverySurface false false false true false false = .challenge := by
+  native_decide
+
+theorem completionControlHasPriorityOverPonychart :
+    classifyRecoverySurface true true false true true true = .complete := by
+  native_decide
+
+theorem nextFloorControlHasPriorityOverPonychart :
+    classifyRecoverySurface true false true true true true = .nextFloor := by
+  native_decide
+
+theorem activeRecoveryRequiresLogAndActionControlMarkers :
+    classifyRecoverySurface true false false false true true = .active ∧
+      classifyRecoverySurface true false false false false true = .ineligible ∧
+      classifyRecoverySurface true false false false true false = .ineligible := by
+  native_decide
+
+structure RecoveryProbe where
+  document : Nat
+  realm : BattleRealm
+  readiness : DocumentReadiness
+  phase : RecoveryPhase
+  activeMarkersPresent : Bool
+  signature : Nat
+  deriving DecidableEq, Repr
+
+/-!
+`signature` abstracts the runtime tuple containing document, realm, readiness,
+phase, log/completion revisions, and action-control count. The explicit field
+equalities below keep the proof boundary readable and prevent an accidental
+weakening if the concrete fingerprint representation changes.
+-/
+def sameRecoveryState (left right : RecoveryProbe) : Bool :=
+  decide (left.document = right.document) &&
+    decide (left.realm = right.realm) &&
+    decide (left.readiness = right.readiness) &&
+    decide (left.phase = right.phase) &&
+    decide (left.activeMarkersPresent = right.activeMarkersPresent) &&
+    decide (left.signature = right.signature)
+
+def eligibleRecoveryPhase
+    (phase : RecoveryPhase) (activeMarkersPresent activeParsedAlive : Bool) : Bool :=
+  match phase with
+  | .active => activeMarkersPresent && activeParsedAlive
+  | .nextFloor | .complete | .challenge => true
+  | .ineligible => false
+
+structure RecoveryObservation where
+  first : RecoveryProbe
+  second : RecoveryProbe
+  final : RecoveryProbe
+  stableReadCount : Nat
+  activeParsedAlive : Bool
+  cleanupDocument : Nat
+  manualReloadCount : Nat
+  deriving DecidableEq, Repr
+
+def stableSameRealmNewDocument
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation) : Bool :=
+  match evidence.preDocument with
+  | none => false
+  | some preDocument =>
+      validExpectedRealm expectedRealm &&
+        decide (observed.first.document ≠ preDocument) &&
+        decide (observed.first.realm = expectedRealm) &&
+        readyEnough observed.first.readiness &&
+        decide (2 ≤ observed.stableReadCount) &&
+        sameRecoveryState observed.first observed.second &&
+        sameRecoveryState observed.second observed.final &&
+        eligibleRecoveryPhase observed.first.phase
+          observed.first.activeMarkersPresent observed.activeParsedAlive &&
+        decide (observed.cleanupDocument = observed.first.document) &&
+        decide (observed.manualReloadCount ≤ 1)
+
+structure RecoveryBudget where
+  awaitingAuthoritativeReceipt : Bool
+  deriving DecidableEq, Repr
+
+def recoveryBudgetAvailable (budget : RecoveryBudget) : Bool :=
+  !budget.awaitingAuthoritativeReceipt
+
+inductive RecoveryBudgetEvent where
+  | recoveryAccepted
+  | confirmedActed
+  | confirmedNextFloor
+  | noAuthoritativeReceipt
+  deriving DecidableEq, Repr
+
+def updateRecoveryBudget
+    (budget : RecoveryBudget) (event : RecoveryBudgetEvent) : RecoveryBudget :=
+  match event with
+  | .recoveryAccepted => ⟨true⟩
+  | .confirmedActed | .confirmedNextFloor => ⟨false⟩
+  | .noAuthoritativeReceipt => budget
+
+inductive UnknownActionResolution where
+  | recoverToPrepare
+  | recoveryExhausted
+  | interrupt
+  deriving DecidableEq, Repr
+
+def recoveryEligible
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget) : Bool :=
+  validExpectedRealm expectedRealm &&
+    matchesServerCommunicationFailure evidence &&
+    stableSameRealmNewDocument expectedRealm evidence observed &&
+    recoveryBudgetAvailable budget
+
+def classifyUnknownAction
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget) : UnknownActionResolution :=
+  if !validExpectedRealm expectedRealm then
+    .interrupt
+  else if !recoveryBudgetAvailable budget then
+    .recoveryExhausted
+  else if !matchesServerCommunicationFailure evidence then
+    .interrupt
+  else if stableSameRealmNewDocument expectedRealm evidence observed then
+    .recoverToPrepare
+  else
+    .recoveryExhausted
+
+def budgetAfterResolution
+    (before : RecoveryBudget)
+    (resolution : UnknownActionResolution) : RecoveryBudget :=
+  match resolution with
+  | .recoverToPrepare => updateRecoveryBudget before .recoveryAccepted
+  | .recoveryExhausted | .interrupt => before
+
+structure UnknownActionDecision where
+  resolution : UnknownActionResolution
+  budgetAfter : RecoveryBudget
+  deriving DecidableEq, Repr
+
+def decideUnknownAction
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget) : UnknownActionDecision :=
+  let resolution := classifyUnknownAction expectedRealm evidence observed budget
+  ⟨resolution, budgetAfterResolution budget resolution⟩
+
+def resolveUnknownAction
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget) : UnknownActionResolution :=
+  (decideUnknownAction expectedRealm evidence observed budget).resolution
+
+inductive RecoveryNextStep where
+  | prepareAndRunStrategy
+  | replayCachedAction
+  | stop
+  deriving DecidableEq, Repr
+
+def recoveryNextStep : UnknownActionResolution → RecoveryNextStep
+  | .recoverToPrepare => .prepareAndRunStrategy
+  | .recoveryExhausted | .interrupt => .stop
+
+theorem recoveryRequiresEveryGuard
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (recovered :
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoverToPrepare) :
+    validExpectedRealm expectedRealm = true ∧
+      matchesServerCommunicationFailure evidence = true ∧
+      stableSameRealmNewDocument expectedRealm evidence observed = true ∧
+      recoveryBudgetAvailable budget = true := by
+  cases validCase : validExpectedRealm expectedRealm <;>
+    cases availableCase : recoveryBudgetAvailable budget <;>
+    cases incidentCase : matchesServerCommunicationFailure evidence <;>
+    cases stableCase :
+      stableSameRealmNewDocument expectedRealm evidence observed <;>
+    simp_all [resolveUnknownAction, decideUnknownAction, classifyUnknownAction]
+
+theorem recoveryEligibleExactlyWhenResolutionReturnsToPrepare
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget) :
+    recoveryEligible expectedRealm evidence observed budget = true ↔
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoverToPrepare := by
+  cases validCase : validExpectedRealm expectedRealm <;>
+    cases availableCase : recoveryBudgetAvailable budget <;>
+    cases incidentCase : matchesServerCommunicationFailure evidence <;>
+    cases stableCase :
+      stableSameRealmNewDocument expectedRealm evidence observed <;>
+    simp_all [recoveryEligible, resolveUnknownAction, decideUnknownAction,
+      classifyUnknownAction]
+
+theorem allRecoveryGuardsProduceFreshPrepare
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (validRealm : validExpectedRealm expectedRealm = true)
+    (incident : matchesServerCommunicationFailure evidence = true)
+    (stable :
+      stableSameRealmNewDocument expectedRealm evidence observed = true)
+    (available : recoveryBudgetAvailable budget = true) :
+    resolveUnknownAction expectedRealm evidence observed budget =
+      .recoverToPrepare := by
+  simp [resolveUnknownAction, decideUnknownAction, classifyUnknownAction,
+    validRealm, incident, stable, available]
+
+theorem unmatchedUnknownInterrupts
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (validRealm : validExpectedRealm expectedRealm = true)
+    (available : recoveryBudgetAvailable budget = true)
+    (unmatched : matchesServerCommunicationFailure evidence = false) :
+    resolveUnknownAction expectedRealm evidence observed budget = .interrupt := by
+  simp [resolveUnknownAction, decideUnknownAction, classifyUnknownAction,
+    validRealm, available, unmatched]
+
+theorem postClickLiveTimeoutWithAvailableBudgetIsOrdinaryInterrupt
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (validRealm : validExpectedRealm expectedRealm = true)
+    (available : recoveryBudgetAvailable budget = true)
+    (unobservable : evidence.postDocument = none) :
+    resolveUnknownAction expectedRealm evidence observed budget = .interrupt := by
+  apply unmatchedUnknownInterrupts expectedRealm evidence observed budget
+    validRealm available
+  exact unobservablePostDocumentCannotMatchRecoveryIncident evidence unobservable
+
+theorem failedMatchedRecoveryIsTypedExhaustion
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (validRealm : validExpectedRealm expectedRealm = true)
+    (available : recoveryBudgetAvailable budget = true)
+    (incident : matchesServerCommunicationFailure evidence = true)
+    (unstable :
+      stableSameRealmNewDocument expectedRealm evidence observed = false) :
+    resolveUnknownAction expectedRealm evidence observed budget =
+      .recoveryExhausted := by
+  simp [resolveUnknownAction, decideUnknownAction, classifyUnknownAction,
+    validRealm, available, incident, unstable]
+
+theorem outsideExpectedRealmInterrupts
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget) :
+    resolveUnknownAction .outside evidence observed budget = .interrupt := by
+  simp [resolveUnknownAction, decideUnknownAction, classifyUnknownAction,
+    validExpectedRealm]
+
+theorem recoveredUnknownNeverReplaysCachedAction
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (recovered :
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoverToPrepare) :
+    recoveryNextStep
+        (resolveUnknownAction expectedRealm evidence observed budget) =
+        .prepareAndRunStrategy ∧
+      recoveryNextStep
+        (resolveUnknownAction expectedRealm evidence observed budget) ≠
+        .replayCachedAction := by
+  simp [recovered, recoveryNextStep]
+
+theorem recoveredUnknownConsumesRecoveryBudget
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (recovered :
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoverToPrepare) :
+    (decideUnknownAction expectedRealm evidence observed budget).budgetAfter =
+      ⟨true⟩ := by
+  have classified :
+      classifyUnknownAction expectedRealm evidence observed budget =
+        .recoverToPrepare := by
+    simpa [resolveUnknownAction, decideUnknownAction] using recovered
+  simp [decideUnknownAction, classified, budgetAfterResolution,
+    updateRecoveryBudget]
+
+theorem secondConsecutiveUnknownIsTypedExhaustion
+    (expectedRealm : BattleRealm)
+    (firstEvidence nextEvidence : ActionRecoveryEvidence)
+    (firstObservation nextObservation : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (firstRecovered :
+      resolveUnknownAction expectedRealm firstEvidence firstObservation budget =
+        .recoverToPrepare) :
+    resolveUnknownAction expectedRealm nextEvidence nextObservation
+        (decideUnknownAction expectedRealm firstEvidence firstObservation
+          budget).budgetAfter = .recoveryExhausted := by
+  have guards := recoveryRequiresEveryGuard expectedRealm firstEvidence
+    firstObservation budget firstRecovered
+  have consumed := recoveredUnknownConsumesRecoveryBudget expectedRealm
+    firstEvidence firstObservation budget firstRecovered
+  rcases guards with ⟨validRealm, _, _, _⟩
+  rw [consumed]
+  simp [resolveUnknownAction, decideUnknownAction,
+    classifyUnknownAction, validRealm, recoveryBudgetAvailable]
+
+theorem confirmedActedRestoresRecoveryBudget (budget : RecoveryBudget) :
+    recoveryBudgetAvailable
+      (updateRecoveryBudget budget .confirmedActed) = true := by
+  simp [updateRecoveryBudget, recoveryBudgetAvailable]
+
+theorem confirmedNextFloorRestoresRecoveryBudget (budget : RecoveryBudget) :
+    recoveryBudgetAvailable
+      (updateRecoveryBudget budget .confirmedNextFloor) = true := by
+  simp [updateRecoveryBudget, recoveryBudgetAvailable]
+
+theorem acceptedRecoveryUsesAtMostOneManualReload
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (recovered :
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoverToPrepare) :
+    observed.manualReloadCount ≤ 1 := by
+  have guards := recoveryRequiresEveryGuard expectedRealm evidence observed budget
+    recovered
+  rcases guards with ⟨_, _, stable, _⟩
+  simp [stableSameRealmNewDocument] at stable
+  split at stable <;> simp_all
+
+structure AcceptedRecoveryCleanup where
+  pageActionStateCleared : Bool
+  dialogTrackerCleared : Bool
+  sessionRoundCacheCleared : Bool
+  sessionCompletionCacheCleared : Bool
+  parserStoreReset : Bool
+  cachedSubmittedAction : Option Nat
+  deriving DecidableEq, Repr
+
+def acceptedRecoveryCleanup (phase : RecoveryPhase) : AcceptedRecoveryCleanup :=
+  { pageActionStateCleared := true
+    dialogTrackerCleared := true
+    sessionRoundCacheCleared := true
+    sessionCompletionCacheCleared := true
+    parserStoreReset := decide (phase ≠ .complete)
+    cachedSubmittedAction := none }
+
+def cleanupAfterResolution
+    (observed : RecoveryObservation)
+    (resolution : UnknownActionResolution) : Option AcceptedRecoveryCleanup :=
+  match resolution with
+  | .recoverToPrepare => some (acceptedRecoveryCleanup observed.first.phase)
+  | .recoveryExhausted | .interrupt => none
+
+theorem acceptedRecoveryClearsSubmittedActionAndSessionCaches
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (recovered :
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoverToPrepare) :
+    cleanupAfterResolution observed
+        (resolveUnknownAction expectedRealm evidence observed budget) =
+      some (acceptedRecoveryCleanup observed.first.phase) ∧
+      (acceptedRecoveryCleanup observed.first.phase).pageActionStateCleared = true ∧
+      (acceptedRecoveryCleanup observed.first.phase).dialogTrackerCleared = true ∧
+      (acceptedRecoveryCleanup observed.first.phase).sessionRoundCacheCleared = true ∧
+      (acceptedRecoveryCleanup observed.first.phase).sessionCompletionCacheCleared = true ∧
+      (acceptedRecoveryCleanup observed.first.phase).cachedSubmittedAction = none := by
+  simp [recovered, cleanupAfterResolution, acceptedRecoveryCleanup]
+
+theorem acceptedNonCompleteRecoveryResetsParserStore
+    (phase : RecoveryPhase)
+    (notComplete : phase ≠ .complete) :
+    (acceptedRecoveryCleanup phase).parserStoreReset = true := by
+  simp [acceptedRecoveryCleanup, notComplete]
+
+theorem acceptedCompleteRecoveryPreservesParserStore :
+    (acceptedRecoveryCleanup .complete).parserStoreReset = false := by
+  native_decide
+
+def observedStatusZeroEvidence : ActionRecoveryEvidence where
+  actionToken := 7
+  actionKind := .turn
+  selectorPresent := true
+  clickStarted := true
+  preDocument := some 133
+  postDocument := some 134
+  dialogActionToken := some 7
+  dialogCategory := some .serverCommunicationFailed
+  xhrSent := true
+  xhrSentCount := 1
+  xhrCompleted := true
+  xhrStatus := some 0
+  xhrOutcome := some .networkError
+
+def observedReceiptUnavailableEvidence : ActionRecoveryEvidence :=
+  { observedStatusZeroEvidence with
+    xhrSent := false
+    xhrSentCount := 0
+    xhrCompleted := false
+    xhrStatus := none
+    xhrOutcome := none }
+
+def observedUnboundUnknownEvidence : ActionRecoveryEvidence :=
+  { observedReceiptUnavailableEvidence with
+    dialogActionToken := none
+    dialogCategory := none }
+
+def observedRecoveredProbe : RecoveryProbe where
+  document := 134
+  realm := .persistent
+  readiness := .complete
+  phase := .active
+  activeMarkersPresent := true
+  signature := 134001
+
+def observedStableRecovery : RecoveryObservation where
+  first := observedRecoveredProbe
+  second := observedRecoveredProbe
+  final := observedRecoveredProbe
+  stableReadCount := 2
+  activeParsedAlive := true
+  cleanupDocument := 134
+  manualReloadCount := 0
+
+def availableRecoveryBudget : RecoveryBudget := ⟨false⟩
+
+def consumedRecoveryBudget : RecoveryBudget := ⟨true⟩
+
+theorem observedStatusZeroIncidentMatchesRecoveryBoundary :
+    matchesServerCommunicationFailure observedStatusZeroEvidence = true := by
+  native_decide
+
+theorem observedUnavailableReceiptMatchesRecoveryBoundary :
+    matchesServerCommunicationFailure observedReceiptUnavailableEvidence = true := by
+  native_decide
+
+theorem duplicateIncompleteReceiptDoesNotMatchRecoveryBoundary :
+    matchesServerCommunicationFailure
+      { observedReceiptUnavailableEvidence with
+        xhrSent := true
+        xhrSentCount := 2 } = false := by
+  native_decide
+
+theorem staleIncompleteReceiptMetadataDoesNotMatchRecoveryBoundary :
+    matchesServerCommunicationFailure
+      { observedReceiptUnavailableEvidence with
+        xhrStatus := some 0
+        xhrOutcome := some .networkError } = false := by
+  native_decide
+
+theorem observedUnboundUnknownDoesNotMatchRecoveryBoundary :
+    matchesServerCommunicationFailure observedUnboundUnknownEvidence = false := by
+  native_decide
+
+theorem observedDuplicateRetainedMonitorCannotUseInjectedCountOneEnvelope :
+    resolveUnknownAction .persistent
+      (freezeTransitionRecoveryEvidence observedStatusZeroEvidence
+        (some observedDuplicateTransitionMonitor))
+      observedStableRecovery availableRecoveryBudget = .interrupt := by
+  native_decide
+
+theorem observedDuplicateRetainedMonitorWithConsumedBudgetIsTypedExhaustion :
+    resolveUnknownAction .persistent
+      (freezeTransitionRecoveryEvidence observedStatusZeroEvidence
+        (some observedDuplicateTransitionMonitor))
+      observedStableRecovery consumedRecoveryBudget = .recoveryExhausted := by
+  native_decide
+
+theorem observedStableIncidentRecoversToFreshPrepare :
+    resolveUnknownAction .persistent observedStatusZeroEvidence
+      observedStableRecovery availableRecoveryBudget = .recoverToPrepare := by
+  native_decide
+
+theorem observedSecondUnboundUnknownAfterRecoveryIsTypedExhaustion :
+    resolveUnknownAction .persistent observedUnboundUnknownEvidence
+      observedStableRecovery
+      (decideUnknownAction .persistent observedStatusZeroEvidence
+        observedStableRecovery availableRecoveryBudget).budgetAfter =
+      .recoveryExhausted := by
+  native_decide
+
+theorem observedWrongRealmIncidentIsTypedExhaustion :
+    resolveUnknownAction .isekai observedStatusZeroEvidence
+      observedStableRecovery availableRecoveryBudget = .recoveryExhausted := by
+  native_decide
+
+theorem observedUnparsedActiveIncidentIsTypedExhaustion :
+    resolveUnknownAction .persistent observedStatusZeroEvidence
+      { observedStableRecovery with activeParsedAlive := false }
+      availableRecoveryBudget = .recoveryExhausted := by
+  native_decide
+
+theorem matchedIncidentRequiresBoundEvidenceAndTerminalShape
+    (evidence : ActionRecoveryEvidence)
+    (matched : matchesServerCommunicationFailure evidence = true) :
+    actionDialogEvidenceBound evidence = true ∧
+      (exactStatusZeroErrorReceipt evidence = true ∨
+        terminalReceiptUnavailable evidence = true) := by
+  simpa [matchesServerCommunicationFailure] using matched
+
+theorem matchedIncidentBindsExactActionAndDialogTokens
+    (evidence : ActionRecoveryEvidence)
+    (matched : matchesServerCommunicationFailure evidence = true) :
+    0 < evidence.actionToken ∧
+      evidence.dialogActionToken = some evidence.actionToken ∧
+      evidence.dialogCategory = some .serverCommunicationFailed := by
+  have bound := (matchedIncidentRequiresBoundEvidenceAndTerminalShape
+    evidence matched).1
+  simp [actionDialogEvidenceBound] at bound
+  rcases bound with ⟨throughToken, exactCategory⟩
+  rcases throughToken with ⟨throughPostDocument, exactToken⟩
+  rcases throughPostDocument with ⟨throughPreDocument, _⟩
+  rcases throughPreDocument with ⟨throughClick, _⟩
+  rcases throughClick with ⟨positiveAndSelector, _⟩
+  exact ⟨positiveAndSelector.1, exactToken, exactCategory⟩
+
+theorem observedUnstableSignatureIsTypedExhaustion :
+    resolveUnknownAction .persistent observedStatusZeroEvidence
+      { observedStableRecovery with
+        second := { observedRecoveredProbe with signature := 999 } }
+      availableRecoveryBudget = .recoveryExhausted := by
+  native_decide
+
+theorem observedSameDocumentIsTypedExhaustion :
+    resolveUnknownAction .persistent observedStatusZeroEvidence
+      { observedStableRecovery with
+        first := { observedRecoveredProbe with document := 133 }
+        second := { observedRecoveredProbe with document := 133 }
+        final := { observedRecoveredProbe with document := 133 }
+        cleanupDocument := 133 }
+      availableRecoveryBudget = .recoveryExhausted := by
+  native_decide
+
+theorem observedUnreadyDocumentIsTypedExhaustion :
+    resolveUnknownAction .persistent observedStatusZeroEvidence
+      { observedStableRecovery with
+        first := { observedRecoveredProbe with readiness := .loading }
+        second := { observedRecoveredProbe with readiness := .loading }
+        final := { observedRecoveredProbe with readiness := .loading } }
+      availableRecoveryBudget = .recoveryExhausted := by
+  native_decide
+
+theorem observedOutsideExpectedRealmInterrupts :
+    resolveUnknownAction .outside observedStatusZeroEvidence
+      { observedStableRecovery with
+        first := { observedRecoveredProbe with realm := .outside }
+        second := { observedRecoveredProbe with realm := .outside }
+        final := { observedRecoveredProbe with realm := .outside } }
+      availableRecoveryBudget = .interrupt := by
+  native_decide
+
 structure CompletionExitSnapshot where
   document : Nat
   realm : BattleRealm
@@ -454,6 +1236,7 @@ inductive LogSeverity where
 inductive LogCode where
   | transitionConfirmed
   | transitionOutcomeUnknown
+  | actionRecoveryAccepted
   | runnerCompletionUnconfirmed
   | completionAckConfirmed
   | completionAckOutcomeUnknown
@@ -486,6 +1269,200 @@ inductive ApplicationOutcome where
   | exited (code : Nat)
   deriving DecidableEq, Repr
 
+/-!
+Only typed exhaustion raised after same-browser reconciliation fails, or after
+the current browser has consumed its recovery budget, may open one fresh
+authenticated browser. Final-completion acknowledgement ambiguity and
+unrelated interruptions never enter this path, and an ambiguity in the fresh
+browser cannot open a third browser.
+-/
+inductive ApplicationInterruptionKind where
+  | recoveryExhausted
+  | finalCompletionAckUnknown
+  | otherBattleInterrupted
+  deriving DecidableEq, Repr
+
+inductive FreshReconcileDecision where
+  | openFreshCurrentBattle
+  | stop
+  deriving DecidableEq, Repr
+
+structure FreshReconcileResult where
+  decision : FreshReconcileDecision
+  usedAfter : Bool
+  deriving DecidableEq, Repr
+
+def advanceFreshReconcile
+    (kind : ApplicationInterruptionKind)
+    (usedBefore : Bool) : FreshReconcileResult :=
+  match kind with
+  | .recoveryExhausted =>
+      if usedBefore then
+        ⟨.stop, true⟩
+      else
+        ⟨.openFreshCurrentBattle, true⟩
+  | .finalCompletionAckUnknown | .otherBattleInterrupted =>
+      ⟨.stop, usedBefore⟩
+
+def freshReconcileDecision
+    (kind : ApplicationInterruptionKind)
+    (usedBefore : Bool) : FreshReconcileDecision :=
+  (advanceFreshReconcile kind usedBefore).decision
+
+inductive UnknownApplicationDirective where
+  | continueCurrentBrowser
+  | openFreshCurrentBattle
+  | terminalInterrupt
+  deriving DecidableEq, Repr
+
+structure UnknownApplicationDecision where
+  directive : UnknownApplicationDirective
+  resolution : UnknownActionResolution
+  recoveryBudgetAfter : RecoveryBudget
+  freshReconcileUsedAfter : Bool
+  deriving DecidableEq, Repr
+
+def freshBrowserInitialRecoveryBudget : RecoveryBudget := ⟨false⟩
+
+def decideUnknownApplication
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (freshReconcileUsedBefore : Bool) : UnknownApplicationDecision :=
+  let action := decideUnknownAction expectedRealm evidence observed budget
+  match action.resolution with
+  | .recoverToPrepare =>
+      ⟨.continueCurrentBrowser, .recoverToPrepare, action.budgetAfter,
+        freshReconcileUsedBefore⟩
+  | .interrupt =>
+      ⟨.terminalInterrupt, .interrupt, action.budgetAfter,
+        freshReconcileUsedBefore⟩
+  | .recoveryExhausted =>
+      let fresh := advanceFreshReconcile .recoveryExhausted
+        freshReconcileUsedBefore
+      match fresh.decision with
+      | .openFreshCurrentBattle =>
+          ⟨.openFreshCurrentBattle, .recoveryExhausted,
+            freshBrowserInitialRecoveryBudget, fresh.usedAfter⟩
+      | .stop =>
+          ⟨.terminalInterrupt, .recoveryExhausted, action.budgetAfter,
+            fresh.usedAfter⟩
+
+theorem onlyTypedRecoveryExhaustionStartsFreshReconcile
+    (kind : ApplicationInterruptionKind)
+    (freshReconcileAlreadyUsed : Bool)
+    (opened : freshReconcileDecision kind freshReconcileAlreadyUsed =
+      .openFreshCurrentBattle) :
+    kind = .recoveryExhausted ∧ freshReconcileAlreadyUsed = false := by
+  cases kind <;> cases freshReconcileAlreadyUsed <;>
+    simp_all [freshReconcileDecision, advanceFreshReconcile]
+
+theorem finalCompletionAckUnknownNeverStartsFreshReconcile
+    (freshReconcileAlreadyUsed : Bool) :
+    freshReconcileDecision .finalCompletionAckUnknown
+      freshReconcileAlreadyUsed = .stop := by
+  simp [freshReconcileDecision, advanceFreshReconcile]
+
+theorem finalCompletionAckUnknownPreservesFreshReconcileState
+    (freshReconcileUsedBefore : Bool) :
+    (advanceFreshReconcile .finalCompletionAckUnknown
+      freshReconcileUsedBefore).usedAfter = freshReconcileUsedBefore := by
+  simp [advanceFreshReconcile]
+
+theorem freshUnknownActionRequiresTypedExhaustionAndUnusedAttempt
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (freshReconcileUsedBefore : Bool)
+    (opened :
+      (decideUnknownApplication expectedRealm evidence observed budget
+        freshReconcileUsedBefore).directive = .openFreshCurrentBattle) :
+    resolveUnknownAction expectedRealm evidence observed budget =
+        .recoveryExhausted ∧
+      freshReconcileUsedBefore = false ∧
+      (decideUnknownApplication expectedRealm evidence observed budget
+        freshReconcileUsedBefore).freshReconcileUsedAfter = true := by
+  cases decisionCase : decideUnknownAction expectedRealm evidence observed budget with
+  | mk resolution budgetAfter =>
+      cases resolution <;> cases freshReconcileUsedBefore <;>
+        simp_all [decideUnknownApplication, resolveUnknownAction,
+          advanceFreshReconcile]
+
+theorem freshBrowserUnknownNeverStartsThirdBrowser
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget) :
+    (decideUnknownApplication expectedRealm evidence observed budget true).directive ≠
+      .openFreshCurrentBattle := by
+  cases decisionCase : decideUnknownAction expectedRealm evidence observed budget with
+  | mk resolution budgetAfter =>
+      cases resolution <;>
+        simp [decideUnknownApplication, decisionCase, advanceFreshReconcile]
+
+theorem openedFreshBrowserStartsWithAvailableRecoveryBudget
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (opened :
+      (decideUnknownApplication expectedRealm evidence observed budget false).directive =
+        .openFreshCurrentBattle) :
+    (decideUnknownApplication expectedRealm evidence observed budget
+        false).recoveryBudgetAfter = freshBrowserInitialRecoveryBudget ∧
+      recoveryBudgetAvailable
+        (decideUnknownApplication expectedRealm evidence observed budget
+          false).recoveryBudgetAfter = true := by
+  cases decisionCase : decideUnknownAction expectedRealm evidence observed budget with
+  | mk resolution budgetAfter =>
+      cases resolution <;>
+        simp_all [decideUnknownApplication,
+          advanceFreshReconcile, freshBrowserInitialRecoveryBudget,
+          recoveryBudgetAvailable]
+
+theorem openedFreshReconcileThreadsUsedState
+    (expectedRealm : BattleRealm)
+    (firstEvidence nextEvidence : ActionRecoveryEvidence)
+    (firstObservation nextObservation : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (opened :
+      (decideUnknownApplication expectedRealm firstEvidence firstObservation
+        budget false).directive = .openFreshCurrentBattle) :
+    (decideUnknownApplication expectedRealm nextEvidence nextObservation
+        (decideUnknownApplication expectedRealm firstEvidence firstObservation
+          budget false).recoveryBudgetAfter
+        (decideUnknownApplication expectedRealm firstEvidence firstObservation
+          budget false).freshReconcileUsedAfter).directive ≠
+      .openFreshCurrentBattle := by
+  have consumed := freshUnknownActionRequiresTypedExhaustionAndUnusedAttempt
+    expectedRealm firstEvidence firstObservation budget false opened
+  rw [consumed.2.2]
+  exact freshBrowserUnknownNeverStartsThirdBrowser expectedRealm nextEvidence
+    nextObservation
+    (decideUnknownApplication expectedRealm firstEvidence firstObservation
+      budget false).recoveryBudgetAfter
+
+theorem observedFreshBrowserCanRebaseOnceButCannotOpenThird :
+    let primary := decideUnknownApplication .persistent
+      observedStatusZeroEvidence
+      { observedStableRecovery with activeParsedAlive := false }
+      availableRecoveryBudget false
+    let freshRebase := decideUnknownApplication .persistent
+      observedStatusZeroEvidence observedStableRecovery
+      primary.recoveryBudgetAfter primary.freshReconcileUsedAfter
+    let nextUnknown := decideUnknownApplication .persistent
+      observedUnboundUnknownEvidence observedStableRecovery
+      freshRebase.recoveryBudgetAfter freshRebase.freshReconcileUsedAfter
+    primary.directive = .openFreshCurrentBattle ∧
+      primary.recoveryBudgetAfter = freshBrowserInitialRecoveryBudget ∧
+      freshRebase.directive = .continueCurrentBrowser ∧
+      freshRebase.freshReconcileUsedAfter = true ∧
+      nextUnknown.directive = .terminalInterrupt ∧
+      nextUnknown.directive ≠ .openFreshCurrentBattle := by
+  native_decide
+
 structure Audited (Outcome : Type) where
   outcome : Outcome
   records : List LogRecord
@@ -499,7 +1476,7 @@ def auditTransitionSelection
   | none =>
       ⟨.battleActionOutcomeUnknown, [.transitionOutcomeUnknown |> errorRecord]⟩
 
-def mapManagerOutcomeToRunner
+def mapUnrecoveredManagerOutcomeToRunner
     (manager : Audited TransitionManagerOutcome) : Audited RunnerOutcome :=
   match manager.outcome with
   | .confirmed _ => ⟨.continueBattle, manager.records⟩
@@ -507,10 +1484,64 @@ def mapManagerOutcomeToRunner
       ⟨.battleInterrupted,
         manager.records ++ [.runnerCompletionUnconfirmed |> errorRecord]⟩
 
+/-!
+This is the coordinator-aware runner boundary. A successful decision continues
+only by returning to turn preparation; every rejected or exhausted decision is
+fed into the existing fail-closed audited interruption path.
+-/
+def runUnknownActionRecovery
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget) : Audited RunnerOutcome :=
+  match resolveUnknownAction expectedRealm evidence observed budget with
+  | .recoverToPrepare =>
+      ⟨.continueBattle, [.actionRecoveryAccepted |> infoRecord]⟩
+  | .recoveryExhausted | .interrupt =>
+      mapUnrecoveredManagerOutcomeToRunner
+        ⟨.battleActionOutcomeUnknown,
+          [.transitionOutcomeUnknown |> errorRecord]⟩
+
 def runTransition
-    (before current : BattleSnapshot) : Audited RunnerOutcome :=
-  mapManagerOutcomeToRunner
-    (auditTransitionSelection (confirmedTransitionEvidence before current))
+    (before current : BattleSnapshot)
+    (retainedTransitionMonitor : Option ActionMonitor)
+    (expectedRealm : BattleRealm)
+    (recoveryEvidence : ActionRecoveryEvidence)
+    (recoveryObservation : RecoveryObservation)
+    (budget : RecoveryBudget) : Audited RunnerOutcome :=
+  match acceptedTransitionEvidence before current retainedTransitionMonitor with
+  | some evidence =>
+      mapUnrecoveredManagerOutcomeToRunner
+        (auditTransitionSelection (some evidence))
+  | none =>
+      runUnknownActionRecovery expectedRealm
+        (freezeTransitionRecoveryEvidence recoveryEvidence
+          retainedTransitionMonitor)
+        recoveryObservation budget
+
+theorem runTransitionKnownDuplicateCannotTakeConfirmedBranch
+    (before current : BattleSnapshot)
+    (retainedTransitionMonitor : Option ActionMonitor)
+    (expectedRealm : BattleRealm)
+    (recoveryEvidence : ActionRecoveryEvidence)
+    (recoveryObservation : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (duplicate :
+      transitionReceiptHasAtMostOneDispatch retainedTransitionMonitor = false) :
+    runTransition before current retainedTransitionMonitor expectedRealm
+        recoveryEvidence recoveryObservation budget =
+      runUnknownActionRecovery expectedRealm
+        (freezeTransitionRecoveryEvidence recoveryEvidence
+          retainedTransitionMonitor)
+        recoveryObservation budget := by
+  simp [runTransition, acceptedTransitionEvidence, duplicate]
+
+theorem observedDuplicateAdvancedTransitionCannotContinue :
+    (runTransition observedRound21 observedRound22Interactive
+      (some observedDuplicateTransitionMonitor) .persistent
+      observedStatusZeroEvidence observedStableRecovery
+      availableRecoveryBudget).outcome = .battleInterrupted := by
+  native_decide
 
 def runCompletionAck
     (expectedRealm : BattleRealm)
@@ -606,9 +1637,24 @@ def mapRunnerOutcomeToApplication
           [.driverException |> errorRecord,
             .applicationBattleInterrupted |> errorRecord]⟩
 
-def runApplicationTransition
-    (before current : BattleSnapshot) : Audited ApplicationOutcome :=
-  mapRunnerOutcomeToApplication (runTransition before current)
+def runApplicationTransitionWithoutFreshReconcile
+    (before current : BattleSnapshot)
+    (retainedTransitionMonitor : Option ActionMonitor)
+    (expectedRealm : BattleRealm)
+    (recoveryEvidence : ActionRecoveryEvidence)
+    (recoveryObservation : RecoveryObservation)
+    (budget : RecoveryBudget) : Audited ApplicationOutcome :=
+  mapRunnerOutcomeToApplication
+    (runTransition before current retainedTransitionMonitor expectedRealm
+      recoveryEvidence recoveryObservation budget)
+
+def runApplicationUnknownActionWithoutFreshReconcile
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget) : Audited ApplicationOutcome :=
+  mapRunnerOutcomeToApplication
+    (runUnknownActionRecovery expectedRealm evidence observed budget)
 
 def unknownTransitionErrorRecordSuffix : List LogRecord :=
   [errorRecord .transitionOutcomeUnknown,
@@ -808,56 +1854,159 @@ theorem failedTeeAfterUnclassifiedChildIsTerminal
     battleInterruptedExitCode]
 
 /-!
-An unknown manager outcome is fail-closed and creates the runner-level error
-record regardless of the records already attached by the manager.
+Once coordinator recovery was rejected or exhausted, an unknown manager
+outcome is fail-closed and creates the runner-level error record regardless of
+the records already attached by the manager.
 -/
-theorem managerUnknownAlwaysInterruptsAndLogs
+theorem unrecoveredManagerUnknownAlwaysInterruptsAndLogs
     (records : List LogRecord) :
-    let result := mapManagerOutcomeToRunner
+    let result := mapUnrecoveredManagerOutcomeToRunner
       (Audited.mk .battleActionOutcomeUnknown records)
     result.outcome = .battleInterrupted ∧
       errorRecord .runnerCompletionUnconfirmed ∈ result.records := by
-  simp [mapManagerOutcomeToRunner]
+  simp [mapUnrecoveredManagerOutcomeToRunner]
 
-/-!
-The reusable-library logging obligation: if transition selection has no
-positive evidence, the manager emits its error record, the runner maps the
-result to `BattleInterrupted`, and the runner emits its own error record.
--/
-theorem unknownTransitionMapsToInterruptionWithErrorRecords
-    (before current : BattleSnapshot)
-    (unknown : confirmedTransitionEvidence before current = none) :
-    let result := runTransition before current
+theorem nonRecoveredUnknownMapsToRunnerInterruptionWithErrorRecords
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (notRecovered :
+      resolveUnknownAction expectedRealm evidence observed budget ≠
+        .recoverToPrepare) :
+    let result := runUnknownActionRecovery expectedRealm evidence observed budget
     result.outcome = .battleInterrupted ∧
       errorRecord .transitionOutcomeUnknown ∈ result.records ∧
       errorRecord .runnerCompletionUnconfirmed ∈ result.records := by
-  simp [runTransition, unknown, auditTransitionSelection,
-    mapManagerOutcomeToRunner]
+  cases resolutionCase :
+      resolveUnknownAction expectedRealm evidence observed budget <;>
+    simp_all [runUnknownActionRecovery, mapUnrecoveredManagerOutcomeToRunner]
 
-theorem unknownTransitionHasExactOrderedErrorRecordSuffix
-    (before current : BattleSnapshot)
-    (unknown : confirmedTransitionEvidence before current = none) :
-    hasExactSuffix
-      (runApplicationTransition before current).records
-      unknownTransitionErrorRecordSuffix := by
-  refine ⟨[], ?_⟩
-  simp [runApplicationTransition, runTransition, unknown,
-    auditTransitionSelection, mapManagerOutcomeToRunner,
-    mapRunnerOutcomeToApplication, unknownTransitionErrorRecordSuffix]
+theorem recoverableUnknownContinuesOnlyThroughPrepare
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (recovered :
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoverToPrepare) :
+    let result := runUnknownActionRecovery expectedRealm evidence observed budget
+    result.outcome = .continueBattle ∧
+      infoRecord .actionRecoveryAccepted ∈ result.records ∧
+      recoveryNextStep
+        (resolveUnknownAction expectedRealm evidence observed budget) =
+        .prepareAndRunStrategy := by
+  simp [runUnknownActionRecovery, recovered, recoveryNextStep]
 
 /-!
-End-to-end safety theorem for the reported failure class. Missing transition
-evidence produces manager, runner, driver-context, and application error
-records; exits with the dedicated interruption code; and is rejected by both
-retry supervisors.
+Without an application fresh-reconciliation context, a transition with no
+positive evidence and no accepted same-browser recovery emits the manager and
+runner error records and is mapped to `BattleInterrupted`.
 -/
-theorem unknownTransitionStopsApplicationWithoutRetry
+theorem unknownTransitionWithoutFreshContextMapsToInterruptionWithErrorRecords
     (before current : BattleSnapshot)
-    (unknown : confirmedTransitionEvidence before current = none)
+    (retainedTransitionMonitor : Option ActionMonitor)
+    (expectedRealm : BattleRealm)
+    (recoveryEvidence : ActionRecoveryEvidence)
+    (recoveryObservation : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (unknown :
+      acceptedTransitionEvidence before current retainedTransitionMonitor = none)
+    (notRecovered :
+      resolveUnknownAction expectedRealm
+        (freezeTransitionRecoveryEvidence recoveryEvidence
+          retainedTransitionMonitor)
+        recoveryObservation budget ≠ .recoverToPrepare) :
+    let result := runTransition before current retainedTransitionMonitor
+      expectedRealm recoveryEvidence recoveryObservation budget
+    result.outcome = .battleInterrupted ∧
+      errorRecord .transitionOutcomeUnknown ∈ result.records ∧
+      errorRecord .runnerCompletionUnconfirmed ∈ result.records := by
+  simpa [runTransition, unknown] using
+    nonRecoveredUnknownMapsToRunnerInterruptionWithErrorRecords expectedRealm
+      (freezeTransitionRecoveryEvidence recoveryEvidence
+        retainedTransitionMonitor)
+      recoveryObservation budget notRecovered
+
+theorem recoverableUnknownTransitionReturnsToFreshPrepare
+    (before current : BattleSnapshot)
+    (retainedTransitionMonitor : Option ActionMonitor)
+    (expectedRealm : BattleRealm)
+    (recoveryEvidence : ActionRecoveryEvidence)
+    (recoveryObservation : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (unknown :
+      acceptedTransitionEvidence before current retainedTransitionMonitor = none)
+    (recovered :
+      resolveUnknownAction expectedRealm
+        (freezeTransitionRecoveryEvidence recoveryEvidence
+          retainedTransitionMonitor)
+        recoveryObservation budget = .recoverToPrepare) :
+    let result := runTransition before current retainedTransitionMonitor
+      expectedRealm recoveryEvidence recoveryObservation budget
+    result.outcome = .continueBattle ∧
+      infoRecord .actionRecoveryAccepted ∈ result.records ∧
+      recoveryNextStep
+        (resolveUnknownAction expectedRealm
+          (freezeTransitionRecoveryEvidence recoveryEvidence
+            retainedTransitionMonitor)
+          recoveryObservation budget) = .prepareAndRunStrategy := by
+  simp [runTransition, unknown, runUnknownActionRecovery,
+    recovered, recoveryNextStep]
+
+theorem unknownTransitionWithoutFreshContextHasExactOrderedErrorRecordSuffix
+    (before current : BattleSnapshot)
+    (retainedTransitionMonitor : Option ActionMonitor)
+    (expectedRealm : BattleRealm)
+    (recoveryEvidence : ActionRecoveryEvidence)
+    (recoveryObservation : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (unknown :
+      acceptedTransitionEvidence before current retainedTransitionMonitor = none)
+    (notRecovered :
+      resolveUnknownAction expectedRealm
+        (freezeTransitionRecoveryEvidence recoveryEvidence
+          retainedTransitionMonitor)
+        recoveryObservation budget ≠ .recoverToPrepare) :
+    hasExactSuffix
+      (runApplicationTransitionWithoutFreshReconcile before current
+        retainedTransitionMonitor expectedRealm recoveryEvidence
+        recoveryObservation budget).records
+      unknownTransitionErrorRecordSuffix := by
+  refine ⟨[], ?_⟩
+  cases resolutionCase : resolveUnknownAction expectedRealm
+      (freezeTransitionRecoveryEvidence recoveryEvidence
+        retainedTransitionMonitor)
+      recoveryObservation budget <;>
+    simp_all [runApplicationTransitionWithoutFreshReconcile, runTransition,
+      runUnknownActionRecovery, mapUnrecoveredManagerOutcomeToRunner,
+      mapRunnerOutcomeToApplication, unknownTransitionErrorRecordSuffix]
+
+/-!
+This terminal theorem is intentionally limited to an ordinary `.interrupt`
+resolution. Typed recovery exhaustion is handled by the separate, stateful
+fresh-reconciliation policy below.
+-/
+theorem ordinaryUnknownTransitionWithoutFreshContextStopsWithoutRetry
+    (before current : BattleSnapshot)
+    (retainedTransitionMonitor : Option ActionMonitor)
+    (expectedRealm : BattleRealm)
+    (recoveryEvidence : ActionRecoveryEvidence)
+    (recoveryObservation : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (unknown :
+      acceptedTransitionEvidence before current retainedTransitionMonitor = none)
+    (ordinary :
+      resolveUnknownAction expectedRealm
+        (freezeTransitionRecoveryEvidence recoveryEvidence
+          retainedTransitionMonitor)
+        recoveryObservation budget = .interrupt)
     (failureKind : LauncherFailureKind)
     (teeSucceeded : Bool)
     (attempt maxAttempts retriesUsed maxRetries : Nat) :
-    let result := runApplicationTransition before current
+    let result := runApplicationTransitionWithoutFreshReconcile before current
+      retainedTransitionMonitor expectedRealm recoveryEvidence
+      recoveryObservation budget
     result.outcome = .exited 4 ∧
       errorRecord .transitionOutcomeUnknown ∈ result.records ∧
       errorRecord .runnerCompletionUnconfirmed ∈ result.records ∧
@@ -866,8 +2015,166 @@ theorem unknownTransitionStopsApplicationWithoutRetry
       loggedCommandExitCode 4 teeSucceeded = 4 ∧
       containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
       launcherShouldRetry failureKind 4 retriesUsed maxRetries = false := by
-  simp [runApplicationTransition, runTransition, unknown,
-    auditTransitionSelection, mapManagerOutcomeToRunner,
+  simp [runApplicationTransitionWithoutFreshReconcile, runTransition, unknown,
+    runUnknownActionRecovery, ordinary,
+    mapUnrecoveredManagerOutcomeToRunner,
+    mapRunnerOutcomeToApplication, battleInterruptedExitCode,
+    loggedCommandExitCode, loggingFailureExitCode,
+    containerSupervisorShouldRetry, launcherShouldRetry,
+    configurationFailureExitCode, postBattleFailureExitCode]
+
+/-!
+Monitor-arm, monitor-cleanup, and session-parse live-operation timeouts are
+raised as ordinary `BattleInterruptedError` values before any recovery policy
+is entered. Browser-context closure is a runtime responsibility; the model
+observes its application consequence: exit 4, no fresh reconciliation, and no
+shell retry.
+-/
+theorem ordinaryLiveOperationTimeoutStopsWithoutFreshOrRetry
+    (freshReconcileUsed : Bool)
+    (failureKind : LauncherFailureKind)
+    (teeSucceeded : Bool)
+    (attempt maxAttempts retriesUsed maxRetries : Nat) :
+    let result := mapRunnerOutcomeToApplication
+      (Audited.mk .battleInterrupted [])
+    result.outcome = .exited 4 ∧
+      errorRecord .driverException ∈ result.records ∧
+      errorRecord .applicationBattleInterrupted ∈ result.records ∧
+      freshReconcileDecision .otherBattleInterrupted
+        freshReconcileUsed = .stop ∧
+      loggedCommandExitCode 4 teeSucceeded = 4 ∧
+      containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
+      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false := by
+  simp [mapRunnerOutcomeToApplication, freshReconcileDecision,
+    advanceFreshReconcile, battleInterruptedExitCode,
+    loggedCommandExitCode, loggingFailureExitCode,
+    containerSupervisorShouldRetry, launcherShouldRetry,
+    configurationFailureExitCode, postBattleFailureExitCode]
+
+theorem unmatchedUnknownActionStopsApplicationWithoutRetry
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (validRealm : validExpectedRealm expectedRealm = true)
+    (available : recoveryBudgetAvailable budget = true)
+    (unmatched : matchesServerCommunicationFailure evidence = false)
+    (failureKind : LauncherFailureKind)
+    (teeSucceeded : Bool)
+    (attempt maxAttempts retriesUsed maxRetries : Nat) :
+    let result := runApplicationUnknownActionWithoutFreshReconcile
+      expectedRealm evidence observed budget
+    result.outcome = .exited 4 ∧
+      errorRecord .transitionOutcomeUnknown ∈ result.records ∧
+      errorRecord .runnerCompletionUnconfirmed ∈ result.records ∧
+      errorRecord .driverException ∈ result.records ∧
+      errorRecord .applicationBattleInterrupted ∈ result.records ∧
+      loggedCommandExitCode 4 teeSucceeded = 4 ∧
+      containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
+      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false := by
+  have ordinary := unmatchedUnknownInterrupts expectedRealm evidence observed
+    budget validRealm available unmatched
+  simp [runApplicationUnknownActionWithoutFreshReconcile,
+    runUnknownActionRecovery, ordinary, mapUnrecoveredManagerOutcomeToRunner,
+    mapRunnerOutcomeToApplication, battleInterruptedExitCode,
+    loggedCommandExitCode, loggingFailureExitCode,
+    containerSupervisorShouldRetry, launcherShouldRetry,
+    configurationFailureExitCode, postBattleFailureExitCode]
+
+theorem typedRecoveryExhaustionOpensOneFreshReconcile
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (exhausted :
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoveryExhausted) :
+    let result := decideUnknownApplication expectedRealm evidence observed budget
+      false
+    result.directive = .openFreshCurrentBattle ∧
+      result.resolution = .recoveryExhausted ∧
+      result.freshReconcileUsedAfter = true := by
+  have decisionResolution :
+      (decideUnknownAction expectedRealm evidence observed budget).resolution =
+        .recoveryExhausted := by
+    simpa [resolveUnknownAction] using exhausted
+  simp [decideUnknownApplication, decisionResolution, advanceFreshReconcile]
+
+/-!
+A live timeout during a recovery probe, manual reload, parser confirmation, or
+recovery cleanup is abstracted as failure to establish the stable coordinator
+guard. Because the immutable incident evidence already matched, that failure
+is typed exhaustion and may consume the sole application fresh-browser stage.
+-/
+theorem failedMatchedCoordinatorRecoveryCanOpenOneFreshReconcile
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (validRealm : validExpectedRealm expectedRealm = true)
+    (available : recoveryBudgetAvailable budget = true)
+    (incident : matchesServerCommunicationFailure evidence = true)
+    (failed :
+      stableSameRealmNewDocument expectedRealm evidence observed = false) :
+    let result := decideUnknownApplication expectedRealm evidence observed budget
+      false
+    result.directive = .openFreshCurrentBattle ∧
+      result.resolution = .recoveryExhausted ∧
+      result.freshReconcileUsedAfter = true := by
+  have exhausted := failedMatchedRecoveryIsTypedExhaustion expectedRealm evidence
+    observed budget validRealm available incident failed
+  exact typedRecoveryExhaustionOpensOneFreshReconcile expectedRealm evidence
+    observed budget exhausted
+
+theorem typedRecoveryExhaustionAfterFreshReconcileIsTerminal
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (exhausted :
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoveryExhausted) :
+    let result := decideUnknownApplication expectedRealm evidence observed budget
+      true
+    result.directive = .terminalInterrupt ∧
+      result.freshReconcileUsedAfter = true := by
+  have decisionResolution :
+      (decideUnknownAction expectedRealm evidence observed budget).resolution =
+        .recoveryExhausted := by
+    simpa [resolveUnknownAction] using exhausted
+  simp [decideUnknownApplication, decisionResolution, advanceFreshReconcile]
+
+theorem typedRecoveryExhaustionAfterFreshReconcileExitsFourWithoutRetry
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (exhausted :
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoveryExhausted)
+    (failureKind : LauncherFailureKind)
+    (teeSucceeded : Bool)
+    (attempt maxAttempts retriesUsed maxRetries : Nat) :
+    let policy := decideUnknownApplication expectedRealm evidence observed budget
+      true
+    let result := runApplicationUnknownActionWithoutFreshReconcile expectedRealm
+      evidence observed budget
+    policy.directive = .terminalInterrupt ∧
+      result.outcome = .exited 4 ∧
+      errorRecord .transitionOutcomeUnknown ∈ result.records ∧
+      errorRecord .runnerCompletionUnconfirmed ∈ result.records ∧
+      errorRecord .driverException ∈ result.records ∧
+      errorRecord .applicationBattleInterrupted ∈ result.records ∧
+      loggedCommandExitCode 4 teeSucceeded = 4 ∧
+      containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
+      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false := by
+  have decisionResolution :
+      (decideUnknownAction expectedRealm evidence observed budget).resolution =
+        .recoveryExhausted := by
+    simpa [resolveUnknownAction] using exhausted
+  simp [decideUnknownApplication, decisionResolution, advanceFreshReconcile,
+    runApplicationUnknownActionWithoutFreshReconcile,
+    runUnknownActionRecovery, exhausted, mapUnrecoveredManagerOutcomeToRunner,
     mapRunnerOutcomeToApplication, battleInterruptedExitCode,
     loggedCommandExitCode, loggingFailureExitCode,
     containerSupervisorShouldRetry, launcherShouldRetry,
@@ -877,6 +2184,7 @@ theorem unknownCompletionAckStopsApplicationWithoutRetry
     (expectedRealm : BattleRealm)
     (observed : CompletionAckObservation)
     (unknown : completionAckOutcome expectedRealm observed = .outcomeUnknown)
+    (freshReconcileUsedBefore : Bool)
     (failureKind : LauncherFailureKind)
     (teeSucceeded : Bool)
     (attempt maxAttempts retriesUsed maxRetries : Nat) :
@@ -889,10 +2197,15 @@ theorem unknownCompletionAckStopsApplicationWithoutRetry
       errorRecord .applicationBattleInterrupted ∈ result.records ∧
       loggedCommandExitCode 4 teeSucceeded = 4 ∧
       containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
-      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false := by
+      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false ∧
+      freshReconcileDecision .finalCompletionAckUnknown
+        freshReconcileUsedBefore = .stop ∧
+      (advanceFreshReconcile .finalCompletionAckUnknown
+        freshReconcileUsedBefore).usedAfter = freshReconcileUsedBefore := by
   simp [runCompletionAck, unknown, mapRunnerOutcomeToApplication,
     battleInterruptedExitCode, loggedCommandExitCode, loggingFailureExitCode,
     containerSupervisorShouldRetry, launcherShouldRetry,
-    configurationFailureExitCode, postBattleFailureExitCode]
+    configurationFailureExitCode, postBattleFailureExitCode,
+    freshReconcileDecision, advanceFreshReconcile]
 
 end HVBattle

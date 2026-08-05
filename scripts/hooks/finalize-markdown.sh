@@ -8,23 +8,27 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 MD_FILES=()
-while IFS= read -r file; do
-    MD_FILES+=("$file")
+while IFS= read -r -d '' file; do
+    if [[ -f "$file" ]]; then
+        MD_FILES+=("$file")
+    fi
 done < <(
-    find . -maxdepth 2 -type f -name "*.md" \
-        -not -path "./.venv/*" \
-        -not -path "./node_modules/*" \
-        -not -path "./.pytest_cache/*" \
-        -not -path "./.*" \
-        | sort
+    git ls-files --cached --others --exclude-standard -z -- '*.md'
 )
 
-if [ ${#MD_FILES[@]} -eq 0 ]; then
+if [[ ${#MD_FILES[@]} -eq 0 ]]; then
     exit 0
 fi
 
-uv run --no-sync pymarkdown fix "${MD_FILES[@]}" >/dev/null 2>&1 || true
+PYMARKDOWN_DISABLED_RULES="MD013,MD014"
+uv run --no-sync pymarkdown -d "$PYMARKDOWN_DISABLED_RULES" fix \
+    "${MD_FILES[@]}" >/dev/null 2>&1 || true
 
 if ! uv run --no-sync ruff format --preview "${MD_FILES[@]}" >&2; then
+    exit 2
+fi
+
+if ! uv run --no-sync pymarkdown -d "$PYMARKDOWN_DISABLED_RULES" scan \
+    "${MD_FILES[@]}" >&2; then
     exit 2
 fi

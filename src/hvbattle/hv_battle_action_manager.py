@@ -11,8 +11,15 @@ from uuid import uuid4
 from hvbrowser import HVDriver
 from hvbrowser.runtime import ElementAction, setup_logger
 
-from ._zendriver import wait_for_zendriver
-from .contracts import BattleActionOutcomeUnknownError
+from ._zendriver import ZendriverOperationTimeout, wait_for_zendriver
+from .contracts import (
+    BattleActionKind,
+    BattleActionOutcomeUnknownError,
+    BattleActionRecoveryEvidence,
+    BattleInterruptedError,
+    BattleTurnPhase,
+)
+from .recovery import BattleRecoveryState
 
 logger = setup_logger(__name__)
 
@@ -271,6 +278,15 @@ _CLEANUP_ACTION_MONITOR_JS = """
 })()
 """
 
+_CLEAR_PAGE_ACTION_STATE_JS = """
+(() => {
+    const monitor = globalThis.__hvbattleActionMonitor;
+    if (monitor && typeof monitor.restore === "function") monitor.restore();
+    delete globalThis.__hvbattleActionMonitor;
+    return globalThis.__hvbattleDocumentId || null;
+})()
+"""
+
 
 # Final completion is neither a combat XHR nor a next-floor transition. Its
 # dedicated receipt returns only realm/DOM markers, never the current URL.
@@ -336,6 +352,90 @@ class _ActionMonitorState:
     response_has_login: bool
 
 
+def _payload_value(raw: Mapping[object, object], key: str, *, context: str) -> object:
+    if key not in raw:
+        raise RuntimeError(f"Invalid {context}: missing {key}")
+    return raw[key]
+
+
+def _payload_bool(raw: Mapping[object, object], key: str, *, context: str) -> bool:
+    value = _payload_value(raw, key, context=context)
+    if not isinstance(value, bool):
+        raise RuntimeError(f"Invalid {context}: {key} must be boolean")
+    return value
+
+
+def _payload_count(raw: Mapping[object, object], key: str, *, context: str) -> int:
+    value = _payload_value(raw, key, context=context)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise RuntimeError(f"Invalid {context}: {key} must be a non-negative integer")
+    return value
+
+
+def _payload_optional_bool(
+    raw: Mapping[object, object], key: str, *, context: str
+) -> bool | None:
+    value = _payload_value(raw, key, context=context)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise RuntimeError(f"Invalid {context}: {key} must be boolean or null")
+    return value
+
+
+def _payload_optional_string(
+    raw: Mapping[object, object],
+    key: str,
+    *,
+    context: str,
+    require_nonempty: bool = False,
+) -> str | None:
+    value = _payload_value(raw, key, context=context)
+    if value is None:
+        return None
+    if not isinstance(value, str) or (require_nonempty and not value):
+        qualifier = "a non-empty string" if require_nonempty else "a string"
+        raise RuntimeError(f"Invalid {context}: {key} must be {qualifier} or null")
+    return value
+
+
+def _parse_action_monitor(raw: Mapping[object, object]) -> _ActionMonitorState:
+    context = "battle action monitor payload"
+    status_raw = _payload_value(raw, "status", context=context)
+    if status_raw is not None and (
+        not isinstance(status_raw, int)
+        or isinstance(status_raw, bool)
+        or status_raw < 0
+    ):
+        raise RuntimeError(f"Invalid {context}: status must be a non-negative integer")
+
+    outcome_raw = _payload_value(raw, "outcome", context=context)
+    if outcome_raw is not None and (
+        not isinstance(outcome_raw, str)
+        or outcome_raw not in {"load", "error", "abort", "timeout"}
+    ):
+        raise RuntimeError(f"Invalid {context}: unknown outcome")
+
+    return _ActionMonitorState(
+        sent=_payload_bool(raw, "sent", context=context),
+        sent_count=_payload_count(raw, "sentCount", context=context),
+        completed=_payload_bool(raw, "completed", context=context),
+        status=status_raw,
+        outcome=outcome_raw,
+        log_mutations=_payload_count(raw, "logMutations", context=context),
+        response_parse_ok=_payload_optional_bool(
+            raw, "responseParseOk", context=context
+        ),
+        response_has_textlog=_payload_bool(raw, "responseHasTextlog", context=context),
+        response_has_pane_completion=_payload_bool(
+            raw, "responseHasPaneCompletion", context=context
+        ),
+        response_has_error=_payload_bool(raw, "responseHasError", context=context),
+        response_has_reload=_payload_bool(raw, "responseHasReload", context=context),
+        response_has_login=_payload_bool(raw, "responseHasLogin", context=context),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _BattleActionState:
     document_id: str
@@ -359,68 +459,63 @@ class _BattleActionState:
     def from_raw(cls, raw: object) -> _BattleActionState:
         if not isinstance(raw, Mapping):
             raise RuntimeError("Invalid battle action state payload")
-        monitor_raw = raw.get("monitor")
-        monitor = None
-        if isinstance(monitor_raw, Mapping):
-            status_raw = monitor_raw.get("status")
-            monitor = _ActionMonitorState(
-                sent=bool(monitor_raw.get("sent")),
-                sent_count=int(monitor_raw.get("sentCount") or 0),
-                completed=bool(monitor_raw.get("completed")),
-                status=(
-                    int(status_raw)
-                    if isinstance(status_raw, int) and not isinstance(status_raw, bool)
-                    else None
-                ),
-                outcome=(
-                    str(monitor_raw["outcome"])
-                    if monitor_raw.get("outcome") is not None
-                    else None
-                ),
-                log_mutations=int(monitor_raw.get("logMutations") or 0),
-                response_parse_ok=(
-                    bool(monitor_raw["responseParseOk"])
-                    if monitor_raw.get("responseParseOk") is not None
-                    else None
-                ),
-                response_has_textlog=bool(monitor_raw.get("responseHasTextlog")),
-                response_has_pane_completion=bool(
-                    monitor_raw.get("responseHasPaneCompletion")
-                ),
-                response_has_error=bool(monitor_raw.get("responseHasError")),
-                response_has_reload=bool(monitor_raw.get("responseHasReload")),
-                response_has_login=bool(monitor_raw.get("responseHasLogin")),
-            )
+
+        context = "battle action state payload"
+        document_id = _payload_value(raw, "documentId", context=context)
+        if (
+            not isinstance(document_id, str)
+            or not document_id
+            or document_id == "unknown"
+        ):
+            raise RuntimeError(f"Invalid {context}: documentId must be non-empty")
+
+        battle_node_id = _payload_optional_string(
+            raw,
+            "battleNodeId",
+            context=context,
+            require_nonempty=True,
+        )
+        if battle_node_id == "unknown":
+            raise RuntimeError(f"Invalid {context}: reserved battleNodeId")
+
+        ready_state = _payload_value(raw, "readyState", context=context)
+        if not isinstance(ready_state, str) or ready_state not in {
+            "loading",
+            "interactive",
+            "complete",
+        }:
+            raise RuntimeError(f"Invalid {context}: unknown readyState")
+
+        monitor_raw = _payload_value(raw, "monitor", context=context)
+        if monitor_raw is None:
+            monitor = None
+        elif isinstance(monitor_raw, Mapping):
+            monitor = _parse_action_monitor(monitor_raw)
+        else:
+            raise RuntimeError(f"Invalid {context}: monitor must be an object or null")
+
         return cls(
-            document_id=str(raw.get("documentId") or "unknown"),
-            battle_node_id=(
-                str(raw["battleNodeId"])
-                if raw.get("battleNodeId") is not None
-                else None
+            document_id=document_id,
+            battle_node_id=battle_node_id,
+            ready_state=ready_state,
+            battle_present=_payload_bool(raw, "battlePresent", context=context),
+            log_revision=_payload_optional_string(raw, "logRevision", context=context),
+            log_rows=_payload_count(raw, "logRows", context=context),
+            latest_log=_payload_optional_string(raw, "latestLog", context=context),
+            round_text=_payload_optional_string(raw, "roundText", context=context),
+            completion_present=_payload_bool(raw, "completionPresent", context=context),
+            battle_complete_present=_payload_bool(
+                raw, "battleCompletePresent", context=context
             ),
-            ready_state=str(raw.get("readyState") or "unknown"),
-            battle_present=bool(raw.get("battlePresent")),
-            log_revision=(
-                str(raw["logRevision"]) if raw.get("logRevision") is not None else None
+            finish_image_present=_payload_bool(
+                raw, "finishImagePresent", context=context
             ),
-            log_rows=int(raw.get("logRows") or 0),
-            latest_log=(
-                str(raw["latestLog"]) if raw.get("latestLog") is not None else None
+            completion_revision=_payload_optional_string(
+                raw, "completionRevision", context=context
             ),
-            round_text=(
-                str(raw["roundText"]) if raw.get("roundText") is not None else None
-            ),
-            completion_present=bool(raw.get("completionPresent")),
-            battle_complete_present=bool(raw.get("battleCompletePresent")),
-            finish_image_present=bool(raw.get("finishImagePresent")),
-            completion_revision=(
-                str(raw["completionRevision"])
-                if raw.get("completionRevision") is not None
-                else None
-            ),
-            next_floor_present=bool(raw.get("nextFloorPresent")),
-            ponychart_present=bool(raw.get("ponychartPresent")),
-            action_controls=int(raw.get("actionControls") or 0),
+            next_floor_present=_payload_bool(raw, "nextFloorPresent", context=context),
+            ponychart_present=_payload_bool(raw, "ponychartPresent", context=context),
+            action_controls=_payload_count(raw, "actionControls", context=context),
             monitor=monitor,
         )
 
@@ -481,11 +576,23 @@ class _BattleExitState:
         document_id = raw.get("documentId")
         realm = raw.get("realm")
         ready_state = raw.get("readyState")
-        if not isinstance(document_id, str) or not document_id:
+        if (
+            not isinstance(document_id, str)
+            or not document_id
+            or document_id == "unknown"
+        ):
             raise RuntimeError("Invalid battle exit document identity")
-        if realm not in {"persistent", "isekai", "outside"}:
+        if not isinstance(realm, str) or realm not in {
+            "persistent",
+            "isekai",
+            "outside",
+        }:
             raise RuntimeError("Invalid battle exit realm")
-        if ready_state not in {"loading", "interactive", "complete"}:
+        if not isinstance(ready_state, str) or ready_state not in {
+            "loading",
+            "interactive",
+            "complete",
+        }:
             raise RuntimeError("Invalid battle exit document readiness")
         return cls(
             document_id=document_id,
@@ -507,19 +614,115 @@ class _BattleExitState:
         )
 
 
+def _reconcile_recovery_state(
+    action: _BattleActionState,
+    exit_state: _BattleExitState,
+) -> BattleRecoveryState | None:
+    """Reject a reload that raced between the two bounded DOM probes."""
+    if (
+        action.document_id == "unknown"
+        or action.document_id != exit_state.document_id
+        or action.ready_state != exit_state.ready_state
+        or action.battle_present != exit_state.battle_present
+        or action.finish_image_present != exit_state.finish_image_present
+        or action.next_floor_present != exit_state.next_floor_present
+        or action.ponychart_present != exit_state.ponychart_present
+    ):
+        return None
+
+    phase: BattleTurnPhase | None = None
+    if action.battle_present and action.finish_image_present:
+        phase = BattleTurnPhase.COMPLETE
+    elif action.battle_present and action.next_floor_present:
+        phase = BattleTurnPhase.NEXT_FLOOR
+    elif action.ponychart_present:
+        # PonyChart may temporarily replace the battle container, so its exact
+        # submit control is authoritative without ``battle_main``.
+        phase = BattleTurnPhase.CHALLENGE
+    elif (
+        action.battle_present
+        and action.log_revision is not None
+        and action.action_controls > 0
+    ):
+        phase = BattleTurnPhase.ACTIVE
+
+    return BattleRecoveryState(
+        document_id=action.document_id,
+        realm=exit_state.realm,
+        ready_state=action.ready_state,
+        phase=phase,
+        log_revision=action.log_revision,
+        completion_revision=action.completion_revision,
+        action_controls=action.action_controls,
+    )
+
+
 def _normal_action_response(monitor: _ActionMonitorState | None) -> bool:
     return bool(
-        monitor
+        monitor is not None
+        and type(monitor.sent) is bool
         and monitor.sent
+        and type(monitor.sent_count) is int
         and monitor.sent_count == 1
+        and type(monitor.completed) is bool
         and monitor.completed
-        and monitor.status is not None
+        and type(monitor.status) is int
         and monitor.status == 200
         and monitor.outcome == "load"
-        and monitor.response_parse_ok
-        and not monitor.response_has_error
-        and not monitor.response_has_reload
-        and not monitor.response_has_login
+        and type(monitor.log_mutations) is int
+        and monitor.log_mutations >= 0
+        and monitor.response_parse_ok is True
+        and type(monitor.response_has_textlog) is bool
+        and type(monitor.response_has_pane_completion) is bool
+        and monitor.response_has_error is False
+        and monitor.response_has_reload is False
+        and monitor.response_has_login is False
+    )
+
+
+def _transition_receipt_has_at_most_one_dispatch(
+    monitor: _ActionMonitorState | None,
+) -> bool:
+    """Reject known duplicate XHRs even when transition DOM already advanced."""
+    return bool(
+        monitor is None
+        or (
+            type(monitor.sent) is bool
+            and type(monitor.sent_count) is int
+            and (
+                (not monitor.sent and monitor.sent_count == 0)
+                or (monitor.sent and monitor.sent_count == 1)
+            )
+        )
+    )
+
+
+def _action_recovery_evidence(
+    *,
+    action_id: str,
+    action_kind: BattleActionKind,
+    selector: str,
+    click_started: bool,
+    pre_click_document_id: str,
+    post_click_document_id: str,
+    dialog_category: str | None,
+    monitor: _ActionMonitorState | None,
+) -> BattleActionRecoveryEvidence:
+    """Freeze the best matching receipt seen before a navigation hid it."""
+    return BattleActionRecoveryEvidence(
+        action_id=action_id,
+        action_kind=action_kind,
+        selector=selector,
+        click_started=click_started,
+        pre_click_document_id=pre_click_document_id,
+        post_click_document_id=post_click_document_id,
+        dialog_action_id=action_id if dialog_category is not None else None,
+        dialog_category=dialog_category,
+        xhr_sent=monitor.sent if monitor is not None else False,
+        xhr_sent_count=monitor.sent_count if monitor is not None else 0,
+        xhr_completed=monitor.completed if monitor is not None else False,
+        xhr_status=monitor.status if monitor is not None else None,
+        xhr_outcome=monitor.outcome if monitor is not None else None,
     )
 
 
@@ -649,10 +852,18 @@ def _final_completion_control_ready(
 
 
 class ElementActionManager:
-    def __init__(self, driver: HVDriver) -> None:
+    def __init__(
+        self,
+        driver: HVDriver,
+        *,
+        begin_dialog_observation: Callable[[str], None] | None = None,
+        get_dialog_category: Callable[[str], str | None] | None = None,
+    ) -> None:
         self.hvdriver = driver
         self._action = ElementAction(lambda: driver.page)
         self._action_lock = asyncio.Lock()
+        self._begin_dialog_observation = begin_dialog_observation
+        self._get_dialog_category = get_dialog_category
 
     @property
     def page(self) -> Any:
@@ -660,6 +871,18 @@ class ElementActionManager:
 
     async def _click(self, element: Any) -> None:
         await self._action.click(element)
+
+    def _begin_submitted_action(self, action_id: str) -> None:
+        begin = getattr(self, "_begin_dialog_observation", None)
+        if begin is not None:
+            begin(action_id)
+
+    def _submitted_action_dialog_category(self, action_id: str) -> str | None:
+        get_category = getattr(self, "_get_dialog_category", None)
+        if get_category is None:
+            return None
+        category = get_category(action_id)
+        return category if isinstance(category, str) else None
 
     async def click_resilient(
         self,
@@ -727,6 +950,35 @@ class ElementActionManager:
         )
         return _BattleExitState.from_raw(raw)
 
+    async def read_recovery_state(
+        self, *, probe_timeout: float = 3.0
+    ) -> BattleRecoveryState | None:
+        """Read a reload state twice and reject cross-document DOM races."""
+        state_id = uuid4().hex
+        action = await self._read_action_state(
+            state_id,
+            probe_timeout=probe_timeout,
+        )
+        exit_state = await self._read_battle_exit_state(probe_timeout=probe_timeout)
+        return _reconcile_recovery_state(action, exit_state)
+
+    async def reload_current_page(self, *, probe_timeout: float = 3.0) -> None:
+        """Reload the tab's current URL once without creating a browser session."""
+        await wait_for_zendriver(
+            self.page.reload(),
+            timeout=probe_timeout,
+        )
+
+    async def clear_page_action_state(
+        self, *, probe_timeout: float = 3.0
+    ) -> str | None:
+        """Discard action hooks that belong to the newly accepted document."""
+        document_id = await wait_for_zendriver(
+            self.page.evaluate(_CLEAR_PAGE_ACTION_STATE_JS),
+            timeout=probe_timeout,
+        )
+        return document_id if isinstance(document_id, str) and document_id else None
+
     async def _cleanup_action_monitor(
         self, monitor_id: str, *, probe_timeout: float
     ) -> None:
@@ -738,6 +990,14 @@ class ElementActionManager:
                 self.page.evaluate(script),
                 timeout=probe_timeout,
             )
+        except ZendriverOperationTimeout as error:
+            logger.error(
+                "Battle action monitor cleanup timed out with a live browser "
+                "operation"
+            )
+            raise BattleInterruptedError(
+                "Battle action monitor cleanup left a browser operation in flight"
+            ) from error
         except Exception as error:
             logger.debug(
                 "Unable to clean up battle action monitor %s: %r",
@@ -823,19 +1083,28 @@ class ElementActionManager:
                 delay=0.1,
             )
             monitor_id = uuid4().hex
+            monitor_cleanup_safe = True
             try:
-                before = await self._read_action_state(
-                    monitor_id,
-                    arm_monitor=True,
-                    probe_timeout=probe_timeout,
-                )
+                try:
+                    before = await self._read_action_state(
+                        monitor_id,
+                        arm_monitor=True,
+                        probe_timeout=probe_timeout,
+                    )
+                except ZendriverOperationTimeout as error:
+                    monitor_cleanup_safe = False
+                    raise BattleInterruptedError(
+                        "Battle action monitor arm left a browser operation in flight"
+                    ) from error
                 last = before
                 click_started = False
                 click_error: Exception | None = None
                 probe_error: Exception | None = None
                 post_click_probe_succeeded = False
                 probe_timed_out = False
+                receipt_monitor: _ActionMonitorState | None = None
                 started = asyncio.get_running_loop().time()
+                self._begin_submitted_action(monitor_id)
                 click_started = True
                 try:
                     await self._click(element)
@@ -858,11 +1127,14 @@ class ElementActionManager:
                     except TimeoutError as error:
                         probe_error = error
                         probe_timed_out = True
+                        monitor_cleanup_safe = False
                         break
                     except Exception as error:
                         probe_error = error
                     else:
                         last = current
+                        if current.monitor is not None:
+                            receipt_monitor = current.monitor
                         post_click_probe_succeeded = True
                         evidence = _confirmed_action_evidence(before, current)
                         if evidence is not None:
@@ -910,8 +1182,13 @@ class ElementActionManager:
                     )
                     if final_error is not None:
                         probe_error = final_error
+                        if isinstance(final_error, TimeoutError):
+                            probe_timed_out = True
+                            monitor_cleanup_safe = False
                     else:
                         post_click_probe_succeeded = True
+                    if last.monitor is not None:
+                        receipt_monitor = last.monitor
                 evidence = _confirmed_action_evidence(before, last)
                 if evidence is not None:
                     elapsed = asyncio.get_running_loop().time() - started
@@ -947,19 +1224,39 @@ class ElementActionManager:
                     before.summary(),
                     last.summary(),
                 )
+                dialog_category = self._submitted_action_dialog_category(monitor_id)
                 unknown = BattleActionOutcomeUnknownError(
                     "Submitted battle action lacks an authoritative receipt; "
-                    f"selector={selector!r}; last_state={last.summary()}"
+                    f"selector={selector!r}; last_state={last.summary()}",
+                    recovery_evidence=_action_recovery_evidence(
+                        action_id=monitor_id,
+                        action_kind=BattleActionKind.TURN,
+                        selector=selector,
+                        click_started=click_started,
+                        pre_click_document_id=before.document_id,
+                        post_click_document_id=(
+                            "unknown"
+                            if probe_timed_out or not post_click_probe_succeeded
+                            else last.document_id
+                        ),
+                        dialog_category=dialog_category,
+                        monitor=receipt_monitor,
+                    ),
                 )
+                # A timed-out cleanup would leave a non-cancelled CDP command
+                # live just before recovery probes begin.  Unknown paths leave
+                # the hook for the accepted reload or browser close to discard.
+                monitor_cleanup_safe = False
                 cause = click_error or probe_error
                 if cause is not None:
                     raise unknown from cause
                 raise unknown
             finally:
-                await self._cleanup_action_monitor(
-                    monitor_id,
-                    probe_timeout=probe_timeout,
-                )
+                if monitor_cleanup_safe:
+                    await self._cleanup_action_monitor(
+                        monitor_id,
+                        probe_timeout=probe_timeout,
+                    )
 
     async def click_and_wait_transition_locator(
         self,
@@ -981,104 +1278,162 @@ class ElementActionManager:
                 delay=0.1,
             )
             state_id = uuid4().hex
-            before = await self._read_action_state(
-                state_id,
-                probe_timeout=probe_timeout,
-            )
-            started = asyncio.get_running_loop().time()
-            click_error: Exception | None = None
-            probe_error: Exception | None = None
-            probe_timed_out = False
-            last = before
+            monitor_cleanup_safe = True
             try:
-                await self._click(element)
-            except Exception as error:
-                click_error = error
-
-            deadline = started + timeout
-            while True:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
                 try:
-                    current = await self._read_action_state(
+                    before = await self._read_action_state(
                         state_id,
-                        # A navigation-time probe may be delayed well beyond
-                        # the normal three-second read bound.  Await that one
-                        # command through the transition deadline instead of
-                        # stacking cancellable probes every few seconds.
-                        probe_timeout=remaining,
+                        arm_monitor=True,
+                        probe_timeout=probe_timeout,
                     )
-                except TimeoutError as error:
-                    probe_error = error
-                    probe_timed_out = True
-                    break
-                except Exception as error:
-                    probe_error = error
-                else:
-                    last = current
-                    evidence = _confirmed_transition_evidence(before, current)
-                    if evidence is not None:
-                        elapsed = asyncio.get_running_loop().time() - started
-                        if click_error is None and probe_error is None:
-                            logger.debug(
-                                "Battle transition confirmed selector=%r "
-                                "evidence=%s elapsed=%.2fs",
-                                selector,
-                                evidence,
-                                elapsed,
-                            )
-                        else:
-                            logger.warning(
-                                "Battle transition confirmed after transient error "
-                                "selector=%r evidence=%s elapsed=%.2fs "
-                                "click_error=%s probe_error=%s",
-                                selector,
-                                evidence,
-                                elapsed,
-                                _error_type_name(click_error),
-                                _error_type_name(probe_error),
-                            )
-                        logger.debug("Battle transition state: %s", current.summary())
-                        return
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining > 0:
-                    await asyncio.sleep(min(check_interval, remaining))
-
-            if not probe_timed_out:
+                except ZendriverOperationTimeout as error:
+                    monitor_cleanup_safe = False
+                    raise BattleInterruptedError(
+                        "Battle transition monitor arm left a browser operation "
+                        "in flight"
+                    ) from error
+                started = asyncio.get_running_loop().time()
+                click_error: Exception | None = None
+                probe_error: Exception | None = None
+                probe_timed_out = False
+                post_click_probe_succeeded = False
+                last = before
+                receipt_monitor = before.monitor
+                self._begin_submitted_action(state_id)
                 try:
-                    last = await self._read_action_state(
+                    await self._click(element)
+                except Exception as error:
+                    click_error = error
+
+                deadline = started + timeout
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        current = await self._read_action_state(
+                            state_id,
+                            # A navigation-time probe may be delayed well beyond
+                            # the normal three-second read bound.  Await that one
+                            # command through the transition deadline instead of
+                            # stacking cancellable probes every few seconds.
+                            probe_timeout=remaining,
+                        )
+                    except TimeoutError as error:
+                        probe_error = error
+                        probe_timed_out = True
+                        monitor_cleanup_safe = False
+                        break
+                    except Exception as error:
+                        probe_error = error
+                    else:
+                        last = current
+                        post_click_probe_succeeded = True
+                        if current.monitor is not None:
+                            receipt_monitor = current.monitor
+                        evidence = _confirmed_transition_evidence(before, current)
+                        if evidence is not None and (
+                            _transition_receipt_has_at_most_one_dispatch(
+                                receipt_monitor
+                            )
+                        ):
+                            elapsed = asyncio.get_running_loop().time() - started
+                            if click_error is None and probe_error is None:
+                                logger.debug(
+                                    "Battle transition confirmed selector=%r "
+                                    "evidence=%s elapsed=%.2fs",
+                                    selector,
+                                    evidence,
+                                    elapsed,
+                                )
+                            else:
+                                logger.warning(
+                                    "Battle transition confirmed after transient "
+                                    "error selector=%r evidence=%s elapsed=%.2fs "
+                                    "click_error=%s probe_error=%s",
+                                    selector,
+                                    evidence,
+                                    elapsed,
+                                    _error_type_name(click_error),
+                                    _error_type_name(probe_error),
+                                )
+                            logger.debug(
+                                "Battle transition state: %s", current.summary()
+                            )
+                            return
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining > 0:
+                        await asyncio.sleep(min(check_interval, remaining))
+
+                if not probe_timed_out:
+                    try:
+                        last = await self._read_action_state(
+                            state_id,
+                            probe_timeout=probe_timeout,
+                        )
+                    except TimeoutError as error:
+                        probe_error = error
+                        probe_timed_out = True
+                        monitor_cleanup_safe = False
+                    except Exception as error:
+                        probe_error = error
+                    else:
+                        post_click_probe_succeeded = True
+                        if last.monitor is not None:
+                            receipt_monitor = last.monitor
+                evidence = _confirmed_transition_evidence(before, last)
+                if evidence is not None and (
+                    _transition_receipt_has_at_most_one_dispatch(receipt_monitor)
+                ):
+                    logger.warning(
+                        "Battle transition confirmed during final reconciliation "
+                        "selector=%r evidence=%s click_error=%s probe_error=%s",
+                        selector,
+                        evidence,
+                        _error_type_name(click_error),
+                        _error_type_name(probe_error),
+                    )
+                    return
+
+                logger.error(
+                    "Battle transition outcome unknown selector=%r before=(%s) "
+                    "last=(%s)",
+                    selector,
+                    before.summary(),
+                    last.summary(),
+                )
+                dialog_category = self._submitted_action_dialog_category(state_id)
+                unknown = BattleActionOutcomeUnknownError(
+                    "Battle transition lacks positive next-phase evidence; "
+                    f"selector={selector!r}; last_state={last.summary()}",
+                    recovery_evidence=_action_recovery_evidence(
+                        action_id=state_id,
+                        action_kind=BattleActionKind.NEXT_FLOOR,
+                        selector=selector,
+                        click_started=True,
+                        pre_click_document_id=before.document_id,
+                        post_click_document_id=(
+                            "unknown"
+                            if probe_timed_out or not post_click_probe_succeeded
+                            else last.document_id
+                        ),
+                        dialog_category=dialog_category,
+                        monitor=receipt_monitor,
+                    ),
+                )
+                # See the TURN path above: do not risk stacking recovery on a
+                # cleanup transaction whose timeout cannot cancel Zendriver.
+                monitor_cleanup_safe = False
+                cause = click_error or probe_error
+                if cause is not None:
+                    raise unknown from cause
+                raise unknown
+            finally:
+                if monitor_cleanup_safe:
+                    await self._cleanup_action_monitor(
                         state_id,
                         probe_timeout=probe_timeout,
                     )
-                except Exception as error:
-                    probe_error = error
-            evidence = _confirmed_transition_evidence(before, last)
-            if evidence is not None:
-                logger.warning(
-                    "Battle transition confirmed during final reconciliation "
-                    "selector=%r evidence=%s click_error=%s probe_error=%s",
-                    selector,
-                    evidence,
-                    _error_type_name(click_error),
-                    _error_type_name(probe_error),
-                )
-                return
-
-            logger.error(
-                "Battle transition outcome unknown selector=%r before=(%s) last=(%s)",
-                selector,
-                before.summary(),
-                last.summary(),
-            )
-            unknown = BattleActionOutcomeUnknownError(
-                "Battle transition lacks positive next-phase evidence; "
-                f"selector={selector!r}; last_state={last.summary()}"
-            )
-            cause = click_error or probe_error
-            if cause is not None:
-                raise unknown from cause
-            raise unknown
 
     async def click_and_wait_battle_exit_locator(
         self,
@@ -1159,6 +1514,11 @@ class ElementActionManager:
                 selected_state = await self._read_battle_exit_state(
                     probe_timeout=probe_timeout
                 )
+            except ZendriverOperationTimeout as selection_probe_error:
+                raise BattleActionOutcomeUnknownError(
+                    "Final completion control state timed out before its single "
+                    "click while the browser operation remained in flight"
+                ) from selection_probe_error
             except Exception as selection_probe_error:
                 last, _ = await self._final_battle_exit_probe(
                     probe_timeout=probe_timeout,

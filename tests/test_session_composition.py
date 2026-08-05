@@ -38,6 +38,16 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(buffs.element_action_manager, actions)
         self.assertIs(buffs._item_provider, items)
         self.assertIs(buffs._skill_manager, skills)
+        self.assertIs(session.battle_recovery._actions, actions)
+        self.assertIs(session.battle_recovery._state_store, session.battle_state)
+        self.assertIs(
+            actions._begin_dialog_observation.__self__,
+            session.action_dialog_tracker,
+        )
+        self.assertIs(
+            actions._get_dialog_category.__self__,
+            session.action_dialog_tracker,
+        )
         self.assertFalse(hasattr(client, "_hvbattle_action_lock"))
 
         with self.assertRaisesRegex(AttributeError, "read-only compatibility"):

@@ -43,8 +43,90 @@ class BattleInterruptedError(RuntimeError):
     """The page left battle without positive completion evidence."""
 
 
+class BattleRecoveryExhaustedError(BattleInterruptedError):
+    """A verified communication failure exhausted same-browser recovery."""
+
+
+class BattleActionKind(StrEnum):
+    """The submitted control whose receipt became ambiguous."""
+
+    TURN = "turn"
+    NEXT_FLOOR = "next-floor"
+
+
+@dataclass(frozen=True, slots=True)
+class BattleActionRecoveryEvidence:
+    """Immutable observations bound to one submitted action token."""
+
+    action_id: str
+    action_kind: BattleActionKind
+    selector: str
+    click_started: bool
+    pre_click_document_id: str
+    post_click_document_id: str
+    dialog_action_id: str | None
+    dialog_category: str | None
+    xhr_sent: bool
+    xhr_sent_count: int
+    xhr_completed: bool
+    xhr_status: int | None
+    xhr_outcome: str | None
+
+    @property
+    def matches_server_communication_failure(self) -> bool:
+        """Whether a bound dialog explains the missing terminal action receipt."""
+        bound_action_failure = bool(
+            isinstance(self.action_kind, BattleActionKind)
+            and isinstance(self.action_id, str)
+            and self.action_id
+            and isinstance(self.selector, str)
+            and self.selector
+            and self.click_started is True
+            and isinstance(self.pre_click_document_id, str)
+            and self.pre_click_document_id
+            and self.pre_click_document_id != "unknown"
+            and isinstance(self.post_click_document_id, str)
+            and self.post_click_document_id
+            and self.post_click_document_id != "unknown"
+            and self.dialog_action_id == self.action_id
+            and self.dialog_category == "server-communication-failed"
+        )
+        status_zero_receipt = bool(
+            self.xhr_completed is True
+            and self.xhr_sent is True
+            and type(self.xhr_sent_count) is int
+            and self.xhr_sent_count == 1
+            and type(self.xhr_status) is int
+            and self.xhr_status == 0
+            and self.xhr_outcome == "error"
+        )
+        terminal_receipt_unavailable = bool(
+            self.xhr_completed is False
+            and type(self.xhr_sent) is bool
+            and type(self.xhr_sent_count) is int
+            and self.xhr_status is None
+            and self.xhr_outcome is None
+            and (
+                (not self.xhr_sent and self.xhr_sent_count == 0)
+                or (self.xhr_sent and self.xhr_sent_count == 1)
+            )
+        )
+        return bound_action_failure and (
+            status_zero_receipt or terminal_receipt_unavailable
+        )
+
+
 class BattleActionOutcomeUnknownError(RuntimeError):
     """A submitted action did not produce authoritative completion evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        recovery_evidence: BattleActionRecoveryEvidence | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.recovery_evidence = recovery_evidence
 
 
 class BattleTurnPhase(StrEnum):

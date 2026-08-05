@@ -19,6 +19,7 @@ from hvbattle import (
     BattleActionOutcomeUnknownError,
     BattleCompleted,
     BattleInterruptedError,
+    BattleRecoveryExhaustedError,
     BattleRunner,
     BattleSession,
     BattleStopped,
@@ -28,10 +29,12 @@ from hvbattle import (
     PonyChartResolutionError,
     TurnDecision,
 )
+from hvbattle._zendriver import ZendriverOperationTimeout
 from hvbattle.battle_launcher import BattleLauncher
 from hvbattle.hv_battle_buff_manager import BuffManager
 from hvbattle.hv_battle_observer_pattern import BattleDashboard, LogEntry
 from hvbattle.hv_battle_ponychart import PonyChart
+from hvbattle.recovery import ActionDialogTracker
 
 
 class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
@@ -65,7 +68,8 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.page = Mock()
         session.page.add_handler = Mock()
         session.page.send = AsyncMock()
-        session._last_dialog_category = None
+        session.action_dialog_tracker = ActionDialogTracker()
+        session.action_dialog_tracker.begin("action-1")
         secret_message = "Server communication failed: response-token-should-not-log"
 
         with patch.object(session_module.logger, "warning") as warning:
@@ -74,7 +78,7 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
             await handler(SimpleNamespace(message=secret_message))
 
         self.assertEqual(
-            session._last_dialog_category,
+            session.action_dialog_tracker.category_for("action-1"),
             "server-communication-failed",
         )
         self.assertNotIn(secret_message, str(warning.call_args))
@@ -123,6 +127,26 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.battle_dashboard.inspect.assert_not_awaited()
         session._read_battle_phase.assert_not_awaited()
         session._has_battle_marker.assert_not_awaited()
+
+    async def test_live_zendriver_timeout_does_not_probe_after_prepare_parse(
+        self,
+    ) -> None:
+        operation_timeout = ZendriverOperationTimeout("content command still live")
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_phase = AsyncMock(return_value="active")
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock(side_effect=operation_timeout)
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await BattleSession.prepare_turn_state(session)
+
+        self.assertIs(raised.exception, operation_timeout)
+        session.battle_state.update.assert_awaited_once_with()
+        session.is_ponychart_present.assert_awaited_once_with()
+        session._read_battle_phase.assert_awaited_once_with()
 
     async def test_non_battle_transition_does_not_increment_turn(self) -> None:
         session = object.__new__(BattleSession)
@@ -657,6 +681,26 @@ console.log(JSON.stringify({
         self.assertTrue(active)
         session.battle_dashboard.inspect.assert_awaited_once()
 
+    async def test_live_zendriver_timeout_does_not_probe_after_battle_inspect(
+        self,
+    ) -> None:
+        operation_timeout = ZendriverOperationTimeout("content command still live")
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_phase = AsyncMock(return_value="active")
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session.battle_dashboard = Mock()
+        session.battle_dashboard.inspect = AsyncMock(side_effect=operation_timeout)
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await BattleSession.is_in_battle(session)
+
+        self.assertIs(raised.exception, operation_timeout)
+        session.battle_dashboard.inspect.assert_awaited_once_with()
+        session.is_ponychart_present.assert_awaited_once_with()
+        session._read_battle_phase.assert_awaited_once_with()
+
     async def test_skill_buff_action_never_uses_an_implicit_mystic_gem(self) -> None:
         manager = object.__new__(BuffManager)
         manager.is_action_needed = Mock(return_value=True)
@@ -890,6 +934,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             ).run_current()
 
         self.assertIs(raised.exception.__cause__, action_error)
+        self.assertNotIsInstance(raised.exception, BattleRecoveryExhaustedError)
         runner_logger.error.assert_called_once_with(
             "Battle action completion could not be confirmed: error_type=%s",
             "BattleActionOutcomeUnknownError",
@@ -950,6 +995,27 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(session.prepare_turn_state.await_count, 3)
         self.assertEqual(retry_sleep.await_count, 2)
+        strategy.take_turn.assert_not_awaited()
+
+    async def test_live_zendriver_timeout_is_never_retried(self) -> None:
+        session = _FakeSession(active=True)
+        operation_timeout = ZendriverOperationTimeout("content command still live")
+        session.prepare_turn_state = AsyncMock(side_effect=operation_timeout)
+        strategy = Mock()
+        strategy.take_turn = AsyncMock()
+        retry_sleep = AsyncMock()
+
+        with self.assertRaises(BattleInterruptedError) as raised:
+            await BattleRunner(
+                session,  # type: ignore[arg-type]
+                strategy,
+                timeout_retries=3,
+                sleep=retry_sleep,
+            ).run_current()
+
+        self.assertIs(raised.exception.__cause__, operation_timeout)
+        session.prepare_turn_state.assert_awaited_once_with()
+        retry_sleep.assert_not_awaited()
         strategy.take_turn.assert_not_awaited()
 
     async def test_strategy_can_return_control_without_claiming_completion(

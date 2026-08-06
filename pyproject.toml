@@ -12,7 +12,7 @@ license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.14,<3.15"
 dependencies = [
-    "hvbrowser>=0.1.9,<0.2",
+    "hvbrowser>=0.1.10,<0.2",
     "hv-bie>=0.7.0,<0.8",
     "ponychart-classifier>=0.9.1,<0.10",
     "zendriver>=0.15.5,<0.16",

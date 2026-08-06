@@ -56,8 +56,7 @@ class BattleSession:
         *args: Any,
         auto_accept_dialogs: bool = False,
         browser_client: HVDriver | None = None,
-        ponychart_diagnostic_directory: str | Path | None = None,
-        ponychart_diagnostic_file_limit: int = 20,
+        ponychart_image_directory: str | Path | None = None,
         **kwargs: Any,
     ) -> None:
         if browser_client is not None and (args or kwargs):
@@ -68,15 +67,14 @@ class BattleSession:
             browser_client if browser_client is not None else HVDriver(*args, **kwargs)
         )
         self.auto_accept_dialogs = auto_accept_dialogs
-        diagnostic_directory = (
-            Path(ponychart_diagnostic_directory)
-            if ponychart_diagnostic_directory is not None
+        image_directory = (
+            Path(ponychart_image_directory)
+            if ponychart_image_directory is not None
             else None
         )
         self._ponychart = PonyChart(
             self.browser_client,
-            diagnostic_directory=diagnostic_directory,
-            diagnostic_file_limit=ponychart_diagnostic_file_limit,
+            image_directory=image_directory,
         )
         self._launcher = BattleLauncher(self.browser_client)
         self.battle_state: BattleStateStore | None = None

@@ -68,10 +68,11 @@ typed exhaustion and may use only the one fresh-browser stage described above.
 `BattleSession` preloads the PonyChart classifier and ONNX model before opening
 the browser, so a timed challenge never pays the first-load cost. The runner
 checks for and resolves PonyChart before parsing an ordinary battle turn or
-calling client strategy code. Classifier screenshots are temporary and removed
-after every attempt. Failure artifacts are retained only when
-`ponychart_diagnostic_directory` is explicitly configured, and that directory
-is bounded by `ponychart_diagnostic_file_limit`.
+calling client strategy code. Set `ponychart_image_directory` to retain the
+image captured for every detected challenge, including successful resolutions
+and failures. Each capture receives a collision-resistant `pony_chart_*.png`
+name, and callers own retention for that directory. Without an image directory,
+classifier screenshots remain temporary and are removed after each attempt.
 
 ```python
 import asyncio
@@ -95,7 +96,10 @@ async def after_battle(session: BattleSession, completed: BattleCompleted) -> No
 
 
 async def main() -> None:
-    async with BattleSession(headless=True) as session:
+    async with BattleSession(
+        headless=True,
+        ponychart_image_directory="pony_chart",
+    ) as session:
         result = await BattleRunner(session, MyStrategy()).run_current()
         if isinstance(result, BattleCompleted):
             await after_battle(session, result)

@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -12,8 +13,12 @@ from hvbattle.battle_state import BattleStateStore
 class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
     def test_session_uses_one_shared_battle_component_graph(self) -> None:
         client = HVDriver(headless=True)
+        image_directory = Path("artifacts/pony_chart")
 
-        session = BattleSession(browser_client=client)
+        session = BattleSession(
+            browser_client=client,
+            ponychart_image_directory=str(image_directory),
+        )
 
         actions = session.element_action_manager
         items = session._item_provider
@@ -29,6 +34,8 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         assert buffs is not None
         self.assertIs(session.browser_client, client)
         self.assertIs(session._launcher.browser_client, client)
+        self.assertIs(session._ponychart.hvdriver, client)
+        self.assertEqual(session._ponychart._image_directory, image_directory)
         self.assertIs(actions.hvdriver, client)
         self.assertIs(items.state_store, session.battle_state)
         self.assertIs(skills.state_store, session.battle_state)

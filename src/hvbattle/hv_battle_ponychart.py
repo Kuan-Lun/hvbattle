@@ -1,5 +1,4 @@
 import asyncio
-import shutil
 import tempfile
 from collections.abc import Callable
 from datetime import datetime
@@ -45,14 +44,10 @@ class PonyChart:
         self,
         driver: HVDriver,
         *,
-        diagnostic_directory: Path | None = None,
-        diagnostic_file_limit: int = 20,
+        image_directory: Path | None = None,
     ) -> None:
-        if diagnostic_file_limit < 1:
-            raise ValueError("diagnostic_file_limit must be at least 1")
         self.hvdriver = driver
-        self._diagnostic_directory = diagnostic_directory
-        self._diagnostic_file_limit = diagnostic_file_limit
+        self._image_directory = image_directory
 
     @property
     def page(self) -> Any:
@@ -106,7 +101,7 @@ class PonyChart:
         raise TimeoutError("PonyChart image did not finish loading in time")
 
     async def _save_pony_chart_image(self) -> str:
-        """Capture one challenge in a temporary file for classifier input."""
+        """Capture one challenge for classification and optional retention."""
         await self._wait_for_image_loaded()
 
         riddleimage_div = await self.page.select("#riddleimage")
@@ -116,9 +111,18 @@ class PonyChart:
         if not img_src:
             raise ValueError("無法獲取圖片 src")
 
+        directory = self._image_directory
+        if directory is not None:
+            directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         with tempfile.NamedTemporaryFile(
-            prefix="hvbattle-ponychart-",
+            prefix=(
+                f"pony_chart_{timestamp}_"
+                if directory is not None
+                else "hvbattle-ponychart-"
+            ),
             suffix=".png",
+            dir=directory,
             delete=False,
         ) as temporary:
             filepath = Path(temporary.name)
@@ -128,40 +132,6 @@ class PonyChart:
             filepath.unlink(missing_ok=True)
             raise
         return str(filepath)
-
-    def _retain_diagnostic(self, img_path: str) -> Path | None:
-        """Retain a bounded failure artifact only when explicitly configured."""
-        if self._diagnostic_directory is None:
-            return None
-
-        try:
-            directory = self._diagnostic_directory
-            directory.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            destination = directory / f"pony_chart_failure_{timestamp}.png"
-            shutil.copyfile(img_path, destination)
-
-            diagnostics = sorted(
-                (
-                    candidate
-                    for candidate in directory.glob("pony_chart_failure_*.png")
-                    if candidate.is_file()
-                ),
-                key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name),
-            )
-            for obsolete in diagnostics[: -self._diagnostic_file_limit]:
-                obsolete.unlink()
-        except OSError as error:
-            logger.warning(
-                "Unable to retain PonyChart diagnostic: error_type=%s",
-                type(error).__name__,
-            )
-            logger.debug(
-                "PonyChart diagnostic retention error detail",
-                exc_info=True,
-            )
-            return None
-        return destination
 
     async def _auto_answer(self, img_path: str) -> frozenset[str] | None:
         """模型推論後依角色名稱比對 label 文字並點擊。"""
@@ -228,15 +198,6 @@ class PonyChart:
             return isponychart
 
         img_path = await self._save_pony_chart_image()
-        diagnostic_retained: Path | None = None
-        diagnostic_attempted = False
-
-        def retain_diagnostic_once() -> Path | None:
-            nonlocal diagnostic_attempted, diagnostic_retained
-            if not diagnostic_attempted:
-                diagnostic_attempted = True
-                diagnostic_retained = self._retain_diagnostic(img_path)
-            return diagnostic_retained
 
         try:
             if not self.hvdriver.headless:
@@ -247,12 +208,11 @@ class PonyChart:
             except Exception as error:
                 if is_connection_error(error):
                     raise
-                retained = retain_diagnostic_once()
                 logger.warning(
                     "PonyChart auto-answer failed; challenge handling will continue "
-                    "error_type=%s diagnostic=%s",
+                    "error_type=%s image=%s",
                     type(error).__name__,
-                    retained,
+                    img_path if self._image_directory is not None else None,
                 )
                 logger.debug(
                     "PonyChart auto-answer error detail",
@@ -307,15 +267,14 @@ class PonyChart:
 
                 await asyncio.sleep(1)
                 if await self._check():
-                    retained = retain_diagnostic_once()
                     logger.warning(
                         "PonyChart remained present after fallback submission "
                         "attempt clicked=%s xpath_error_type=%s "
-                        "selector_error_type=%s diagnostic=%s",
+                        "selector_error_type=%s image=%s",
                         clicked,
                         xpath_error_type or "none",
                         selector_error_type or "none",
-                        retained,
+                        img_path if self._image_directory is not None else None,
                     )
                     raise PonyChartResolutionError(
                         "PonyChart remained present after fallback submission"
@@ -341,4 +300,5 @@ class PonyChart:
 
             return isponychart
         finally:
-            Path(img_path).unlink(missing_ok=True)
+            if self._image_directory is None:
+                Path(img_path).unlink(missing_ok=True)

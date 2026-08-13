@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, patch
 from hvbrowser import HVDriver
 
 import hvbattle.session as session_module
-from hvbattle import BattleSession
+from hvbattle import (
+    BattleSession,
+    RingOfBloodOption,
+    RingOfBloodSnapshot,
+    RingOfBloodStartOutcome,
+)
 from hvbattle.battle_state import BattleStateStore
 
 
@@ -96,6 +101,34 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         login.assert_awaited_once_with()
         gohomepage.assert_awaited_once_with()
         close.assert_awaited_once_with(None, None, None)
+
+    async def test_ring_of_blood_operations_delegate_to_shared_launcher(self) -> None:
+        client = HVDriver(headless=True)
+        session = BattleSession(browser_client=client)
+        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
+        snapshot = RingOfBloodSnapshot(20, (option,))
+        session._launcher.goto_ring_of_blood = AsyncMock(return_value=True)
+        session._launcher.inspect_ring_of_blood = AsyncMock(return_value=snapshot)
+        session._launcher.start_ring_of_blood = AsyncMock(
+            return_value=RingOfBloodStartOutcome.SUBMITTED
+        )
+
+        self.assertTrue(await session.goto_ring_of_blood())
+        self.assertIs(await session.inspect_ring_of_blood(), snapshot)
+        self.assertIs(
+            await session.start_ring_of_blood(
+                option,
+                expected_before=snapshot,
+            ),
+            RingOfBloodStartOutcome.SUBMITTED,
+        )
+
+        session._launcher.goto_ring_of_blood.assert_awaited_once_with()
+        session._launcher.inspect_ring_of_blood.assert_awaited_once_with()
+        session._launcher.start_ring_of_blood.assert_awaited_once_with(
+            option,
+            expected_before=snapshot,
+        )
 
 
 class BattleSessionBoundaryTests(unittest.TestCase):

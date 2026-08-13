@@ -1,6 +1,6 @@
 """Stable contracts between battle sessions, runners, and client policies."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 
@@ -10,6 +10,35 @@ class ArenaOption:
 
     battle_id: int
     token: str | None = None
+    challenge_name: str | None = field(default=None, kw_only=True, compare=False)
+    exp_multiplier: float | None = field(default=None, kw_only=True, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class RingOfBloodOption:
+    """One currently startable Ring of Blood challenge."""
+
+    battle_id: int
+    challenge_name: str
+    exp_multiplier: float
+    entry_cost: int
+
+
+@dataclass(frozen=True, slots=True)
+class RingOfBloodSnapshot:
+    """Read-only Ring of Blood choices and the current token balance."""
+
+    tokens_of_blood: int
+    options: tuple[RingOfBloodOption, ...]
+
+
+class RingOfBloodStartOutcome(StrEnum):
+    """The authoritative pre-submit result of one explicit Ring challenge."""
+
+    SUBMITTED = "submitted"
+    INSUFFICIENT_TOKENS = "insufficient-tokens"
+    OPTION_UNAVAILABLE = "option-unavailable"
+    STATE_CHANGED = "state-changed"
 
 
 @dataclass(frozen=True, slots=True)

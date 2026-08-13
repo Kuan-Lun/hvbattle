@@ -19,6 +19,9 @@ from .contracts import (
     BattleTurnPhase,
     BattleTurnState,
     GrindfestOption,
+    RingOfBloodOption,
+    RingOfBloodSnapshot,
+    RingOfBloodStartOutcome,
 )
 from .hv_battle_action_manager import ElementActionManager
 from .hv_battle_buff_manager import BuffManager
@@ -544,6 +547,9 @@ class BattleSession:
     async def goto_arena(self) -> bool:
         return await self._launcher.goto_arena()
 
+    async def goto_ring_of_blood(self) -> bool:
+        return await self._launcher.goto_ring_of_blood()
+
     async def goto_grindfest(self) -> bool:
         return await self._launcher.goto_grindfest()
 
@@ -570,6 +576,20 @@ class BattleSession:
 
     async def start_arena(self, option: ArenaOption) -> bool:
         return await self._launcher.start_arena(option)
+
+    async def inspect_ring_of_blood(self) -> RingOfBloodSnapshot:
+        return await self._launcher.inspect_ring_of_blood()
+
+    async def start_ring_of_blood(
+        self,
+        option: RingOfBloodOption,
+        *,
+        expected_before: RingOfBloodSnapshot,
+    ) -> RingOfBloodStartOutcome:
+        return await self._launcher.start_ring_of_blood(
+            option,
+            expected_before=expected_before,
+        )
 
     async def list_grindfest_options(self) -> tuple[GrindfestOption, ...]:
         return await self._launcher.list_grindfest_options()

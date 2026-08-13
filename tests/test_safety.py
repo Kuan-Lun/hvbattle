@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import inspect
 import json
 import shutil
 import subprocess
@@ -27,6 +28,9 @@ from hvbattle import (
     BattleTurnState,
     GrindfestOption,
     PonyChartResolutionError,
+    RingOfBloodOption,
+    RingOfBloodSnapshot,
+    RingOfBloodStartOutcome,
     TurnDecision,
 )
 from hvbattle._zendriver import ZendriverOperationTimeout
@@ -38,6 +42,25 @@ from hvbattle.recovery import ActionDialogTracker
 
 
 class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
+    def test_arena_option_keeps_old_positional_constructor(self) -> None:
+        option = ArenaOption(12, "token")
+
+        self.assertEqual(option.battle_id, 12)
+        self.assertEqual(option.token, "token")
+        self.assertIsNone(option.challenge_name)
+        self.assertIsNone(option.exp_multiplier)
+        enriched = ArenaOption(
+            12,
+            "token",
+            challenge_name="Challenge",
+            exp_multiplier=2.0,
+        )
+        self.assertEqual(option, enriched)
+        self.assertEqual(hash(option), hash(enriched))
+        parameters = inspect.signature(ArenaOption).parameters
+        self.assertIs(parameters["challenge_name"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(parameters["exp_multiplier"].kind, inspect.Parameter.KEYWORD_ONLY)
+
     async def test_browser_startup_preloads_ponychart_before_browser(self) -> None:
         session = BattleSession(headless=True, auto_accept_dialogs=True)
         events: list[str] = []
@@ -725,6 +748,7 @@ class _FakeSession:
         self.repairequipment = AsyncMock()
         self.recoverstamina = AsyncMock()
         self.goto_arena = AsyncMock()
+        self.goto_ring_of_blood = AsyncMock()
         self.goto_grindfest = AsyncMock()
         self.go_next_floor = AsyncMock(return_value=True)
         self.acknowledge_battle_completion = AsyncMock()
@@ -779,6 +803,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         session.repairequipment.assert_not_awaited()
         session.recoverstamina.assert_not_awaited()
         session.goto_arena.assert_not_awaited()
+        session.goto_ring_of_blood.assert_not_awaited()
         session.goto_grindfest.assert_not_awaited()
         session.acknowledge_battle_completion.assert_not_awaited()
 
@@ -1261,6 +1286,44 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(options, (ArenaOption(12), ArenaOption(56, "token")))
 
+    async def test_arena_options_include_row_metadata_in_server_order(self) -> None:
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client)
+        client.page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "onclick": "init_battle(12, 34)",
+                    "challengeName": " First Challenge ",
+                    "expText": "X1.25",
+                },
+                {
+                    "onclick": "init_battle(56, 78, 'token');",
+                    "challengeName": "Last Challenge",
+                    "expText": "x3.0",
+                },
+            ]
+        )
+
+        options = await launcher.list_arena_options()
+
+        self.assertEqual(
+            options,
+            (
+                ArenaOption(
+                    12,
+                    challenge_name="First Challenge",
+                    exp_multiplier=1.25,
+                ),
+                ArenaOption(
+                    56,
+                    "token",
+                    challenge_name="Last Challenge",
+                    exp_multiplier=3.0,
+                ),
+            ),
+        )
+
     async def test_malformed_arena_option_log_does_not_expose_token(self) -> None:
         client = Mock()
         client.page = Mock()
@@ -1307,6 +1370,244 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, "bad form"):
             await launcher.start_grindfest(GrindfestOption(12))
+
+
+class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _launcher() -> tuple[BattleLauncher, Mock]:
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client)
+        launcher._path_prefix = AsyncMock(return_value="")
+        return launcher, client.page
+
+    @staticmethod
+    def _payload(
+        *,
+        tokens: str = "You have 1,234 tokens of blood.",
+        rows: list[object] | None = None,
+    ) -> dict[str, object]:
+        if rows is None:
+            rows = [
+                {
+                    "onclick": "init_battle(112,10)",
+                    "challengeName": "Triple Trio and the Tree",
+                    "expText": "X1.0",
+                    "entryCostText": "10 Tokens",
+                }
+            ]
+        return {"tokenText": tokens, "rows": rows}
+
+    async def test_snapshot_parses_balance_and_available_options(self) -> None:
+        launcher, page = self._launcher()
+        page.evaluate = AsyncMock(
+            return_value=self._payload(
+                rows=[
+                    {
+                        "onclick": "init_battle(105,1)",
+                        "challengeName": "Konata",
+                        "expText": "X1.0",
+                        "entryCostText": "1 Token",
+                    },
+                    {
+                        "onclick": "init_battle(112,10)",
+                        "challengeName": "Triple Trio and the Tree",
+                        "expText": "X2.5",
+                        "entryCostText": "10 Tokens",
+                    },
+                ]
+            )
+        )
+
+        snapshot = await launcher.inspect_ring_of_blood()
+
+        self.assertEqual(
+            snapshot,
+            RingOfBloodSnapshot(
+                1_234,
+                (
+                    RingOfBloodOption(105, "Konata", 1.0, 1),
+                    RingOfBloodOption(
+                        112,
+                        "Triple Trio and the Tree",
+                        2.5,
+                        10,
+                    ),
+                ),
+            ),
+        )
+        inspection_script = page.evaluate.await_args.args[0]
+        self.assertNotIn("postoken", inspection_script.casefold())
+
+    async def test_snapshot_keeps_unaffordable_option_for_client_policy(self) -> None:
+        launcher, page = self._launcher()
+        page.evaluate = AsyncMock(
+            return_value=self._payload(tokens="You have 3 tokens of blood.")
+        )
+
+        snapshot = await launcher.inspect_ring_of_blood()
+
+        self.assertEqual(snapshot.tokens_of_blood, 3)
+        self.assertEqual(snapshot.options[0].entry_cost, 10)
+
+    async def test_snapshot_rejects_missing_or_malformed_balance(self) -> None:
+        cases = (
+            None,
+            {"tokenText": "balance unavailable", "rows": []},
+            {"tokenText": "You have 3 tokens of blood.", "rows": None},
+        )
+        for payload in cases:
+            with self.subTest(payload_type=type(payload).__name__):
+                launcher, page = self._launcher()
+                page.evaluate = AsyncMock(return_value=payload)
+
+                with self.assertRaises(RuntimeError):
+                    await launcher.inspect_ring_of_blood()
+
+    async def test_snapshot_rejects_inconsistent_entry_cost(self) -> None:
+        launcher, page = self._launcher()
+        page.evaluate = AsyncMock(
+            return_value=self._payload(
+                rows=[
+                    {
+                        "onclick": "init_battle(112,9)",
+                        "challengeName": "Triple Trio and the Tree",
+                        "expText": "X1.0",
+                        "entryCostText": "10 Tokens",
+                    }
+                ]
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "inconsistent"):
+            await launcher.inspect_ring_of_blood()
+
+    async def test_start_returns_insufficient_tokens_without_submission(self) -> None:
+        launcher, page = self._launcher()
+        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
+        snapshot = RingOfBloodSnapshot(3, (option,))
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "https://hentaiverse.org/?s=Battle&ss=rb",
+                self._payload(tokens="You have 3 tokens of blood."),
+            ]
+        )
+
+        outcome = await launcher.start_ring_of_blood(
+            option,
+            expected_before=snapshot,
+        )
+
+        self.assertIs(outcome, RingOfBloodStartOutcome.INSUFFICIENT_TOKENS)
+        self.assertEqual(page.evaluate.await_count, 2)
+
+    async def test_start_returns_unavailable_when_option_disappears(self) -> None:
+        launcher, page = self._launcher()
+        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
+        snapshot = RingOfBloodSnapshot(20, (option,))
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "https://hentaiverse.org/?s=Battle&ss=rb",
+                self._payload(tokens="You have 20 tokens of blood.", rows=[]),
+            ]
+        )
+
+        outcome = await launcher.start_ring_of_blood(
+            option,
+            expected_before=snapshot,
+        )
+
+        self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
+        self.assertEqual(page.evaluate.await_count, 2)
+
+    async def test_start_returns_state_changed_before_submission(self) -> None:
+        launcher, page = self._launcher()
+        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
+        snapshot = RingOfBloodSnapshot(20, (option,))
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "https://hentaiverse.org/?s=Battle&ss=rb",
+                self._payload(tokens="You have 19 tokens of blood."),
+            ]
+        )
+
+        outcome = await launcher.start_ring_of_blood(
+            option,
+            expected_before=snapshot,
+        )
+
+        self.assertIs(outcome, RingOfBloodStartOutcome.STATE_CHANGED)
+        self.assertEqual(page.evaluate.await_count, 2)
+
+    async def test_start_submits_existing_form_without_copying_hidden_state(
+        self,
+    ) -> None:
+        launcher, page = self._launcher()
+        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
+        snapshot = RingOfBloodSnapshot(20, (option,))
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "https://hentaiverse.org/?s=Battle&ss=rb",
+                self._payload(tokens="You have 20 tokens of blood."),
+                True,
+            ]
+        )
+
+        outcome = await launcher.start_ring_of_blood(
+            option,
+            expected_before=snapshot,
+        )
+
+        self.assertIs(outcome, RingOfBloodStartOutcome.SUBMITTED)
+        submission_script = page.evaluate.await_args_list[-1].args[0]
+        self.assertIn("initform.submit()", submission_script)
+        self.assertIn("window.location.href !== expectedUrl", submission_script)
+        self.assertIn("Number(match[1]) === expectedId", submission_script)
+        self.assertIn("Number(match[2]) === expectedCost", submission_script)
+        self.assertIn("const expectedId = 112", submission_script)
+        self.assertIn("const expectedCost = 10", submission_script)
+        self.assertNotIn("postoken", submission_script.casefold())
+
+    async def test_final_atomic_revalidation_failure_does_not_submit(self) -> None:
+        launcher, page = self._launcher()
+        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
+        snapshot = RingOfBloodSnapshot(20, (option,))
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "https://hentaiverse.org/?s=Battle&ss=rb",
+                self._payload(tokens="You have 20 tokens of blood."),
+                False,
+            ]
+        )
+
+        outcome = await launcher.start_ring_of_blood(
+            option,
+            expected_before=snapshot,
+        )
+
+        self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
+        self.assertEqual(page.evaluate.await_count, 3)
+
+    async def test_start_submission_exception_propagates(self) -> None:
+        launcher, page = self._launcher()
+        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
+        snapshot = RingOfBloodSnapshot(20, (option,))
+        submission_error = ValueError("navigation destroyed context")
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "https://hentaiverse.org/?s=Battle&ss=rb",
+                self._payload(tokens="You have 20 tokens of blood."),
+                submission_error,
+            ]
+        )
+
+        with self.assertRaises(ValueError) as raised:
+            await launcher.start_ring_of_blood(
+                option,
+                expected_before=snapshot,
+            )
+
+        self.assertIs(raised.exception, submission_error)
 
 
 class PonyChartPreloadTests(unittest.TestCase):
@@ -1426,6 +1727,9 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(forbidden.isdisjoint(BattleSession.__dict__))
         self.assertTrue(hasattr(BattleSession, "list_arena_options"))
         self.assertTrue(hasattr(BattleSession, "start_arena"))
+        self.assertTrue(hasattr(BattleSession, "goto_ring_of_blood"))
+        self.assertTrue(hasattr(BattleSession, "inspect_ring_of_blood"))
+        self.assertTrue(hasattr(BattleSession, "start_ring_of_blood"))
         self.assertTrue(hasattr(BattleSession, "list_grindfest_options"))
         self.assertTrue(hasattr(BattleSession, "start_grindfest"))
 

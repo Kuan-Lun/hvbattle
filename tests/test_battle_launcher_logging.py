@@ -1,7 +1,13 @@
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
-from hvbattle import ArenaOption, GrindfestOption
+from hvbattle import (
+    ArenaOption,
+    GrindfestOption,
+    RingOfBloodOption,
+    RingOfBloodSnapshot,
+    RingOfBloodStartOutcome,
+)
 from hvbattle.battle_launcher import BattleLauncher
 
 
@@ -13,6 +19,25 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         launcher = BattleLauncher(client)
         launcher._path_prefix = AsyncMock(return_value="")
         return launcher, client.page
+
+    @staticmethod
+    def _ring_values() -> (
+        tuple[RingOfBloodOption, RingOfBloodSnapshot, dict[str, object]]
+    ):
+        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
+        snapshot = RingOfBloodSnapshot(20, (option,))
+        payload: dict[str, object] = {
+            "tokenText": "You have 20 tokens of blood.",
+            "rows": [
+                {
+                    "onclick": "init_battle(112,10)",
+                    "challengeName": "Triple Trio and the Tree",
+                    "expText": "X1.0",
+                    "entryCostText": "10 Tokens",
+                }
+            ],
+        }
+        return option, snapshot, payload
 
     async def test_wrong_page_logs_expected_and_current_at_debug(self) -> None:
         cases = (
@@ -166,6 +191,64 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(
                     "secret-arena-token", repr(launcher_logger.method_calls)
                 )
+
+    async def test_ring_wrong_page_logs_only_safe_context(self) -> None:
+        launcher, page = self._launcher()
+        option, snapshot, _payload = self._ring_values()
+        secret = "secret-current-url-detail"
+        current_url = f"https://hentaiverse.org/?private={secret}"
+        expected_url = "https://hentaiverse.org/?s=Battle&ss=rb"
+        page.evaluate = AsyncMock(return_value=current_url)
+
+        with patch("hvbattle.battle_launcher.logger") as launcher_logger:
+            outcome = await launcher.start_ring_of_blood(
+                option,
+                expected_before=snapshot,
+            )
+
+        self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
+        launcher_logger.debug.assert_called_once_with(
+            "Battle form submission skipped kind=ring-of-blood id=%s "
+            "reason=unexpected-page expected=%s",
+            option.battle_id,
+            expected_url,
+        )
+        launcher_logger.info.assert_not_called()
+        launcher_logger.warning.assert_not_called()
+        self.assertNotIn(secret, repr(launcher_logger.method_calls))
+
+    async def test_ring_submission_exception_logs_only_error_type(self) -> None:
+        launcher, page = self._launcher()
+        option, snapshot, payload = self._ring_values()
+        secret_detail = "server rejected private response detail"
+        submission_error = RuntimeError(secret_detail)
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "https://hentaiverse.org/?s=Battle&ss=rb",
+                payload,
+                submission_error,
+            ]
+        )
+
+        with (
+            patch("hvbattle.battle_launcher.logger") as launcher_logger,
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            await launcher.start_ring_of_blood(
+                option,
+                expected_before=snapshot,
+            )
+
+        self.assertIs(raised.exception, submission_error)
+        launcher_logger.error.assert_called_once_with(
+            "Battle form submission outcome is unknown "
+            "kind=ring-of-blood id=%s error_type=%s",
+            option.battle_id,
+            "RuntimeError",
+        )
+        launcher_logger.exception.assert_not_called()
+        launcher_logger.info.assert_not_called()
+        self.assertNotIn(secret_detail, repr(launcher_logger.method_calls))
 
 
 if __name__ == "__main__":

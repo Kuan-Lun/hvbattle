@@ -7,8 +7,8 @@ private command-line runner in a separate application workspace.
 The package exposes a policy-neutral `BattleSession`, atomic battle actions,
 and a `BattleRunner` that runs exactly one already-active battle using a
 client-supplied `BattleStrategy`. It never repairs equipment, recovers stamina,
-or starts Arena/GrindFest on its own. Campaign policy and post-battle work belong
-to the calling application.
+or starts Arena, Ring of Blood, or GrindFest on its own. Campaign policy and
+post-battle work belong to the calling application.
 
 `BattleSession` is a facade, not an `HVDriver` subclass. It composes an explicit
 `browser_client`, a battle-scoped state store, a battle launcher, and shared
@@ -123,6 +123,13 @@ post-battle tasks, and next-battle selection after the returned
 `BattleCompleted`. Arena choice follows the same boundary:
 `list_arena_options()` returns data and `start_arena(option)` starts only the
 option explicitly selected by the caller.
+`goto_ring_of_blood()` and `inspect_ring_of_blood()` expose the currently
+startable named challenges, EXP modifiers, entry costs, and live Tokens of
+Blood balance. `start_ring_of_blood(option, expected_before=snapshot)`
+revalidates the page and sanitized snapshot before submitting the existing
+form. It returns a typed submitted, insufficient-tokens, unavailable, or
+state-changed outcome; it never chooses a challenge or reads hidden form
+credentials for the caller.
 GrindFest uses the equivalent `list_grindfest_options()` and
 `start_grindfest(option)` pair; the package does not silently choose the first
 or last server option.

@@ -12,6 +12,9 @@ from .contracts import (
     BattleTurnPhase,
     BattleTurnState,
     GrindfestOption,
+    RingOfBloodOption,
+    RingOfBloodSnapshot,
+    RingOfBloodStartOutcome,
     TurnDecision,
 )
 from .control_panel import BaseControlPanel, ControlPanel, NullControlPanel
@@ -42,6 +45,9 @@ __all__ = [
     "GrindfestOption",
     "NullControlPanel",
     "PonyChartResolutionError",
+    "RingOfBloodOption",
+    "RingOfBloodSnapshot",
+    "RingOfBloodStartOutcome",
     "TurnDecision",
     "preload_ponychart_classifier",
 ]

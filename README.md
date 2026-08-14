@@ -11,11 +11,12 @@ or starts Arena, Ring of Blood, or GrindFest on its own. Campaign policy and
 post-battle work belong to the calling application.
 
 `BattleSession` is a facade, not an `HVDriver` subclass. It composes an explicit
-`browser_client`, a battle-scoped state store, a battle launcher, and shared
-action/item/skill/buff collaborators. Callers that also need non-battle
-`hvbrowser` operations use `session.browser_client` explicitly; this prevents
-maintenance APIs from leaking into the battle-domain surface. The legacy
-`battle_dashboard` name remains a compatibility alias for the state store.
+`HentaiVerseSession`, a battle-scoped state store, a battle launcher, and shared
+action/item/skill/buff collaborators. The raw browser used by battle components
+is `session.hentaiverse.browser`; non-battle operations remain grouped under
+the other `session.hentaiverse` services instead of leaking into the
+battle-domain surface. The legacy `battle_dashboard` name remains a
+compatibility alias for the state store.
 
 Version 0.2.7 restores the game's final completion acknowledgement as a
 runner-owned safety step. `BattleRunner` captures the immutable completion and
@@ -77,6 +78,7 @@ classifier screenshots remain temporary and are removed after each attempt.
 ```python
 import asyncio
 
+from hvbrowser import HentaiVerseSession
 from hvbattle import BattleCompleted, BattleRunner, BattleSession, TurnDecision
 
 
@@ -96,8 +98,9 @@ async def after_battle(session: BattleSession, completed: BattleCompleted) -> No
 
 
 async def main() -> None:
+    hentaiverse = HentaiVerseSession(headless=True)
     async with BattleSession(
-        headless=True,
+        hentaiverse=hentaiverse,
         ponychart_image_directory="pony_chart",
     ) as session:
         result = await BattleRunner(session, MyStrategy()).run_current()

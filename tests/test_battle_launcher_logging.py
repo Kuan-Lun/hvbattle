@@ -16,7 +16,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
     def _launcher() -> tuple[BattleLauncher, Mock]:
         client = Mock()
         client.page = Mock()
-        launcher = BattleLauncher(client)
+        launcher = BattleLauncher(client, Mock())
         launcher._path_prefix = AsyncMock(return_value="")
         return launcher, client.page
 

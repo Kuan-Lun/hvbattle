@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from hv_bie.types import BattleSnapshot
-from hvbrowser import HVDriver
+from hvbrowser import HentaiVerseSession, Realm
 from hvbrowser.runtime import is_connection_error, setup_logger
 from zendriver import cdp
 
@@ -52,22 +52,25 @@ _BATTLE_PHASE_JS = r"""
 
 
 class BattleSession:
-    """Battle facade backed by one explicitly composed browser client."""
+    """Battle facade backed by one explicitly composed HentaiVerse session."""
 
     def __init__(
         self,
         *args: Any,
         auto_accept_dialogs: bool = False,
-        browser_client: HVDriver | None = None,
+        hentaiverse: HentaiVerseSession | None = None,
         ponychart_image_directory: str | Path | None = None,
         **kwargs: Any,
     ) -> None:
-        if browser_client is not None and (args or kwargs):
+        if hentaiverse is not None and (args or kwargs):
             raise TypeError(
-                "Browser options cannot be combined with an injected browser_client"
+                "Browser options cannot be combined with an injected "
+                "HentaiVerseSession"
             )
-        self.browser_client = (
-            browser_client if browser_client is not None else HVDriver(*args, **kwargs)
+        self.hentaiverse = (
+            hentaiverse
+            if hentaiverse is not None
+            else HentaiVerseSession(*args, **kwargs)
         )
         self.auto_accept_dialogs = auto_accept_dialogs
         image_directory = (
@@ -76,10 +79,13 @@ class BattleSession:
             else None
         )
         self._ponychart = PonyChart(
-            self.browser_client,
+            self.hentaiverse.browser,
             image_directory=image_directory,
         )
-        self._launcher = BattleLauncher(self.browser_client)
+        self._launcher = BattleLauncher(
+            self.hentaiverse.browser,
+            self.hentaiverse.realm,
+        )
         self.battle_state: BattleStateStore | None = None
         self.element_action_manager: ElementActionManager | None = None
         self._item_provider: ItemProvider | None = None
@@ -95,24 +101,24 @@ class BattleSession:
 
     @property
     def page(self) -> Any:
-        """Expose the battle page while keeping the full client explicit."""
-        client = self.__dict__.get("browser_client")
-        if client is not None:
-            return client.page
+        """Expose the page owned by the composed HentaiVerse session."""
+        hentaiverse = self.__dict__.get("hentaiverse")
+        if hentaiverse is not None:
+            return hentaiverse.browser.page
         return self.__dict__["_page_override"]
 
     @page.setter
     def page(self, value: Any) -> None:
         """Keep lightweight, uninitialized test doubles usable."""
-        client = self.__dict__.get("browser_client")
-        if client is not None:
-            client.page = value
+        hentaiverse = self.__dict__.get("hentaiverse")
+        if hentaiverse is not None:
+            hentaiverse.browser.page = value
         else:
             self.__dict__["_page_override"] = value
 
     @property
     def headless(self) -> bool:
-        return bool(self.browser_client.headless)
+        return bool(self.hentaiverse.browser.headless)
 
     @property
     def battle_dashboard(self) -> BattleStateStore | None:
@@ -141,16 +147,13 @@ class BattleSession:
     @property
     async def is_isekai(self) -> bool:
         """Expose the realm needed by battle-run completion results."""
-        return bool(await self.browser_client.is_isekai)
+        return await self.hentaiverse.realm.current() is Realm.ISEKAI
 
     async def __aenter__(self) -> Self:
-        try:
-            await self._init_browser()
-            await self.browser_client.login()
-            await self.browser_client.gohomepage()
-        except BaseException as error:
-            await self.__aexit__(type(error), error, error.__traceback__)
-            raise
+        await asyncio.to_thread(preload_ponychart_classifier)
+        await self.hentaiverse.start(
+            on_browser_ready=self._on_browser_ready,
+        )
         return self
 
     async def __aexit__(
@@ -159,11 +162,9 @@ class BattleSession:
         exc_value: Any,
         traceback: Any,
     ) -> None:
-        await self.browser_client.__aexit__(exc_type, exc_value, traceback)
+        await self.hentaiverse.__aexit__(exc_type, exc_value, traceback)
 
-    async def _init_browser(self) -> None:
-        await asyncio.to_thread(preload_ponychart_classifier)
-        await self.browser_client._init_browser()
+    async def _on_browser_ready(self) -> None:
         if self.auto_accept_dialogs:
             await self._setup_alert_handler()
 
@@ -171,16 +172,17 @@ class BattleSession:
         """Create battle adapters without parsing a non-battle login page."""
         if self.battle_state is not None:
             return
-        state_store = BattleStateStore(self.browser_client)
+        browser = self.hentaiverse.browser
+        state_store = BattleStateStore(browser)
         actions = ElementActionManager(
-            self.browser_client,
+            browser,
             begin_dialog_observation=self.action_dialog_tracker.begin,
             get_dialog_category=self.action_dialog_tracker.category_for,
         )
-        items = ItemProvider(self.browser_client, state_store, actions)
-        skills = SkillManager(self.browser_client, state_store, actions)
+        items = ItemProvider(browser, state_store, actions)
+        skills = SkillManager(browser, state_store, actions)
         buffs = BuffManager(
-            self.browser_client,
+            browser,
             state_store,
             actions,
             items,

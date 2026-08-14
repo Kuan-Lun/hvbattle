@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any
 
-from hvbrowser import HENTAIVERSE_ROOT_URL, HVDriver
+from hvbrowser import HENTAIVERSE_ROOT_URL, HVDriver, Realm, RealmNavigator
 from hvbrowser.runtime import setup_logger
 
 from .contracts import (
@@ -56,15 +56,16 @@ def _parse_ring_integer(pattern: re.Pattern[str], value: Any, *, field: str) -> 
 class BattleLauncher:
     """List and submit battle choices without owning selection policy."""
 
-    def __init__(self, browser_client: HVDriver) -> None:
-        self.browser_client = browser_client
+    def __init__(self, browser: HVDriver, realm: RealmNavigator) -> None:
+        self.browser = browser
+        self.realm = realm
 
     @property
     def page(self) -> Any:
-        return self.browser_client.page
+        return self.browser.page
 
     async def _path_prefix(self) -> str:
-        return "/isekai" if await self.browser_client.is_isekai else ""
+        return "/isekai" if await self.realm.current() is Realm.ISEKAI else ""
 
     async def _goto_via_battle_menu(self, label: str) -> bool:
         battle_menu = await self.page.select("#parent_Battle")
@@ -77,7 +78,7 @@ class BattleLauncher:
 
         await battle_menu.mouse_move()
         await target_elements[0].mouse_move()
-        await self.browser_client.wait(
+        await self.browser.wait(
             target_elements[0].mouse_click,
             ischangeurl=True,
         )

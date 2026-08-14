@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
-from hvbrowser import HVDriver
+from hvbrowser import Realm
 
 import hvbattle.hv_battle_ponychart as ponychart_module
 import hvbattle.session as session_module
@@ -61,27 +61,12 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(parameters["challenge_name"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertIs(parameters["exp_multiplier"].kind, inspect.Parameter.KEYWORD_ONLY)
 
-    async def test_browser_startup_preloads_ponychart_before_browser(self) -> None:
+    async def test_browser_ready_installs_dialog_handler_when_enabled(self) -> None:
         session = BattleSession(headless=True, auto_accept_dialogs=True)
-        events: list[str] = []
         session._setup_alert_handler = AsyncMock()
-        session._initialize_battle_components = Mock()
 
-        with (
-            patch.object(
-                session_module,
-                "preload_ponychart_classifier",
-                side_effect=lambda: events.append("preload"),
-            ),
-            patch.object(
-                HVDriver,
-                "_init_browser",
-                new=AsyncMock(side_effect=lambda: events.append("browser")),
-            ),
-        ):
-            await session._init_browser()
+        await session._on_browser_ready()
 
-        self.assertEqual(events, ["preload", "browser"])
         session._setup_alert_handler.assert_awaited_once_with()
 
     async def test_dialog_log_records_category_without_raw_server_message(
@@ -1249,10 +1234,22 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         await task
         strategy.take_turn.assert_awaited_once_with(session)
 
+    async def test_battle_launcher_uses_composed_realm_navigator(self) -> None:
+        browser = Mock()
+        browser.page = Mock()
+        realm = Mock()
+        realm.current = AsyncMock(return_value=Realm.ISEKAI)
+        launcher = BattleLauncher(browser, realm)
+
+        self.assertEqual(await launcher._path_prefix(), "/isekai")
+
+        realm.current.return_value = Realm.PERSISTENT
+        self.assertEqual(await launcher._path_prefix(), "")
+
     async def test_false_submission_result_is_not_reported_as_started(self) -> None:
         client = Mock()
         client.page = Mock()
-        launcher = BattleLauncher(client)
+        launcher = BattleLauncher(client, Mock())
         arena_url = "https://hentaiverse.org/?s=Battle&ss=ar"
         launcher._path_prefix = AsyncMock(return_value="")
         client.page.evaluate = AsyncMock(side_effect=[arena_url, False])
@@ -1264,7 +1261,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_arena_submission_exception_propagates_as_unknown(self) -> None:
         client = Mock()
         client.page = Mock()
-        launcher = BattleLauncher(client)
+        launcher = BattleLauncher(client, Mock())
         arena_url = "https://hentaiverse.org/?s=Battle&ss=ar"
         launcher._path_prefix = AsyncMock(return_value="")
         client.page.evaluate = AsyncMock(
@@ -1277,7 +1274,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_arena_options_are_returned_without_selecting_the_last(self) -> None:
         client = Mock()
         client.page = Mock()
-        launcher = BattleLauncher(client)
+        launcher = BattleLauncher(client, Mock())
         client.page.evaluate = AsyncMock(
             return_value=["init_battle(12, 34)", "init_battle(56, 78, 'token')"]
         )
@@ -1289,7 +1286,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_arena_options_include_row_metadata_in_server_order(self) -> None:
         client = Mock()
         client.page = Mock()
-        launcher = BattleLauncher(client)
+        launcher = BattleLauncher(client, Mock())
         client.page.evaluate = AsyncMock(
             return_value=[
                 {
@@ -1327,7 +1324,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_arena_option_log_does_not_expose_token(self) -> None:
         client = Mock()
         client.page = Mock()
-        launcher = BattleLauncher(client)
+        launcher = BattleLauncher(client, Mock())
         secret = "secret-battle-token"
         malformed = f"init_battle(bad, 34, '{secret}')"
         client.page.evaluate = AsyncMock(return_value=[malformed])
@@ -1347,7 +1344,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         client = Mock()
         client.page = Mock()
-        launcher = BattleLauncher(client)
+        launcher = BattleLauncher(client, Mock())
         client.page.evaluate = AsyncMock(
             return_value=["init_battle(12)", "not-an-option", "init_battle(56)"]
         )
@@ -1361,7 +1358,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         client = Mock()
         client.page = Mock()
-        launcher = BattleLauncher(client)
+        launcher = BattleLauncher(client, Mock())
         grindfest_url = "https://hentaiverse.org/?s=Battle&ss=gr"
         launcher._path_prefix = AsyncMock(return_value="")
         client.page.evaluate = AsyncMock(
@@ -1377,7 +1374,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
     def _launcher() -> tuple[BattleLauncher, Mock]:
         client = Mock()
         client.page = Mock()
-        launcher = BattleLauncher(client)
+        launcher = BattleLauncher(client, Mock())
         launcher._path_prefix = AsyncMock(return_value="")
         return launcher, client.page
 

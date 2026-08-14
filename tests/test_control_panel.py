@@ -10,6 +10,7 @@ from hvbattle.control_panel import (
     _checklist_grid_position,
     _checklist_render_state,
     _checklist_text_wraplength,
+    _checklist_viewport_wraplength,
     _close_gui,
     _commit_integer_control,
     _invoke_callback,
@@ -463,6 +464,16 @@ class GuiCallbackTests(unittest.TestCase):
     def test_dynamic_checklist_width_is_bounded_for_extreme_names(self) -> None:
         self.assertEqual(_checklist_text_wraplength(10_000, 0, 1, 1), 420)
         self.assertEqual(_checklist_text_wraplength(800, 700, 2, 1), 1)
+
+    def test_checklist_wraplength_tracks_the_allocated_viewport(self) -> None:
+        self.assertEqual(_checklist_viewport_wraplength(500), 420)
+        self.assertEqual(_checklist_viewport_wraplength(300), 252)
+        self.assertEqual(_checklist_viewport_wraplength(48), 1)
+        self.assertEqual(_checklist_viewport_wraplength(1), 1)
+
+    def test_checklist_wraplength_rejects_invalid_viewport_width(self) -> None:
+        with self.assertRaisesRegex(ValueError, "viewport_width must be positive"):
+            _checklist_viewport_wraplength(0)
 
     def test_narrow_layout_keeps_one_choice_column(self) -> None:
         self.assertEqual(

@@ -1565,6 +1565,31 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("const expectedCost = 10", submission_script)
         self.assertNotIn("postoken", submission_script.casefold())
 
+    async def test_start_submits_from_exact_isekai_ring_url(self) -> None:
+        launcher, page = self._launcher()
+        launcher._path_prefix = AsyncMock(return_value="/isekai")
+        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
+        snapshot = RingOfBloodSnapshot(20, (option,))
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "https://hentaiverse.org/isekai/?s=Battle&ss=rb",
+                self._payload(tokens="You have 20 tokens of blood."),
+                True,
+            ]
+        )
+
+        outcome = await launcher.start_ring_of_blood(
+            option,
+            expected_before=snapshot,
+        )
+
+        self.assertIs(outcome, RingOfBloodStartOutcome.SUBMITTED)
+        submission_script = page.evaluate.await_args_list[-1].args[0]
+        self.assertIn(
+            'const expectedUrl = "https://hentaiverse.org/isekai/' '?s=Battle&ss=rb";',
+            submission_script,
+        )
+
     async def test_final_atomic_revalidation_failure_does_not_submit(self) -> None:
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)

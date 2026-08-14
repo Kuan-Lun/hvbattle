@@ -128,10 +128,17 @@ def _checklist_text_wraplength(
         controls_width,
         checklist_count,
     )
-    text_width = (
-        frame_width // choice_column_count - _CHECKLIST_TEXT_HORIZONTAL_OVERHEAD
+    return _checklist_viewport_wraplength(max(1, frame_width // choice_column_count))
+
+
+def _checklist_viewport_wraplength(viewport_width: int) -> int:
+    """Bound text to one currently allocated checklist viewport."""
+    if viewport_width <= 0:
+        raise ValueError("viewport_width must be positive")
+    return min(
+        _CHECKLIST_TEXT_MAX_WRAP_LENGTH,
+        max(1, viewport_width - _CHECKLIST_TEXT_HORIZONTAL_OVERHEAD),
     )
-    return min(_CHECKLIST_TEXT_MAX_WRAP_LENGTH, max(1, text_width))
 
 
 def _checklist_frame_width(
@@ -289,9 +296,10 @@ def _run_gui(
     checklist_choice_widgets: dict[str, tuple[Any, ...]] = {}
     checklist_choice_canvases: dict[str, Any] = {}
     checklist_choice_containers: dict[str, Any] = {}
+    checklist_choice_windows: dict[str, int] = {}
     checklist_choice_scrollbars: dict[str, Any] = {}
     checklist_reflow_pending = False
-    scrollbar_refresh_pending = False
+    checklist_viewport_refresh_pending = False
 
     def group_frame(group: str) -> tk.LabelFrame:
         frame = toggle_groups.get(group)
@@ -369,14 +377,7 @@ def _run_gui(
                 scrollregion=(0, 0, content_width, content_height),
             )
 
-        root.update_idletasks()
-        for name, canvas in checklist_choice_canvases.items():
-            content_height = checklist_choice_containers[name].winfo_reqheight()
-            scrollbar = checklist_choice_scrollbars[name]
-            if content_height > canvas.winfo_height():
-                scrollbar.grid()
-            else:
-                scrollbar.grid_remove()
+        refresh_checklist_viewports_impl()
 
     def reflow_checklists() -> None:
         _run_gui_callback_fail_closed(
@@ -392,33 +393,65 @@ def _run_gui(
         checklist_reflow_pending = True
         root.after(20, reflow_checklists)
 
-    def refresh_scrollbars_impl() -> None:
-        nonlocal scrollbar_refresh_pending
-        # The window manager may allocate less height than Tk requested. Use
-        # the final viewport height instead of the earlier screen-size budget.
+    def refresh_checklist_viewports_impl() -> None:
+        nonlocal checklist_viewport_refresh_pending
+        checklist_viewport_refresh_pending = False
+        if not checklist_frames:
+            return
+
+        # The window manager may allocate less space than Tk requested. Wrap
+        # against the final frame and canvas widths so resizing never exposes
+        # a hidden horizontal overflow.
+        root.update_idletasks()
+        for name, frame in checklist_frames.items():
+            canvas = checklist_choice_canvases[name]
+            frame_width = max(1, frame.winfo_width())
+            canvas_width = max(1, canvas.winfo_width())
+            spanning_wraplength = _checklist_viewport_wraplength(frame_width)
+            choice_wraplength = _checklist_viewport_wraplength(canvas_width)
+            for widget in checklist_spanning_widgets[name]:
+                widget.config(wraplength=spanning_wraplength)
+            for widget in checklist_choice_widgets[name]:
+                widget.config(wraplength=choice_wraplength)
+            canvas.itemconfigure(
+                checklist_choice_windows[name],
+                width=canvas_width,
+            )
+
         root.update_idletasks()
         for name, canvas in checklist_choice_canvases.items():
             content_height = checklist_choice_containers[name].winfo_reqheight()
+            canvas_width = max(1, canvas.winfo_width())
+            canvas.config(
+                scrollregion=(0, 0, canvas_width, content_height),
+            )
             scrollbar = checklist_choice_scrollbars[name]
             if content_height > canvas.winfo_height():
                 scrollbar.grid()
             else:
                 scrollbar.grid_remove()
-        scrollbar_refresh_pending = False
 
-    def refresh_scrollbars() -> None:
+    def refresh_checklist_viewports() -> None:
         _run_gui_callback_fail_closed(
             pause_flag,
             root.destroy,
-            refresh_scrollbars_impl,
+            refresh_checklist_viewports_impl,
         )
 
-    def schedule_scrollbar_refresh(event: Any) -> None:
-        nonlocal scrollbar_refresh_pending
-        if event.widget is not root or scrollbar_refresh_pending:
+    def schedule_checklist_viewport_refresh(event: Any = None) -> None:
+        nonlocal checklist_viewport_refresh_pending
+        if (
+            event is not None
+            and event.widget is not root
+            and not any(
+                event.widget is canvas for canvas in checklist_choice_canvases.values()
+            )
+        ):
             return
-        scrollbar_refresh_pending = True
-        root.after(20, refresh_scrollbars)
+        if checklist_viewport_refresh_pending:
+            return
+        checklist_viewport_refresh_pending = True
+        root.after(20, refresh_checklist_viewports)
 
     def sync_to_shared_impl() -> None:
         for name, skill_variable in local_skills.items():
@@ -526,7 +559,11 @@ def _run_gui(
                         pady=3,
                         sticky="nsew",
                     )
-                    checklist_container.columnconfigure(column, weight=1)
+                    checklist_container.columnconfigure(
+                        column,
+                        weight=1,
+                        uniform="checklists",
+                    )
                     checklist_frames[name] = frame
 
                     spanning_widgets: list[Any] = [title]
@@ -564,10 +601,14 @@ def _run_gui(
                         canvas,
                         background=frame.cget("background"),
                     )
-                    canvas.create_window(
+                    choice_window = canvas.create_window(
                         (0, 0),
                         window=choices_container,
                         anchor="nw",
+                    )
+                    canvas.bind(
+                        "<Configure>",
+                        schedule_checklist_viewport_refresh,
                     )
 
                     selected_keys = frozenset(selected)
@@ -621,6 +662,7 @@ def _run_gui(
                     checklist_choice_widgets[name] = tuple(choice_widgets)
                     checklist_choice_canvases[name] = canvas
                     checklist_choice_containers[name] = choices_container
+                    checklist_choice_windows[name] = choice_window
                     checklist_choice_scrollbars[name] = scrollbar
                     schedule_checklist_reflow()
                 case "set_skills":
@@ -671,7 +713,7 @@ def _run_gui(
         "WM_DELETE_WINDOW",
         partial(_close_gui, pause_flag, root.destroy),
     )
-    root.bind("<Configure>", schedule_scrollbar_refresh)
+    root.bind("<Configure>", schedule_checklist_viewport_refresh)
     root.after(100, poll_commands)
     root.after(200, sync_to_shared)
     ready_event.set()

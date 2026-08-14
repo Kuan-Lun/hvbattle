@@ -35,6 +35,16 @@ _TOKEN_COST_PATTERN = re.compile(
     r"\b(\d[\d,]*)\s+tokens?\b",
     re.IGNORECASE,
 )
+_RING_OF_BLOOD_ATOMIC_RESULTS = frozenset(
+    {
+        "submitted",
+        "unexpected-page",
+        "missing-table",
+        "missing-initid",
+        "missing-initform",
+        "missing-exact-action",
+    }
+)
 
 
 def _parse_optional_exp_multiplier(value: Any) -> float | None:
@@ -253,6 +263,18 @@ class BattleLauncher:
                     entry_cost=entry_cost,
                 )
             )
+        logger.info(
+            "Ring of Blood inspection complete tokens=%s start_actions=%s",
+            tokens_of_blood,
+            len(options),
+        )
+        for option in options:
+            logger.info(
+                "Ring of Blood start action found challenge=%r id=%s entry_cost=%s",
+                option.challenge_name,
+                option.battle_id,
+                option.entry_cost,
+            )
         return RingOfBloodSnapshot(tokens_of_blood, tuple(options))
 
     async def start_ring_of_blood(
@@ -270,11 +292,9 @@ class BattleLauncher:
         ring_url = f"{HENTAIVERSE_ROOT_URL}{await self._path_prefix()}/?s=Battle&ss=rb"
         current_url = await self.page.evaluate("window.location.href")
         if current_url != ring_url:
-            logger.debug(
-                "Battle form submission skipped kind=ring-of-blood id=%s "
-                "reason=unexpected-page expected=%s",
+            logger.info(
+                "Ring of Blood pre-submit check id=%s reason=unexpected-page",
                 option.battle_id,
-                ring_url,
             )
             return RingOfBloodStartOutcome.OPTION_UNAVAILABLE
 
@@ -284,6 +304,15 @@ class BattleLauncher:
             for current_option in current.options
         }
         current_option = current_by_id.get(option.battle_id)
+        logger.info(
+            "Ring of Blood pre-submit check id=%s action_present=%s "
+            "snapshot_matches=%s required=%s available=%s",
+            option.battle_id,
+            current_option is not None,
+            current == expected_before,
+            option.entry_cost,
+            current.tokens_of_blood,
+        )
         if current_option is None:
             logger.info(
                 "Ring of Blood option is unavailable id=%s",
@@ -307,16 +336,18 @@ class BattleLauncher:
 
         ring_url_js = json.dumps(ring_url)
         try:
-            submitted = await self.page.evaluate(rf"""
+            atomic_result = await self.page.evaluate(rf"""
                 (() => {{
                     const expectedUrl = {ring_url_js};
-                    if (window.location.href !== expectedUrl) return false;
+                    if (window.location.href !== expectedUrl) return 'unexpected-page';
                     const expectedId = {current_option.battle_id};
                     const expectedCost = {current_option.entry_cost};
                     const table = document.getElementById('arena_list');
                     const initid = document.getElementById('initid');
                     const initform = document.getElementById('initform');
-                    if (!table || !initid || !initform) return false;
+                    if (!table) return 'missing-table';
+                    if (!initid) return 'missing-initid';
+                    if (!initform) return 'missing-initform';
                     const hasExactAction = Array.from(table.querySelectorAll(
                         'img[onclick*="init_battle"]'
                     )).some((element) => {{
@@ -330,10 +361,10 @@ class BattleLauncher:
                             && Number(match[1]) === expectedId
                             && Number(match[2]) === expectedCost;
                     }});
-                    if (!hasExactAction) return false;
+                    if (!hasExactAction) return 'missing-exact-action';
                     initid.value = String(expectedId);
                     initform.submit();
-                    return true;
+                    return 'submitted';
                 }})()
                 """)
         except Exception as error:
@@ -344,10 +375,22 @@ class BattleLauncher:
                 type(error).__name__,
             )
             raise
-        if submitted is not True:
+        result = (
+            atomic_result
+            if isinstance(atomic_result, str)
+            and atomic_result in _RING_OF_BLOOD_ATOMIC_RESULTS
+            else "unexpected-result"
+        )
+        logger.info(
+            "Ring of Blood atomic submission check id=%s result=%s",
+            option.battle_id,
+            result,
+        )
+        if result != "submitted":
             logger.warning(
-                "Battle form was not submitted kind=ring-of-blood id=%s",
+                "Battle form was not submitted kind=ring-of-blood id=%s reason=%s",
                 option.battle_id,
+                result,
             )
             return RingOfBloodStartOutcome.OPTION_UNAVAILABLE
 

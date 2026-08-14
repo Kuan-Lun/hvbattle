@@ -12,6 +12,10 @@ from multiprocessing import Queue
 from queue import Empty
 from typing import Any
 
+from hvbrowser.runtime import setup_logger
+
+logger = setup_logger(__name__)
+
 _GUI_START_TIMEOUT = 10.0
 _GUI_STOP_TIMEOUT = 3.0
 _CHECKLIST_TEXT_MAX_WRAP_LENGTH = 420
@@ -1008,6 +1012,7 @@ class ControlPanel(BaseControlPanel):
         self._pause_flag.set()
         self._cmd_queue.put(("pause", None))
         self._require_live_gui()
+        logger.info("Battle control panel pause requested")
 
     def set_skills(
         self, skill_groups: dict[str, list[str]], forbidden: Iterable[str]
@@ -1030,12 +1035,18 @@ class ControlPanel(BaseControlPanel):
         return forbidden
 
     async def wait_if_paused(self) -> None:
+        waiting = False
         while True:
             self._require_live_gui()
             paused = self._pause_flag.is_set()
             self._require_live_gui()
             if not paused:
+                if waiting:
+                    logger.info("Battle control panel resumed")
                 return
+            if not waiting:
+                logger.info("Battle control panel is paused; waiting for Resume")
+                waiting = True
             await asyncio.sleep(0.5)
 
     def destroy(self) -> None:

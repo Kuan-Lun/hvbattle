@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 from hvbattle import (
     ArenaOption,
@@ -207,15 +207,193 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
-        launcher_logger.debug.assert_called_once_with(
-            "Battle form submission skipped kind=ring-of-blood id=%s "
-            "reason=unexpected-page expected=%s",
+        launcher_logger.info.assert_called_once_with(
+            "Ring of Blood pre-submit check id=%s reason=unexpected-page",
             option.battle_id,
-            expected_url,
         )
-        launcher_logger.info.assert_not_called()
+        launcher_logger.debug.assert_not_called()
         launcher_logger.warning.assert_not_called()
+        self.assertNotIn(expected_url, repr(launcher_logger.method_calls))
         self.assertNotIn(secret, repr(launcher_logger.method_calls))
+
+    async def test_ring_inspection_logs_only_parsed_start_action_details(self) -> None:
+        launcher, page = self._launcher()
+        option, snapshot, payload = self._ring_values()
+        page.evaluate = AsyncMock(return_value=payload)
+
+        with patch("hvbattle.battle_launcher.logger") as launcher_logger:
+            inspected = await launcher.inspect_ring_of_blood()
+
+        self.assertEqual(inspected, snapshot)
+        self.assertEqual(
+            launcher_logger.info.call_args_list,
+            [
+                call(
+                    "Ring of Blood inspection complete tokens=%s start_actions=%s",
+                    20,
+                    1,
+                ),
+                call(
+                    "Ring of Blood start action found "
+                    "challenge=%r id=%s entry_cost=%s",
+                    option.challenge_name,
+                    option.battle_id,
+                    option.entry_cost,
+                ),
+            ],
+        )
+        logged = repr(launcher_logger.method_calls)
+        self.assertNotIn("init_battle", logged)
+        self.assertNotIn("tokenText", logged)
+
+    async def test_ring_success_logs_precheck_and_atomic_submission(self) -> None:
+        launcher, page = self._launcher()
+        option, snapshot, payload = self._ring_values()
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "https://hentaiverse.org/?s=Battle&ss=rb",
+                payload,
+                "submitted",
+            ]
+        )
+
+        with patch("hvbattle.battle_launcher.logger") as launcher_logger:
+            outcome = await launcher.start_ring_of_blood(
+                option,
+                expected_before=snapshot,
+            )
+
+        self.assertIs(outcome, RingOfBloodStartOutcome.SUBMITTED)
+        self.assertEqual(
+            launcher_logger.info.call_args_list,
+            [
+                call(
+                    "Ring of Blood inspection complete tokens=%s start_actions=%s",
+                    20,
+                    1,
+                ),
+                call(
+                    "Ring of Blood start action found "
+                    "challenge=%r id=%s entry_cost=%s",
+                    option.challenge_name,
+                    option.battle_id,
+                    option.entry_cost,
+                ),
+                call(
+                    "Ring of Blood pre-submit check id=%s action_present=%s "
+                    "snapshot_matches=%s required=%s available=%s",
+                    option.battle_id,
+                    True,
+                    True,
+                    option.entry_cost,
+                    snapshot.tokens_of_blood,
+                ),
+                call(
+                    "Ring of Blood atomic submission check id=%s result=%s",
+                    option.battle_id,
+                    "submitted",
+                ),
+                call(
+                    "Submitted Ring of Blood battle form id=%s",
+                    option.battle_id,
+                ),
+            ],
+        )
+        launcher_logger.warning.assert_not_called()
+
+    async def test_ring_precheck_logs_when_target_action_disappears(self) -> None:
+        launcher, page = self._launcher()
+        option, snapshot, payload = self._ring_values()
+        payload["rows"] = []
+        page.evaluate = AsyncMock(
+            side_effect=[
+                "https://hentaiverse.org/?s=Battle&ss=rb",
+                payload,
+            ]
+        )
+
+        with patch("hvbattle.battle_launcher.logger") as launcher_logger:
+            outcome = await launcher.start_ring_of_blood(
+                option,
+                expected_before=snapshot,
+            )
+
+        self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
+        launcher_logger.info.assert_any_call(
+            "Ring of Blood pre-submit check id=%s action_present=%s "
+            "snapshot_matches=%s required=%s available=%s",
+            option.battle_id,
+            False,
+            False,
+            option.entry_cost,
+            snapshot.tokens_of_blood,
+        )
+        launcher_logger.info.assert_any_call(
+            "Ring of Blood option is unavailable id=%s",
+            option.battle_id,
+        )
+
+    async def test_ring_atomic_failures_log_exact_closed_reason(self) -> None:
+        results = (
+            "unexpected-page",
+            "missing-table",
+            "missing-initid",
+            "missing-initform",
+            "missing-exact-action",
+            "unexpected-result-from-page",
+            {"unexpected": "payload"},
+        )
+        for atomic_result in results:
+            with self.subTest(atomic_result=atomic_result):
+                launcher, page = self._launcher()
+                option, snapshot, payload = self._ring_values()
+                page.evaluate = AsyncMock(
+                    side_effect=[
+                        "https://hentaiverse.org/?s=Battle&ss=rb",
+                        payload,
+                        atomic_result,
+                    ]
+                )
+
+                with patch("hvbattle.battle_launcher.logger") as launcher_logger:
+                    outcome = await launcher.start_ring_of_blood(
+                        option,
+                        expected_before=snapshot,
+                    )
+
+                expected_reason = (
+                    atomic_result
+                    if isinstance(atomic_result, str)
+                    and atomic_result
+                    in {
+                        "unexpected-page",
+                        "missing-table",
+                        "missing-initid",
+                        "missing-initform",
+                        "missing-exact-action",
+                    }
+                    else "unexpected-result"
+                )
+                self.assertIs(
+                    outcome,
+                    RingOfBloodStartOutcome.OPTION_UNAVAILABLE,
+                )
+                launcher_logger.info.assert_any_call(
+                    "Ring of Blood atomic submission check id=%s result=%s",
+                    option.battle_id,
+                    expected_reason,
+                )
+                launcher_logger.warning.assert_called_once_with(
+                    "Battle form was not submitted kind=ring-of-blood id=%s "
+                    "reason=%s",
+                    option.battle_id,
+                    expected_reason,
+                )
+                if expected_reason == "unexpected-result":
+                    self.assertNotIn(
+                        repr(atomic_result),
+                        repr(launcher_logger.method_calls),
+                    )
 
     async def test_ring_submission_exception_logs_only_error_type(self) -> None:
         launcher, page = self._launcher()
@@ -247,7 +425,32 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             "RuntimeError",
         )
         launcher_logger.exception.assert_not_called()
-        launcher_logger.info.assert_not_called()
+        self.assertEqual(
+            launcher_logger.info.call_args_list,
+            [
+                call(
+                    "Ring of Blood inspection complete tokens=%s start_actions=%s",
+                    20,
+                    1,
+                ),
+                call(
+                    "Ring of Blood start action found "
+                    "challenge=%r id=%s entry_cost=%s",
+                    option.challenge_name,
+                    option.battle_id,
+                    option.entry_cost,
+                ),
+                call(
+                    "Ring of Blood pre-submit check id=%s action_present=%s "
+                    "snapshot_matches=%s required=%s available=%s",
+                    option.battle_id,
+                    True,
+                    True,
+                    option.entry_cost,
+                    snapshot.tokens_of_blood,
+                ),
+            ],
+        )
         self.assertNotIn(secret_detail, repr(launcher_logger.method_calls))
 
 

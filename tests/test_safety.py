@@ -1546,7 +1546,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
             side_effect=[
                 "https://hentaiverse.org/?s=Battle&ss=rb",
                 self._payload(tokens="You have 20 tokens of blood."),
-                True,
+                "submitted",
             ]
         )
 
@@ -1563,6 +1563,16 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Number(match[2]) === expectedCost", submission_script)
         self.assertIn("const expectedId = 112", submission_script)
         self.assertIn("const expectedCost = 10", submission_script)
+        for result in (
+            "unexpected-page",
+            "missing-table",
+            "missing-initid",
+            "missing-initform",
+            "missing-exact-action",
+            "submitted",
+        ):
+            with self.subTest(atomic_result=result):
+                self.assertIn(f"return '{result}'", submission_script)
         self.assertNotIn("postoken", submission_script.casefold())
 
     async def test_start_submits_from_exact_isekai_ring_url(self) -> None:
@@ -1574,7 +1584,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
             side_effect=[
                 "https://hentaiverse.org/isekai/?s=Battle&ss=rb",
                 self._payload(tokens="You have 20 tokens of blood."),
-                True,
+                "submitted",
             ]
         )
 
@@ -1590,25 +1600,44 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
             submission_script,
         )
 
-    async def test_final_atomic_revalidation_failure_does_not_submit(self) -> None:
-        launcher, page = self._launcher()
-        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
-        snapshot = RingOfBloodSnapshot(20, (option,))
-        page.evaluate = AsyncMock(
-            side_effect=[
-                "https://hentaiverse.org/?s=Battle&ss=rb",
-                self._payload(tokens="You have 20 tokens of blood."),
-                False,
-            ]
+    async def test_final_atomic_revalidation_failures_do_not_submit(self) -> None:
+        failure_results: tuple[object, ...] = (
+            "unexpected-page",
+            "missing-table",
+            "missing-initid",
+            "missing-initform",
+            "missing-exact-action",
+            True,
+            {"unexpected": "payload"},
         )
+        for atomic_result in failure_results:
+            with self.subTest(atomic_result=atomic_result):
+                launcher, page = self._launcher()
+                option = RingOfBloodOption(
+                    112,
+                    "Triple Trio and the Tree",
+                    1.0,
+                    10,
+                )
+                snapshot = RingOfBloodSnapshot(20, (option,))
+                page.evaluate = AsyncMock(
+                    side_effect=[
+                        "https://hentaiverse.org/?s=Battle&ss=rb",
+                        self._payload(tokens="You have 20 tokens of blood."),
+                        atomic_result,
+                    ]
+                )
 
-        outcome = await launcher.start_ring_of_blood(
-            option,
-            expected_before=snapshot,
-        )
+                outcome = await launcher.start_ring_of_blood(
+                    option,
+                    expected_before=snapshot,
+                )
 
-        self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
-        self.assertEqual(page.evaluate.await_count, 3)
+                self.assertIs(
+                    outcome,
+                    RingOfBloodStartOutcome.OPTION_UNAVAILABLE,
+                )
+                self.assertEqual(page.evaluate.await_count, 3)
 
     async def test_start_submission_exception_propagates(self) -> None:
         launcher, page = self._launcher()

@@ -1,7 +1,7 @@
 import asyncio
 import threading
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, call, patch
 
 from hvbattle import BaseControlPanel, ControlPanel, NullControlPanel
 from hvbattle.control_panel import (
@@ -354,13 +354,35 @@ class ControlPanelStateTests(unittest.TestCase):
             panel._pause_flag = asyncio.Event()
             panel._cmd_queue = Mock()
 
-            panel.pause()
-            waiter = asyncio.create_task(panel.wait_if_paused())
-            await asyncio.sleep(0)
-            self.assertFalse(waiter.done())
-            panel._pause_flag.clear()
-            await asyncio.wait_for(waiter, timeout=1)
+            with patch("hvbattle.control_panel.logger") as control_logger:
+                panel.pause()
+                waiter = asyncio.create_task(panel.wait_if_paused())
+                await asyncio.sleep(0)
+                self.assertFalse(waiter.done())
+                panel._pause_flag.clear()
+                await asyncio.wait_for(waiter, timeout=1)
+
+            self.assertEqual(
+                control_logger.info.call_args_list,
+                [
+                    call("Battle control panel pause requested"),
+                    call("Battle control panel is paused; waiting for Resume"),
+                    call("Battle control panel resumed"),
+                ],
+            )
             panel._cmd_queue.put.assert_called_once_with(("pause", None))
+
+        asyncio.run(exercise())
+
+    def test_unpaused_wait_does_not_report_a_resume(self) -> None:
+        async def exercise() -> None:
+            panel = _control_panel_without_process_start()
+            panel._pause_flag = asyncio.Event()
+
+            with patch("hvbattle.control_panel.logger") as control_logger:
+                await panel.wait_if_paused()
+
+            control_logger.info.assert_not_called()
 
         asyncio.run(exercise())
 

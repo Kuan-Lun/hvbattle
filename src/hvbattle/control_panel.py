@@ -14,8 +14,6 @@ from typing import Any
 
 _GUI_START_TIMEOUT = 10.0
 _GUI_STOP_TIMEOUT = 3.0
-_CHECKLIST_ROWS_PER_COLUMN = 12
-_CHECKLIST_TEXT_MIN_WRAP_LENGTH = 120
 _CHECKLIST_TEXT_MAX_WRAP_LENGTH = 420
 _CHECKLIST_TEXT_HORIZONTAL_OVERHEAD = 48
 _CHECKLIST_CANVAS_HORIZONTAL_OVERHEAD = 24
@@ -108,20 +106,11 @@ def _checklist_render_state(
 
 def _checklist_grid_position(
     index: int,
-    rows_per_column: int = _CHECKLIST_ROWS_PER_COLUMN,
+    rows_per_column: int,
 ) -> tuple[int, int]:
     if rows_per_column <= 0:
         raise ValueError("rows_per_column must be positive")
     return index % rows_per_column, index // rows_per_column
-
-
-def _checklist_choice_column_count(choice_count: int) -> int:
-    if choice_count < 0:
-        raise ValueError("choice_count must not be negative")
-    return max(
-        1,
-        (choice_count + _CHECKLIST_ROWS_PER_COLUMN - 1) // _CHECKLIST_ROWS_PER_COLUMN,
-    )
 
 
 def _checklist_text_wraplength(
@@ -173,22 +162,11 @@ def _checklist_choice_layout(
     checklist_count: int,
     choice_count: int,
 ) -> tuple[int, int, int]:
-    """Return inner columns, rows per column, and dynamic text wrap length."""
-    natural_columns = _checklist_choice_column_count(choice_count)
-    frame_width = _checklist_frame_width(
-        screen_width,
-        controls_width,
-        checklist_count,
-    )
-    readable_column_width = (
-        _CHECKLIST_TEXT_MIN_WRAP_LENGTH + _CHECKLIST_TEXT_HORIZONTAL_OVERHEAD
-    )
-    fitting_columns = max(1, frame_width // readable_column_width)
-    column_count = min(natural_columns, fitting_columns)
-    if choice_count == 0 or column_count == natural_columns:
-        rows_per_column = _CHECKLIST_ROWS_PER_COLUMN
-    else:
-        rows_per_column = (choice_count + column_count - 1) // column_count
+    """Return one vertical choice column with a dynamic text wrap length."""
+    if choice_count < 0:
+        raise ValueError("choice_count must not be negative")
+    column_count = 1
+    rows_per_column = max(1, choice_count)
     wraplength = _checklist_text_wraplength(
         screen_width,
         controls_width,
@@ -628,7 +606,10 @@ def _run_gui(
                             ),
                         )
                         choice_widgets.append(checkbox)
-                        grid_row, grid_column = _checklist_grid_position(index)
+                        grid_row, grid_column = _checklist_grid_position(
+                            index,
+                            max(1, len(choices)),
+                        )
                         checkbox.grid(
                             row=grid_row,
                             column=grid_column,

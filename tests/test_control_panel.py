@@ -6,7 +6,6 @@ from unittest.mock import Mock
 from hvbattle import BaseControlPanel, ControlPanel, NullControlPanel
 from hvbattle.control_panel import (
     _allocate_checklist_column,
-    _checklist_choice_column_count,
     _checklist_choice_layout,
     _checklist_grid_position,
     _checklist_render_state,
@@ -445,18 +444,13 @@ class GuiCallbackTests(unittest.TestCase):
         self.assertEqual(_allocate_checklist_column(columns, "arena"), 0)
         self.assertEqual(columns, {"arena": 0, "ring": 1})
 
-    def test_checklist_grid_starts_a_new_column_every_twelve_choices(self) -> None:
-        self.assertEqual(_checklist_grid_position(0), (0, 0))
-        self.assertEqual(_checklist_grid_position(11), (11, 0))
-        self.assertEqual(_checklist_grid_position(12), (0, 1))
-        self.assertEqual(_checklist_grid_position(23), (11, 1))
-        self.assertEqual(_checklist_grid_position(24), (0, 2))
-        self.assertEqual(_checklist_grid_position(13, rows_per_column=13), (0, 1))
-
-    def test_checklist_choice_column_count_includes_empty_placeholder(self) -> None:
-        self.assertEqual(_checklist_choice_column_count(0), 1)
-        self.assertEqual(_checklist_choice_column_count(12), 1)
-        self.assertEqual(_checklist_choice_column_count(13), 2)
+    def test_checklist_grid_keeps_all_choices_in_one_column(self) -> None:
+        for index in range(25):
+            with self.subTest(index=index):
+                self.assertEqual(
+                    _checklist_grid_position(index, rows_per_column=25),
+                    (index, 0),
+                )
 
     def test_dynamic_checklist_width_uses_remaining_screen_space(self) -> None:
         one_checklist = _checklist_text_wraplength(1_600, 600, 1, 1)
@@ -470,16 +464,22 @@ class GuiCallbackTests(unittest.TestCase):
         self.assertEqual(_checklist_text_wraplength(10_000, 0, 1, 1), 420)
         self.assertEqual(_checklist_text_wraplength(800, 700, 2, 1), 1)
 
-    def test_narrow_layout_reduces_inner_columns_before_text_width(self) -> None:
+    def test_narrow_layout_keeps_one_choice_column(self) -> None:
         self.assertEqual(
             _checklist_choice_layout(1_366, 550, 2, 25),
-            (2, 13, 124),
+            (1, 25, 296),
         )
 
-    def test_wide_layout_preserves_twelve_rows_per_column(self) -> None:
+    def test_wide_layout_keeps_one_choice_column(self) -> None:
         self.assertEqual(
             _checklist_choice_layout(1_920, 600, 2, 25),
-            (3, 12, 150),
+            (1, 25, 420),
+        )
+
+    def test_empty_checklist_layout_has_one_placeholder_row(self) -> None:
+        self.assertEqual(
+            _checklist_choice_layout(1_366, 550, 2, 0),
+            (1, 1, 296),
         )
 
     def test_apply_commits_valid_integer_and_updates_visible_status(self) -> None:

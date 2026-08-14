@@ -15,9 +15,18 @@ from hvbattle.control_panel import (
 )
 
 
+def _control_panel_without_process_start(*, alive: bool = True) -> ControlPanel:
+    panel = object.__new__(ControlPanel)
+    panel._destroyed = False
+    panel._process = Mock()
+    panel._process.is_alive.return_value = alive
+    panel._pause_flag = Mock()
+    return panel
+
+
 class ControlPanelStateTests(unittest.TestCase):
     def test_toggle_default_is_available_before_gui_processes_command(self) -> None:
-        panel = object.__new__(ControlPanel)
+        panel = _control_panel_without_process_start()
         panel._toggle_dict = {}
         panel._cmd_queue = Mock()
 
@@ -42,7 +51,7 @@ class ControlPanelStateTests(unittest.TestCase):
         )
 
     def test_toggle_reads_live_shared_state(self) -> None:
-        panel = object.__new__(ControlPanel)
+        panel = _control_panel_without_process_start()
         panel._toggle_dict = {"auto_next_arena_battle": True}
 
         panel._toggle_dict["auto_next_arena_battle"] = False
@@ -52,7 +61,7 @@ class ControlPanelStateTests(unittest.TestCase):
     def test_forbidden_skills_are_available_before_gui_processes_command(
         self,
     ) -> None:
-        panel = object.__new__(ControlPanel)
+        panel = _control_panel_without_process_start()
         panel._skill_dict = {}
         panel._cmd_queue = Mock()
 
@@ -65,7 +74,7 @@ class ControlPanelStateTests(unittest.TestCase):
         panel._cmd_queue.put.assert_called_once()
 
     def test_integer_default_is_available_before_gui_processes_command(self) -> None:
-        panel = object.__new__(ControlPanel)
+        panel = _control_panel_without_process_start()
         panel._integer_dict = {}
         panel._cmd_queue = Mock()
 
@@ -100,7 +109,7 @@ class ControlPanelStateTests(unittest.TestCase):
         self.assertIsNone(_parse_integer("1001", 0, 1_000))
 
     def test_integer_reads_only_committed_shared_state(self) -> None:
-        panel = object.__new__(ControlPanel)
+        panel = _control_panel_without_process_start()
         panel._integer_dict = {"lottery_target": 1_000}
 
         panel._integer_dict["lottery_target"] = 500
@@ -108,7 +117,7 @@ class ControlPanelStateTests(unittest.TestCase):
         self.assertEqual(panel.get_integer("lottery_target"), 500)
 
     def test_checklist_selection_is_available_before_gui_command(self) -> None:
-        panel = object.__new__(ControlPanel)
+        panel = _control_panel_without_process_start()
         panel._checklist_dict = {}
         panel._cmd_queue = Mock()
 
@@ -138,7 +147,7 @@ class ControlPanelStateTests(unittest.TestCase):
         )
 
     def test_checklist_replacement_removes_stale_shared_selection(self) -> None:
-        panel = object.__new__(ControlPanel)
+        panel = _control_panel_without_process_start()
         panel._checklist_dict = {}
         panel._cmd_queue = Mock()
         panel.set_checklist(
@@ -163,7 +172,7 @@ class ControlPanelStateTests(unittest.TestCase):
         )
 
     def test_checklist_reads_one_live_atomic_tuple(self) -> None:
-        panel = object.__new__(ControlPanel)
+        panel = _control_panel_without_process_start()
         panel._checklist_dict = {"arena": ("low", "high")}
 
         panel._checklist_dict["arena"] = ("high",)
@@ -171,7 +180,7 @@ class ControlPanelStateTests(unittest.TestCase):
         self.assertEqual(panel.get_checklist_selection("arena"), ("high",))
 
     def test_empty_checklist_has_an_empty_selection(self) -> None:
-        panel = object.__new__(ControlPanel)
+        panel = _control_panel_without_process_start()
         panel._checklist_dict = {}
         panel._cmd_queue = Mock()
 
@@ -198,7 +207,7 @@ class ControlPanelStateTests(unittest.TestCase):
         )
 
     def test_checklist_namespace_is_independent_from_other_controls(self) -> None:
-        panel = object.__new__(ControlPanel)
+        panel = _control_panel_without_process_start()
         panel._toggle_dict = {}
         panel._integer_dict = {}
         panel._checklist_dict = {}
@@ -219,7 +228,7 @@ class ControlPanelStateTests(unittest.TestCase):
 
     def test_programmatic_pause_blocks_until_pause_flag_is_cleared(self) -> None:
         async def exercise() -> None:
-            panel = object.__new__(ControlPanel)
+            panel = _control_panel_without_process_start()
             panel._pause_flag = asyncio.Event()
             panel._cmd_queue = Mock()
 
@@ -232,6 +241,77 @@ class ControlPanelStateTests(unittest.TestCase):
             panel._cmd_queue.put.assert_called_once_with(("pause", None))
 
         asyncio.run(exercise())
+
+    def test_live_reads_fail_closed_after_gui_process_exits(self) -> None:
+        panel = _control_panel_without_process_start(alive=False)
+        panel._toggle_dict = {"toggle": True}
+        panel._integer_dict = {"integer": 7}
+        panel._checklist_dict = {"checklist": ("choice",)}
+        panel._skill_dict = {"skill": False}
+
+        live_reads = (
+            lambda: panel.get_toggle("toggle"),
+            lambda: panel.get_integer("integer"),
+            lambda: panel.get_checklist_selection("checklist"),
+            panel.get_forbidden_skills,
+        )
+        for read in live_reads:
+            with (
+                self.subTest(read=read),
+                self.assertRaisesRegex(RuntimeError, "GUI process is not running"),
+            ):
+                read()
+
+        self.assertEqual(panel._pause_flag.set.call_count, len(live_reads))
+
+    def test_mutations_fail_closed_after_gui_process_exits(self) -> None:
+        panel = _control_panel_without_process_start(alive=False)
+        panel._toggle_dict = {}
+        panel._integer_dict = {}
+        panel._checklist_dict = {}
+        panel._skill_dict = {}
+        panel._cmd_queue = Mock()
+
+        mutations = (
+            lambda: panel.set_title("Title"),
+            lambda: panel.register_toggle("toggle", "Toggle"),
+            lambda: panel.register_integer("integer", "Integer"),
+            lambda: panel.set_checklist("checklist", "Checklist", ()),
+            panel.pause,
+            lambda: panel.set_skills({"Skills": ["skill"]}, ()),
+        )
+        for mutation in mutations:
+            with (
+                self.subTest(mutation=mutation),
+                self.assertRaisesRegex(RuntimeError, "GUI process is not running"),
+            ):
+                mutation()
+
+        self.assertEqual(panel._pause_flag.set.call_count, len(mutations))
+        panel._cmd_queue.put.assert_not_called()
+
+    def test_unpaused_wait_fails_closed_after_gui_process_exits(self) -> None:
+        async def exercise() -> None:
+            panel = _control_panel_without_process_start(alive=False)
+            panel._pause_flag.is_set.return_value = False
+
+            with self.assertRaisesRegex(RuntimeError, "GUI process is not running"):
+                await panel.wait_if_paused()
+
+            panel._pause_flag.set.assert_called_once_with()
+            panel._pause_flag.is_set.assert_not_called()
+
+        asyncio.run(exercise())
+
+    def test_live_read_rechecks_gui_after_shared_state_access(self) -> None:
+        panel = _control_panel_without_process_start()
+        panel._process.is_alive.side_effect = (True, False)
+        panel._toggle_dict = {"toggle": True}
+
+        with self.assertRaisesRegex(RuntimeError, "GUI process is not running"):
+            panel.get_toggle("toggle")
+
+        panel._pause_flag.set.assert_called_once_with()
 
 
 class GuiCallbackTests(unittest.TestCase):

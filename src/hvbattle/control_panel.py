@@ -275,7 +275,17 @@ def _run_gui(
     root.after(100, poll_commands)
     root.after(200, sync_to_shared)
     ready_event.set()
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        # A graceful Tk exit that did not pass through WM_DELETE_WINDOW must
+        # still stop the parent at its next live-control boundary.
+        try:
+            pause_flag.set()
+        except Exception:
+            # The manager may already be unavailable during interpreter
+            # shutdown. The parent independently checks the GUI process.
+            pass
 
 
 class BaseControlPanel(ABC):
@@ -394,7 +404,9 @@ class ControlPanel(BaseControlPanel):
         deadline = time.monotonic() + _GUI_START_TIMEOUT
         while time.monotonic() < deadline:
             if ready_event.wait(timeout=0.1):
-                return
+                if self._process.is_alive():
+                    return
+                break
             if not self._process.is_alive():
                 break
         if self._process.is_alive():
@@ -403,8 +415,32 @@ class ControlPanel(BaseControlPanel):
         self._manager.shutdown()
         raise RuntimeError("Battle control panel failed to start")
 
+    def _require_live_gui(self) -> None:
+        """Fail closed instead of using stale state after the GUI exits."""
+        if self._destroyed:
+            raise RuntimeError("Battle control panel has been destroyed")
+        try:
+            alive = self._process.is_alive()
+        except Exception as error:
+            self._pause_best_effort()
+            raise RuntimeError(
+                "Battle control panel GUI process state is unavailable"
+            ) from error
+        if alive:
+            return
+        self._pause_best_effort()
+        raise RuntimeError("Battle control panel GUI process is not running")
+
+    def _pause_best_effort(self) -> None:
+        try:
+            self._pause_flag.set()
+        except Exception:
+            pass
+
     def set_title(self, title: str) -> None:
+        self._require_live_gui()
         self._cmd_queue.put(("set_title", title))
+        self._require_live_gui()
 
     def register_toggle(
         self,
@@ -414,11 +450,16 @@ class ControlPanel(BaseControlPanel):
         *,
         group: str = "Options",
     ) -> None:
+        self._require_live_gui()
         self._toggle_dict[name] = default
         self._cmd_queue.put(("register_toggle", (name, label, default, group)))
+        self._require_live_gui()
 
     def get_toggle(self, name: str) -> bool:
-        return bool(self._toggle_dict.get(name, False))
+        self._require_live_gui()
+        value = bool(self._toggle_dict.get(name, False))
+        self._require_live_gui()
+        return value
 
     def register_integer(
         self,
@@ -430,6 +471,7 @@ class ControlPanel(BaseControlPanel):
         maximum: int | None = None,
         group: str = "Options",
     ) -> None:
+        self._require_live_gui()
         _validate_integer_configuration(default, minimum, maximum)
         self._integer_dict[name] = default
         self._cmd_queue.put(
@@ -438,12 +480,16 @@ class ControlPanel(BaseControlPanel):
                 (name, label, default, minimum, maximum, group),
             )
         )
+        self._require_live_gui()
 
     def get_integer(self, name: str) -> int:
+        self._require_live_gui()
         try:
-            return int(self._integer_dict[name])
+            value = int(self._integer_dict[name])
         except KeyError:
             raise KeyError(f"Unknown integer control: {name}") from None
+        self._require_live_gui()
+        return value
 
     def set_checklist(
         self,
@@ -454,6 +500,7 @@ class ControlPanel(BaseControlPanel):
         *,
         status: str | None = None,
     ) -> None:
+        self._require_live_gui()
         normalized_choices, normalized_selected = _validate_checklist_configuration(
             name,
             label,
@@ -474,34 +521,50 @@ class ControlPanel(BaseControlPanel):
                 ),
             )
         )
+        self._require_live_gui()
 
     def get_checklist_selection(self, name: str) -> tuple[str, ...]:
+        self._require_live_gui()
         try:
-            return tuple(self._checklist_dict[name])
+            selected = tuple(self._checklist_dict[name])
         except KeyError:
             raise KeyError(f"Unknown checklist control: {name}") from None
+        self._require_live_gui()
+        return selected
 
     def pause(self) -> None:
+        self._require_live_gui()
         self._pause_flag.set()
         self._cmd_queue.put(("pause", None))
+        self._require_live_gui()
 
     def set_skills(
         self, skill_groups: dict[str, list[str]], forbidden: Iterable[str]
     ) -> None:
+        self._require_live_gui()
         forbidden_set = frozenset(forbidden)
         self._skill_dict.clear()
         for skills in skill_groups.values():
             for skill in skills:
                 self._skill_dict[skill] = skill not in forbidden_set
         self._cmd_queue.put(("set_skills", (skill_groups, forbidden_set)))
+        self._require_live_gui()
 
     def get_forbidden_skills(self) -> frozenset[str]:
-        return frozenset(
+        self._require_live_gui()
+        forbidden = frozenset(
             name for name, enabled in self._skill_dict.items() if not enabled
         )
+        self._require_live_gui()
+        return forbidden
 
     async def wait_if_paused(self) -> None:
-        while self._pause_flag.is_set():
+        while True:
+            self._require_live_gui()
+            paused = self._pause_flag.is_set()
+            self._require_live_gui()
+            if not paused:
+                return
             await asyncio.sleep(0.5)
 
     def destroy(self) -> None:

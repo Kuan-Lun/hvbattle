@@ -56,6 +56,35 @@ class BattleStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(driver.page.mapper, {7: sentinel})
         self.assertIs(store.snap, snapshot)
 
+    async def test_duplicate_id_retry_uses_only_remaining_content_budget(self) -> None:
+        driver = Mock()
+        driver.page.get_content = Mock(return_value=object())
+        store = BattleStateStore(driver)
+        observed_timeouts: list[float] = []
+
+        async def bounded_content_read(
+            _content: object,
+            *,
+            timeout: float,
+        ) -> str:
+            observed_timeouts.append(timeout)
+            if len(observed_timeouts) == 1:
+                await asyncio.sleep(0.01)
+                raise state_module.ProtocolException("duplicate id")
+            return "<html></html>"
+
+        with patch.object(
+            state_module,
+            "wait_for_zendriver",
+            side_effect=bounded_content_read,
+        ):
+            content = await store._get_content(timeout=1)
+
+        self.assertEqual(content, "<html></html>")
+        self.assertEqual(observed_timeouts[0], 1)
+        self.assertGreater(observed_timeouts[1], 0)
+        self.assertLess(observed_timeouts[1], 1)
+
     def test_reset_replaces_all_battle_scoped_state(self) -> None:
         store = BattleStateStore(Mock())
         previous_log = store.log_entries

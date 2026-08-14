@@ -1,5 +1,6 @@
 """Typed battle snapshot state and derived combat views."""
 
+import asyncio
 import re
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -9,7 +10,7 @@ from hv_bie.types import BattleSnapshot
 from hvbrowser import HVDriver
 from zendriver.core.connection import ProtocolException
 
-from ._zendriver import wait_for_zendriver
+from ._zendriver import ZendriverOperationTimeout, wait_for_zendriver
 
 
 @dataclass(slots=True)
@@ -87,6 +88,7 @@ class BattleStateStore:
 
     async def _get_content(self, timeout: float = 10.0) -> str:
         """Read HTML with one bounded retry for zendriver's duplicate-id race."""
+        deadline = asyncio.get_running_loop().time() + timeout
         try:
             return await wait_for_zendriver(
                 self._driver.page.get_content(), timeout=timeout
@@ -94,17 +96,20 @@ class BattleStateStore:
         except ProtocolException as error:
             if "duplicate" not in str(error).casefold():
                 raise
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise ZendriverOperationTimeout from error
             return await wait_for_zendriver(
-                self._driver.page.get_content(), timeout=timeout
+                self._driver.page.get_content(), timeout=remaining
             )
 
     async def init(self) -> None:
         """Compatibility spelling for the first state refresh."""
         await self.update()
 
-    async def inspect(self) -> BattleSnapshot:
+    async def inspect(self, *, timeout: float = 10.0) -> BattleSnapshot:
         """Parse the page without consuming log or derived-view state."""
-        return parse_snapshot(await self._get_content())
+        return parse_snapshot(await self._get_content(timeout=timeout))
 
     async def update(self) -> None:
         snapshot = await self.inspect()

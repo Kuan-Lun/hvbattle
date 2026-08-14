@@ -221,6 +221,39 @@ class RecoveryStateReconciliationTests(unittest.TestCase):
         self.assertIsNone(state)
 
 
+class RecoveryStateProbeBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_second_dom_probe_receives_only_remaining_total_budget(self) -> None:
+        manager = object.__new__(ElementActionManager)
+
+        async def read_action_state(
+            _state_id: str,
+            *,
+            probe_timeout: float,
+        ) -> _BattleActionState:
+            self.assertEqual(probe_timeout, 1)
+            await asyncio.sleep(0.01)
+            return _action_state(document_id="document-after")
+
+        exit_state = _BattleExitState(
+            document_id="document-after",
+            realm="persistent",
+            ready_state="complete",
+            battle_present=True,
+            finish_image_present=False,
+            next_floor_present=False,
+            ponychart_present=False,
+        )
+        manager._read_action_state = AsyncMock(side_effect=read_action_state)
+        manager._read_battle_exit_state = AsyncMock(return_value=exit_state)
+
+        state = await manager.read_recovery_state(probe_timeout=1)
+
+        self.assertIsNotNone(state)
+        remaining = manager._read_battle_exit_state.await_args.kwargs["probe_timeout"]
+        self.assertGreater(remaining, 0)
+        self.assertLess(remaining, 1)
+
+
 class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
     def test_recovery_evidence_requires_bound_dialog_and_receipt_loss_shape(
         self,
@@ -782,7 +815,20 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(raised.exception, error)
 
 
+class _ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.now += delay
+
+
 class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
+    clock: _ManualClock
+
     def _coordinator(self) -> tuple[BattleRecoveryCoordinator, Mock, Mock]:
         actions = Mock()
         actions.read_recovery_state = AsyncMock()
@@ -795,7 +841,14 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         state_store.reset = Mock()
-        return BattleRecoveryCoordinator(actions, state_store), actions, state_store
+        self.clock = _ManualClock()
+        coordinator = BattleRecoveryCoordinator(
+            actions,
+            state_store,
+            sleep=self.clock.sleep,
+            monotonic=self.clock,
+        )
+        return coordinator, actions, state_store
 
     async def test_auto_reload_rebases_only_after_stable_parseable_active_state(
         self,
@@ -814,7 +867,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _recovery_evidence(),
             expected_realm="persistent",
             auto_reload_checks=2,
-            recovery_checks=2,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
@@ -823,7 +876,11 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(recovered)
         actions.reload_current_page.assert_not_awaited()
         actions.clear_page_action_state.assert_awaited_once_with(probe_timeout=1)
-        state_store.inspect.assert_awaited_once_with()
+        state_store.inspect.assert_awaited_once()
+        self.assertLessEqual(
+            state_store.inspect.await_args.kwargs["timeout"],
+            10,
+        )
         state_store.reset.assert_called_once_with()
 
     async def test_missing_auto_reload_reloads_current_page_once_then_rebases(
@@ -848,7 +905,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _recovery_evidence(),
             expected_realm="persistent",
             auto_reload_checks=2,
-            recovery_checks=2,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
@@ -870,17 +927,19 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _stalled_xhr_evidence(),
             expected_realm="persistent",
             auto_reload_checks=4,
-            recovery_checks=2,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
         )
 
         self.assertTrue(recovered)
+        self.assertLess(self.clock.now, 10)
+        self.assertAlmostEqual(self.clock.now, 1e-9)
         self.assertEqual(actions.read_recovery_state.await_count, 4)
         actions.reload_current_page.assert_awaited_once_with(probe_timeout=1)
         actions.clear_page_action_state.assert_awaited_once_with(probe_timeout=1)
-        state_store.inspect.assert_awaited_once_with()
+        state_store.inspect.assert_awaited_once()
         state_store.reset.assert_called_once_with()
 
     async def test_stalled_xhr_skips_reload_when_race_probe_sees_new_document(
@@ -893,7 +952,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         recovered = await coordinator.recover(
             _stalled_xhr_evidence(),
             expected_realm="persistent",
-            recovery_checks=2,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
@@ -902,7 +961,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(recovered)
         actions.reload_current_page.assert_not_awaited()
         actions.clear_page_action_state.assert_awaited_once_with(probe_timeout=1)
-        state_store.inspect.assert_awaited_once_with()
+        state_store.inspect.assert_awaited_once()
         state_store.reset.assert_called_once_with()
 
     async def test_cross_probe_race_after_manual_reload_can_stabilize(self) -> None:
@@ -926,7 +985,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _recovery_evidence(),
             expected_realm="persistent",
             auto_reload_checks=2,
-            recovery_checks=3,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
@@ -934,6 +993,182 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(recovered)
         actions.reload_current_page.assert_awaited_once_with(probe_timeout=1)
+
+    async def test_reloaded_shell_can_become_stable_just_before_deadline(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        old = _recovery_state(document_id="document-before")
+        shell = _recovery_state(
+            phase=None,
+            log_revision=None,
+            action_controls=0,
+        )
+        fresh = _recovery_state()
+        first_probe = True
+
+        async def delayed_full_dom(*, probe_timeout: float) -> BattleRecoveryState:
+            nonlocal first_probe
+            self.assertLessEqual(probe_timeout, 2)
+            if first_probe:
+                first_probe = False
+                return old
+            return shell if self.clock.now < 9.5 else fresh
+
+        actions.read_recovery_state.side_effect = delayed_full_dom
+
+        recovered = await coordinator.recover(
+            _stalled_xhr_evidence(),
+            expected_realm="persistent",
+            recovery_timeout=10,
+            stable_checks=2,
+            check_interval=0.25,
+            probe_timeout=2,
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(self.clock.now, 9.75)
+        actions.reload_current_page.assert_awaited_once_with(probe_timeout=2)
+        state_store.inspect.assert_awaited_once()
+        self.assertEqual(
+            state_store.inspect.await_args.kwargs["timeout"],
+            0.25,
+        )
+
+    async def test_reloaded_shell_fails_closed_at_ten_second_deadline(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        old = _recovery_state(document_id="document-before")
+        shell = _recovery_state(
+            phase=None,
+            log_revision=None,
+            action_controls=0,
+        )
+        first_probe = True
+
+        async def never_full_dom(*, probe_timeout: float) -> BattleRecoveryState:
+            nonlocal first_probe
+            self.assertGreater(probe_timeout, 0)
+            self.assertLessEqual(probe_timeout, 2)
+            if first_probe:
+                first_probe = False
+                return old
+            return shell
+
+        actions.read_recovery_state.side_effect = never_full_dom
+
+        recovered = await coordinator.recover(
+            _stalled_xhr_evidence(),
+            expected_realm="persistent",
+            recovery_timeout=10,
+            stable_checks=2,
+            check_interval=0.25,
+            probe_timeout=2,
+        )
+
+        self.assertFalse(recovered)
+        self.assertEqual(self.clock.now, 10)
+        actions.reload_current_page.assert_awaited_once_with(probe_timeout=2)
+        actions.clear_page_action_state.assert_not_awaited()
+        state_store.inspect.assert_not_awaited()
+
+    async def test_probe_returning_after_deadline_is_not_accepted(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        old = _recovery_state(document_id="document-before")
+        fresh = _recovery_state()
+        first_probe = True
+
+        async def slow_probe(*, probe_timeout: float) -> BattleRecoveryState:
+            nonlocal first_probe
+            if first_probe:
+                first_probe = False
+                return old
+            self.assertEqual(probe_timeout, 1)
+            self.clock.now += 1.1
+            return fresh
+
+        actions.read_recovery_state.side_effect = slow_probe
+
+        recovered = await coordinator.recover(
+            _stalled_xhr_evidence(),
+            expected_realm="persistent",
+            recovery_timeout=1,
+            stable_checks=2,
+            check_interval=0.25,
+            probe_timeout=2,
+        )
+
+        self.assertFalse(recovered)
+        actions.clear_page_action_state.assert_not_awaited()
+        state_store.inspect.assert_not_awaited()
+
+    async def test_active_parse_finishing_after_deadline_is_not_accepted(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        old = _recovery_state(document_id="document-before")
+        fresh = _recovery_state()
+        first_probe = True
+
+        async def ready_near_deadline(*, probe_timeout: float) -> BattleRecoveryState:
+            nonlocal first_probe
+            self.assertGreater(probe_timeout, 0)
+            if first_probe:
+                first_probe = False
+                return old
+            return fresh
+
+        async def slow_parse(*, timeout: float) -> SimpleNamespace:
+            self.assertEqual(timeout, 0.25)
+            self.clock.now += 0.3
+            return SimpleNamespace(monsters={1: SimpleNamespace(alive=True)})
+
+        actions.read_recovery_state.side_effect = ready_near_deadline
+        state_store.inspect.side_effect = slow_parse
+        self.clock.now = 9.5
+
+        recovered = await coordinator.recover(
+            _stalled_xhr_evidence(),
+            expected_realm="persistent",
+            recovery_timeout=0.5,
+            stable_checks=2,
+            check_interval=0.25,
+            probe_timeout=2,
+        )
+
+        self.assertFalse(recovered)
+        self.assertEqual(self.clock.now, 10.05)
+        actions.clear_page_action_state.assert_not_awaited()
+        state_store.inspect.assert_awaited_once_with(timeout=0.25)
+
+    async def test_changing_signatures_never_satisfy_stability_guard(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        old = _recovery_state(document_id="document-before")
+        first = _recovery_state(log_revision="first")
+        second = _recovery_state(log_revision="second")
+        first_probe = True
+        use_first_signature = True
+
+        async def changing_dom(*, probe_timeout: float) -> BattleRecoveryState:
+            nonlocal first_probe, use_first_signature
+            self.assertGreater(probe_timeout, 0)
+            if first_probe:
+                first_probe = False
+                return old
+            state = first if use_first_signature else second
+            use_first_signature = not use_first_signature
+            return state
+
+        actions.read_recovery_state.side_effect = changing_dom
+
+        recovered = await coordinator.recover(
+            _stalled_xhr_evidence(),
+            expected_realm="persistent",
+            recovery_timeout=1,
+            stable_checks=2,
+            check_interval=0.25,
+            probe_timeout=2,
+        )
+
+        self.assertFalse(recovered)
+        self.assertEqual(self.clock.now, 1)
+        actions.clear_page_action_state.assert_not_awaited()
+        state_store.inspect.assert_not_awaited()
 
     async def test_indeterminate_auto_reload_probe_never_triggers_manual_reload(
         self,
@@ -945,7 +1180,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _recovery_evidence(),
             expected_realm="persistent",
             auto_reload_checks=2,
-            recovery_checks=2,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
@@ -972,7 +1207,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _recovery_evidence(),
             expected_realm="persistent",
             auto_reload_checks=1,
-            recovery_checks=2,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
@@ -995,7 +1230,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _recovery_evidence(),
             expected_realm="persistent",
             auto_reload_checks=1,
-            recovery_checks=2,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
@@ -1025,9 +1260,9 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _recovery_evidence(),
             expected_realm="persistent",
             auto_reload_checks=1,
-            recovery_checks=2,
+            recovery_timeout=0.5,
             stable_checks=2,
-            check_interval=1e-9,
+            check_interval=0.25,
             probe_timeout=1,
         )
 
@@ -1077,7 +1312,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _recovery_evidence(),
             expected_realm="persistent",
             auto_reload_checks=1,
-            recovery_checks=2,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
@@ -1096,14 +1331,14 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _recovery_evidence(),
             expected_realm="persistent",
             auto_reload_checks=1,
-            recovery_checks=2,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
         )
 
         self.assertFalse(recovered)
-        state_store.inspect.assert_awaited_once_with()
+        state_store.inspect.assert_awaited_once()
         state_store.reset.assert_not_called()
 
     async def test_active_parse_timeout_is_not_stacked(self) -> None:
@@ -1116,7 +1351,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             _recovery_evidence(),
             expected_realm="persistent",
             auto_reload_checks=1,
-            recovery_checks=4,
+            recovery_timeout=10,
             stable_checks=2,
             check_interval=1e-9,
             probe_timeout=1,
@@ -1152,6 +1387,7 @@ class BattleSessionRecoveryCompositionTests(unittest.IsolatedAsyncioTestCase):
         call = session.battle_recovery.recover.call_args
         self.assertEqual(call.args, (_recovery_evidence(),))
         self.assertEqual(call.kwargs["expected_realm"], "persistent")
+        self.assertEqual(call.kwargs["recovery_timeout"], 10)
         session.action_dialog_tracker.clear.assert_called_once_with()
         self.assertEqual(session.turn, 8)
         self.assertEqual(session.round, -1)

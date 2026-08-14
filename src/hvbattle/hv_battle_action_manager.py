@@ -1002,12 +1002,16 @@ class ElementActionManager:
         self, *, probe_timeout: float = 3.0
     ) -> BattleRecoveryState | None:
         """Read a reload state twice and reject cross-document DOM races."""
+        deadline = asyncio.get_running_loop().time() + probe_timeout
         state_id = uuid4().hex
         action = await self._read_action_state(
             state_id,
             probe_timeout=probe_timeout,
         )
-        exit_state = await self._read_battle_exit_state(probe_timeout=probe_timeout)
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise ZendriverOperationTimeout
+        exit_state = await self._read_battle_exit_state(probe_timeout=remaining)
         return _reconcile_recovery_state(action, exit_state)
 
     async def reload_current_page(self, *, probe_timeout: float = 3.0) -> None:

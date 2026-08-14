@@ -88,7 +88,10 @@ requires log/action-control markers plus a successful parse with a live
 monster. Accepted recovery performs at most one manual reload, clears
 page/action and session caches, drops the cached submitted action, resets parser
 state unless the accepted phase is complete, and leads only to fresh turn
-preparation. The model has no transition from recovery to cached-action replay.
+preparation. Runtime reconciliation polls for at most ten seconds after the
+reload and ends that wait as soon as the stable-state guards hold; this wall-clock
+liveness bound is outside the transition model. The model has no transition
+from recovery to cached-action replay.
 
 Another unknown before a confirmed `ACTED` or next-floor receipt produces typed
 recovery exhaustion; either confirmed receipt restores the current browser's

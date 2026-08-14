@@ -53,8 +53,10 @@ closed.
 
 For the stalled-XHR class, the coordinator reads the document once more to
 avoid racing an automatic navigation, then reloads the current page at most
-once if that document is still unchanged. Recovery never replays the cached
-action. It accepts only a new, ready document on the expected
+once if that document is still unchanged. After that reload it polls for at
+most ten seconds, ending the polling window immediately once the required
+stable state is present rather than sleeping for the full duration. Recovery never replays the
+cached action. It accepts only a new, ready document on the expected
 persistent/Isekai realm after at least two stable state signatures. Complete
 and next-floor controls take priority over PonyChart; an active phase
 additionally needs its log/action-control markers and must parse with a live

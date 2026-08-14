@@ -76,7 +76,7 @@ class _RecoveryActions(Protocol):
 
 
 class _RecoveryStateStore(Protocol):
-    async def inspect(self) -> Any: ...
+    async def inspect(self, *, timeout: float) -> Any: ...
 
     def reset(self) -> None: ...
 
@@ -114,10 +114,17 @@ class BattleRecoveryCoordinator:
         state_store: _RecoveryStateStore,
         *,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self._actions = actions
         self._state_store = state_store
         self._sleep = sleep
+        self._monotonic = monotonic
+
+    def _time(self) -> float:
+        if self._monotonic is not None:
+            return self._monotonic()
+        return asyncio.get_running_loop().time()
 
     @staticmethod
     def _eligible_state(
@@ -189,28 +196,34 @@ class BattleRecoveryCoordinator:
         expected_realm: str,
         *,
         initial_state: BattleRecoveryState | None,
-        checks: int,
+        timeout: float,
         stable_checks: int,
         check_interval: float,
         probe_timeout: float,
     ) -> BattleRecoveryState | None:
+        deadline = self._time() + timeout
         last_signature: tuple[object, ...] | None = None
         matching_reads = 0
         state = initial_state
-        for check in range(checks):
+        while True:
+            remaining = deadline - self._time()
+            if remaining <= 0:
+                return None
             if state is None:
-                probe = await self._read_probe(probe_timeout=probe_timeout)
+                probe = await self._read_probe(
+                    probe_timeout=min(probe_timeout, remaining)
+                )
                 if probe.kind is _RecoveryProbeKind.ERROR:
                     return None
                 if probe.kind is _RecoveryProbeKind.RECONCILIATION_MISMATCH:
                     last_signature = None
                     matching_reads = 0
-                    if check + 1 < checks:
-                        await self._sleep(check_interval)
-                    continue
-                state = probe.state
-                if state is None:
-                    raise RuntimeError("state probe kind requires a recovery state")
+                else:
+                    state = probe.state
+                    if state is None:
+                        raise RuntimeError("state probe kind requires a recovery state")
+                if self._time() >= deadline:
+                    return None
             if state is not None and self._eligible_state(
                 state,
                 pre_click_document_id=pre_click_document_id,
@@ -225,8 +238,11 @@ class BattleRecoveryCoordinator:
                 if matching_reads >= stable_checks:
                     if state.phase is not BattleTurnPhase.ACTIVE:
                         return state
+                    remaining = deadline - self._time()
+                    if remaining <= 0:
+                        return None
                     try:
-                        snapshot = await self._state_store.inspect()
+                        snapshot = await self._state_store.inspect(timeout=remaining)
                     except TimeoutError:
                         logger.error(
                             "Reloaded active battle parse timed out; refusing "
@@ -240,15 +256,18 @@ class BattleRecoveryCoordinator:
                             type(error).__name__,
                         )
                     else:
+                        if self._time() >= deadline:
+                            return None
                         if any(monster.alive for monster in snapshot.monsters.values()):
                             return state
             else:
                 last_signature = None
                 matching_reads = 0
             state = None
-            if check + 1 < checks:
-                await self._sleep(check_interval)
-        return None
+            remaining = deadline - self._time()
+            if remaining <= 0:
+                return None
+            await self._sleep(min(check_interval, remaining))
 
     async def recover(
         self,
@@ -256,7 +275,7 @@ class BattleRecoveryCoordinator:
         *,
         expected_realm: str,
         auto_reload_checks: int = 4,
-        recovery_checks: int = 12,
+        recovery_timeout: float = 10.0,
         stable_checks: int = 2,
         check_interval: float = 0.25,
         probe_timeout: float = 2.0,
@@ -264,11 +283,11 @@ class BattleRecoveryCoordinator:
         """Accept only a verified new state; never replay the submitted action."""
         if expected_realm not in {"persistent", "isekai"}:
             raise ValueError("expected_realm must be persistent or isekai")
-        if auto_reload_checks < 1 or recovery_checks < 1:
-            raise ValueError("battle recovery check counts must be positive")
+        if auto_reload_checks < 1:
+            raise ValueError("auto_reload_checks must be positive")
         if stable_checks < 2:
             raise ValueError("stable_checks must be at least 2")
-        if check_interval <= 0 or probe_timeout <= 0:
+        if recovery_timeout <= 0 or check_interval <= 0 or probe_timeout <= 0:
             raise ValueError("battle recovery timeouts must be positive")
         if not evidence.allows_same_browser_recovery:
             return False
@@ -315,7 +334,7 @@ class BattleRecoveryCoordinator:
             pre_click_document_id,
             expected_realm,
             initial_state=initial_state,
-            checks=recovery_checks,
+            timeout=recovery_timeout,
             stable_checks=stable_checks,
             check_interval=check_interval,
             probe_timeout=probe_timeout,

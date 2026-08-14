@@ -245,6 +245,11 @@ def _set_paused(pause_flag: Any, pause_button: Any, paused: bool) -> None:
         pause_button.config(text="Pause")
 
 
+def _render_pause_button(pause_flag: Any, pause_button: Any) -> None:
+    """Render the authoritative shared pause state without changing it."""
+    pause_button.config(text="Resume" if pause_flag.is_set() else "Pause")
+
+
 def _invoke_callback(callback: Callable[[], None], _event: Any) -> None:
     callback()
 
@@ -697,7 +702,7 @@ def _run_gui(
                 case "set_title":
                     root.title(arguments)
                 case "pause":
-                    _set_paused(pause_flag, pause_button, True)
+                    _render_pause_button(pause_flag, pause_button)
                 case "destroy":
                     root.destroy()
                     return

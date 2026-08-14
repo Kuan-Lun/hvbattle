@@ -17,6 +17,7 @@ from hvbattle.control_panel import (
     _parse_integer,
     _publish_boolean,
     _publish_checklist_selection,
+    _render_pause_button,
     _run_gui_callback_fail_closed,
     _set_paused,
 )
@@ -601,6 +602,24 @@ class GuiCallbackTests(unittest.TestCase):
         pause_flag.clear.assert_called_once_with()
         self.assertEqual(pause_button.config.call_args.args, ())
         self.assertEqual(pause_button.config.call_args.kwargs, {"text": "Pause"})
+
+    def test_queued_pause_render_does_not_reapply_stale_state(self) -> None:
+        pause_flag = threading.Event()
+        pause_button = Mock()
+
+        pause_flag.set()
+        pause_flag.clear()
+        _render_pause_button(pause_flag, pause_button)
+
+        self.assertFalse(pause_flag.is_set())
+        pause_button.config.assert_called_once_with(text="Pause")
+
+        pause_button.reset_mock()
+        pause_flag.set()
+        _render_pause_button(pause_flag, pause_button)
+
+        self.assertTrue(pause_flag.is_set())
+        pause_button.config.assert_called_once_with(text="Resume")
 
     def test_return_binding_invokes_the_same_apply_callback(self) -> None:
         apply = Mock()

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import shutil
 import subprocess
@@ -8,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from hvbattle import (
     BattleActionKind,
     BattleActionOutcomeUnknownError,
+    BattleActionRecoveryEvidence,
     BattleInterruptedError,
 )
 from hvbattle._zendriver import ZendriverOperationTimeout
@@ -289,6 +291,7 @@ def _monitor(
     *,
     sent: bool = True,
     sent_count: int = 1,
+    request_age_ms: float | None = None,
     completed: bool = True,
     status: int | None = 200,
     outcome: str | None = "load",
@@ -303,6 +306,7 @@ def _monitor(
     return _ActionMonitorState(
         sent=sent,
         sent_count=sent_count,
+        request_age_ms=(5_000.0 if sent and request_age_ms is None else request_age_ms),
         completed=completed,
         status=status,
         outcome=outcome,
@@ -480,6 +484,7 @@ class BattleActionJavaScriptHookTests(unittest.TestCase):
         monitor = result["afterBattleMonitor"]
         self.assertTrue(monitor["sent"])
         self.assertEqual(monitor["sentCount"], 2)
+        self.assertGreaterEqual(monitor["requestAgeMs"], 0)
         self.assertTrue(monitor["completed"])
         self.assertEqual(monitor["status"], 200)
         self.assertEqual(monitor["outcome"], "load")
@@ -586,6 +591,34 @@ console.log(JSON.stringify({
 
 
 class BattleActionEvidenceTests(unittest.TestCase):
+    def test_stalled_evidence_uses_actual_xhr_age_not_click_elapsed_time(
+        self,
+    ) -> None:
+        def evidence_for_age(age_ms: float) -> BattleActionRecoveryEvidence:
+            return _action_recovery_evidence(
+                action_id="action-1",
+                action_kind=BattleActionKind.TURN,
+                selector="#ikey_2",
+                click_started=True,
+                pre_click_document_id="document-before",
+                post_click_document_id="document-before",
+                dialog_category=None,
+                monitor=_monitor(
+                    completed=False,
+                    status=None,
+                    outcome=None,
+                    request_age_ms=age_ms,
+                ),
+            )
+
+        recently_sent = evidence_for_age(100.0)
+        stalled = evidence_for_age(5_000.0)
+
+        self.assertFalse(recently_sent.xhr_pending_at_least_five_seconds)
+        self.assertFalse(recently_sent.matches_stalled_single_xhr)
+        self.assertTrue(stalled.xhr_pending_at_least_five_seconds)
+        self.assertTrue(stalled.matches_stalled_single_xhr)
+
     def test_normal_xhr_and_log_revision_confirm_action(self) -> None:
         before = _state(monitor=_pending_monitor())
         current = _state(
@@ -905,6 +938,7 @@ class BattleActionEvidenceTests(unittest.TestCase):
         valid_monitor = {
             "sent": True,
             "sentCount": 1,
+            "requestAgeMs": 5_000.0,
             "completed": False,
             "status": None,
             "outcome": None,
@@ -922,6 +956,7 @@ class BattleActionEvidenceTests(unittest.TestCase):
         malformed = {
             "sent": 1,
             "sentCount": True,
+            "requestAgeMs": True,
             "completed": 0,
             "status": True,
             "outcome": 7,
@@ -933,6 +968,16 @@ class BattleActionEvidenceTests(unittest.TestCase):
             with self.subTest(field=field):
                 candidate = dict(raw)
                 candidate["monitor"] = dict(valid_monitor, **{field: invalid})
+                with self.assertRaises(RuntimeError):
+                    _BattleActionState.from_raw(candidate)
+
+        for invalid_age in (-1, float("nan"), float("inf")):
+            with self.subTest(request_age_ms=invalid_age):
+                candidate = dict(raw)
+                candidate["monitor"] = dict(
+                    valid_monitor,
+                    requestAgeMs=invalid_age,
+                )
                 with self.assertRaises(RuntimeError):
                     _BattleActionState.from_raw(candidate)
 
@@ -992,6 +1037,7 @@ class BattleActionEvidenceTests(unittest.TestCase):
         malformed = _ActionMonitorState(
             sent=1,  # type: ignore[arg-type]
             sent_count=1,
+            request_age_ms=5_000.0,
             completed=True,
             status=200,
             outcome="load",
@@ -1010,6 +1056,7 @@ class BattleActionEvidenceTests(unittest.TestCase):
         malformed = _ActionMonitorState(
             sent=1,  # type: ignore[arg-type]
             sent_count=1,
+            request_age_ms=5_000.0,
             completed=0,  # type: ignore[arg-type]
             status=None,
             outcome=None,
@@ -1037,6 +1084,13 @@ class BattleActionEvidenceTests(unittest.TestCase):
 
 
 class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
+    def test_turn_action_receipt_deadline_defaults_to_five_seconds(self) -> None:
+        timeout = inspect.signature(
+            ElementActionManager.click_and_wait_log_locator
+        ).parameters["timeout"]
+
+        self.assertEqual(timeout.default, 5.0)
+
     async def test_selector_is_resolved_before_monitor_arm_and_single_click(
         self,
     ) -> None:
@@ -1069,6 +1123,50 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         await manager.click_and_wait_log_locator("#mkey_1", timeout=1)
 
         self.assertEqual(events[:3], ["select", "arm", "click"])
+        manager._click.assert_awaited_once()
+
+    async def test_request_age_rebinds_the_post_click_receipt_deadline(self) -> None:
+        manager = _manager()
+        before = _state(monitor=_pending_monitor())
+        aged_pending = _state(
+            monitor=_monitor(
+                completed=False,
+                status=None,
+                outcome=None,
+                request_age_ms=150.0,
+            )
+        )
+        confirmed = _state(monitor=_monitor(request_age_ms=200.0))
+        post_click_probe_timeouts: list[float] = []
+
+        async def slow_click(_element: object) -> None:
+            await asyncio.sleep(0.05)
+
+        async def read(
+            _monitor_id: str,
+            *,
+            arm_monitor: bool = False,
+            probe_timeout: float = 3,
+        ) -> _BattleActionState:
+            if arm_monitor:
+                return before
+            post_click_probe_timeouts.append(probe_timeout)
+            if len(post_click_probe_timeouts) == 1:
+                return aged_pending
+            return confirmed
+
+        manager._click = AsyncMock(side_effect=slow_click)
+        manager._read_action_state = AsyncMock(side_effect=read)
+
+        await manager.click_and_wait_log_locator(
+            "#mkey_1",
+            timeout=0.2,
+            check_interval=1e-9,
+        )
+
+        self.assertEqual(len(post_click_probe_timeouts), 2)
+        self.assertGreater(post_click_probe_timeouts[0], 0.12)
+        self.assertLess(post_click_probe_timeouts[1], 0.1)
         manager._click.assert_awaited_once()
 
     async def test_monitor_arm_timeout_does_not_stack_cleanup_or_click(self) -> None:

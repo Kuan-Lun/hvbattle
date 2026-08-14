@@ -37,10 +37,12 @@ def _monitor(
     completed: bool = True,
     status: int | None = 0,
     outcome: str | None = "error",
+    request_age_ms: float | None = None,
 ) -> _ActionMonitorState:
     return _ActionMonitorState(
         sent=sent,
         sent_count=1 if sent else 0,
+        request_age_ms=(5_000.0 if sent and request_age_ms is None else request_age_ms),
         completed=completed,
         status=status,
         outcome=outcome,
@@ -105,18 +107,41 @@ def _recoverable_error() -> BattleActionOutcomeUnknownError:
     )
 
 
+def _stalled_recoverable_error() -> BattleActionOutcomeUnknownError:
+    return BattleActionOutcomeUnknownError(
+        "single XHR remained pending",
+        recovery_evidence=_stalled_xhr_evidence(),
+    )
+
+
 def _recovery_evidence(**changes: object) -> BattleActionRecoveryEvidence:
     evidence = BattleActionRecoveryEvidence(
         action_id="action-1",
         action_kind=BattleActionKind.TURN,
         selector="#mkey_3",
         click_started=True,
+        xhr_pending_at_least_five_seconds=False,
         pre_click_document_id="document-before",
         post_click_document_id="document-after",
         dialog_action_id="action-1",
         dialog_category="server-communication-failed",
         xhr_sent=False,
         xhr_sent_count=0,
+        xhr_completed=False,
+        xhr_status=None,
+        xhr_outcome=None,
+    )
+    return replace(evidence, **changes)
+
+
+def _stalled_xhr_evidence(**changes: object) -> BattleActionRecoveryEvidence:
+    evidence = _recovery_evidence(
+        xhr_pending_at_least_five_seconds=True,
+        post_click_document_id="document-before",
+        dialog_action_id=None,
+        dialog_category=None,
+        xhr_sent=True,
+        xhr_sent_count=1,
         xhr_completed=False,
         xhr_status=None,
         xhr_outcome=None,
@@ -266,6 +291,45 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
             ).matches_server_communication_failure
         )
 
+    def test_stalled_single_xhr_requires_exact_expired_same_document_shape(
+        self,
+    ) -> None:
+        stalled = _stalled_xhr_evidence()
+
+        self.assertTrue(stalled.matches_stalled_single_xhr)
+        self.assertFalse(stalled.matches_server_communication_failure)
+        self.assertTrue(stalled.allows_same_browser_recovery)
+
+        rejected = (
+            {"action_kind": BattleActionKind.NEXT_FLOOR},
+            {"action_kind": "turn"},
+            {"action_id": ""},
+            {"selector": ""},
+            {"click_started": 1},
+            {"xhr_pending_at_least_five_seconds": False},
+            {"xhr_pending_at_least_five_seconds": 1},
+            {"pre_click_document_id": "unknown"},
+            {"post_click_document_id": "unknown"},
+            {"post_click_document_id": "document-after"},
+            {"dialog_action_id": "action-1"},
+            {"dialog_category": "server-communication-failed"},
+            {"xhr_sent": False, "xhr_sent_count": 0},
+            {"xhr_sent": False, "xhr_sent_count": 1},
+            {"xhr_sent_count": 0},
+            {"xhr_sent": 1},
+            {"xhr_sent_count": True},
+            {"xhr_sent_count": 2},
+            {"xhr_completed": True},
+            {"xhr_completed": 0},
+            {"xhr_status": 0},
+            {"xhr_outcome": "error"},
+        )
+        for changes in rejected:
+            with self.subTest(changes=changes):
+                evidence = replace(stalled, **changes)
+                self.assertFalse(evidence.matches_stalled_single_xhr)
+                self.assertFalse(evidence.allows_same_browser_recovery)
+
     def test_dialog_tracker_binds_category_to_active_action_token(self) -> None:
         tracker = ActionDialogTracker()
         tracker.begin("action-1")
@@ -373,6 +437,97 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence.xhr_sent_count, 1)
         self.assertEqual(evidence.post_click_document_id, "document-after")
 
+    async def test_five_second_same_document_single_xhr_is_recoverable_without_dialog(
+        self,
+    ) -> None:
+        manager = object.__new__(ElementActionManager)
+        manager._action_lock = asyncio.Lock()
+        manager._select_for_single_click = AsyncMock(return_value=object())
+        manager._click = AsyncMock()
+        manager._cleanup_action_monitor = AsyncMock()
+        manager._begin_dialog_observation = Mock()
+        manager._get_dialog_category = Mock(return_value=None)
+        before = _action_state(
+            monitor=_monitor(
+                sent=False,
+                completed=False,
+                status=None,
+                outcome=None,
+            )
+        )
+        stalled = _action_state(
+            monitor=_monitor(
+                sent=True,
+                completed=False,
+                status=None,
+                outcome=None,
+            )
+        )
+        manager._read_action_state = AsyncMock(side_effect=[before, stalled])
+
+        with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
+            await manager.click_and_wait_log_locator(
+                "#ikey_2",
+                timeout=1e-9,
+                check_interval=1e-9,
+            )
+
+        evidence = raised.exception.recovery_evidence
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertTrue(evidence.xhr_pending_at_least_five_seconds)
+        self.assertTrue(evidence.matches_stalled_single_xhr)
+        self.assertTrue(evidence.allows_same_browser_recovery)
+        self.assertIsNone(evidence.dialog_category)
+        manager._click.assert_awaited_once_with(
+            manager._select_for_single_click.return_value
+        )
+        manager._cleanup_action_monitor.assert_not_awaited()
+
+    async def test_recently_sent_xhr_is_not_recoverable_from_click_deadline_alone(
+        self,
+    ) -> None:
+        manager = object.__new__(ElementActionManager)
+        manager._action_lock = asyncio.Lock()
+        manager._select_for_single_click = AsyncMock(return_value=object())
+        manager._click = AsyncMock()
+        manager._cleanup_action_monitor = AsyncMock()
+        manager._begin_dialog_observation = Mock()
+        manager._get_dialog_category = Mock(return_value=None)
+        before = _action_state(
+            monitor=_monitor(
+                sent=False,
+                completed=False,
+                status=None,
+                outcome=None,
+            )
+        )
+        recently_sent = _action_state(
+            monitor=_monitor(
+                sent=True,
+                completed=False,
+                status=None,
+                outcome=None,
+                request_age_ms=100.0,
+            )
+        )
+        manager._read_action_state = AsyncMock(side_effect=[before, recently_sent])
+
+        with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
+            await manager.click_and_wait_log_locator(
+                "#ikey_2",
+                timeout=1e-9,
+                check_interval=1e-9,
+            )
+
+        evidence = raised.exception.recovery_evidence
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertFalse(evidence.xhr_pending_at_least_five_seconds)
+        self.assertFalse(evidence.matches_stalled_single_xhr)
+        self.assertFalse(evidence.allows_same_browser_recovery)
+        manager._click.assert_awaited_once()
+
     async def test_turn_without_successful_post_click_probe_has_unknown_document(
         self,
     ) -> None:
@@ -472,6 +627,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(evidence.xhr_sent)
         self.assertEqual(evidence.xhr_sent_count, 1)
         self.assertFalse(evidence.xhr_completed)
+        self.assertFalse(evidence.xhr_pending_at_least_five_seconds)
         self.assertEqual(evidence.post_click_document_id, "document-after")
         manager._cleanup_action_monitor.assert_not_awaited()
 
@@ -702,6 +858,53 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         actions.reload_current_page.assert_awaited_once_with(probe_timeout=1)
         state_store.inspect.assert_not_awaited()
 
+    async def test_stalled_single_xhr_reloads_after_one_race_probe_and_rebases(
+        self,
+    ) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        old = _recovery_state(document_id="document-before")
+        fresh = _recovery_state()
+        actions.read_recovery_state.side_effect = [old, fresh, fresh, fresh]
+
+        recovered = await coordinator.recover(
+            _stalled_xhr_evidence(),
+            expected_realm="persistent",
+            auto_reload_checks=4,
+            recovery_checks=2,
+            stable_checks=2,
+            check_interval=1e-9,
+            probe_timeout=1,
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(actions.read_recovery_state.await_count, 4)
+        actions.reload_current_page.assert_awaited_once_with(probe_timeout=1)
+        actions.clear_page_action_state.assert_awaited_once_with(probe_timeout=1)
+        state_store.inspect.assert_awaited_once_with()
+        state_store.reset.assert_called_once_with()
+
+    async def test_stalled_xhr_skips_reload_when_race_probe_sees_new_document(
+        self,
+    ) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        fresh = _recovery_state()
+        actions.read_recovery_state.side_effect = [fresh, fresh, fresh]
+
+        recovered = await coordinator.recover(
+            _stalled_xhr_evidence(),
+            expected_realm="persistent",
+            recovery_checks=2,
+            stable_checks=2,
+            check_interval=1e-9,
+            probe_timeout=1,
+        )
+
+        self.assertTrue(recovered)
+        actions.reload_current_page.assert_not_awaited()
+        actions.clear_page_action_state.assert_awaited_once_with(probe_timeout=1)
+        state_store.inspect.assert_awaited_once_with()
+        state_store.reset.assert_called_once_with()
+
     async def test_cross_probe_race_after_manual_reload_can_stabilize(self) -> None:
         coordinator, actions, _state_store = self._coordinator()
         old = _recovery_state(document_id="document-before")
@@ -848,6 +1051,20 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         actions.reload_current_page.assert_not_awaited()
         state_store.reset.assert_not_called()
 
+    async def test_younger_pending_xhr_never_reaches_recovery_probes(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+
+        recovered = await coordinator.recover(
+            _stalled_xhr_evidence(xhr_pending_at_least_five_seconds=False),
+            expected_realm="persistent",
+        )
+
+        self.assertFalse(recovered)
+        actions.read_recovery_state.assert_not_awaited()
+        actions.reload_current_page.assert_not_awaited()
+        actions.clear_page_action_state.assert_not_awaited()
+        state_store.reset.assert_not_called()
+
     async def test_cleanup_document_change_rejects_previously_stable_state(
         self,
     ) -> None:
@@ -986,6 +1203,46 @@ class BattleRunnerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(strategy.take_turn.await_count, 2)
         session.recover_unknown_action.assert_awaited_once_with(
             error,
+            expected_is_isekai=False,
+        )
+
+    async def test_stalled_single_xhr_recovery_makes_a_fresh_decision(self) -> None:
+        session = _RunnerSession()
+        strategy = Mock()
+        error = _stalled_recoverable_error()
+        strategy.take_turn = AsyncMock(side_effect=[error, TurnDecision.STOP])
+
+        result = await BattleRunner(
+            session,  # type: ignore[arg-type]
+            strategy,
+            sleep=AsyncMock(),
+        ).run_current()
+
+        self.assertIsInstance(result, BattleStopped)
+        self.assertEqual(strategy.take_turn.await_count, 2)
+        session.recover_unknown_action.assert_awaited_once_with(
+            error,
+            expected_is_isekai=False,
+        )
+
+    async def test_second_stalled_xhr_before_receipt_exhausts_recovery(self) -> None:
+        session = _RunnerSession()
+        strategy = Mock()
+        first = _stalled_recoverable_error()
+        second = _stalled_recoverable_error()
+        strategy.take_turn = AsyncMock(side_effect=[first, second])
+
+        with self.assertRaises(BattleRecoveryExhaustedError) as raised:
+            await BattleRunner(
+                session,  # type: ignore[arg-type]
+                strategy,
+                sleep=AsyncMock(),
+            ).run_current()
+
+        self.assertIs(raised.exception.__cause__, second)
+        self.assertEqual(strategy.take_turn.await_count, 2)
+        session.recover_unknown_action.assert_awaited_once_with(
+            first,
             expected_is_isekai=False,
         )
 

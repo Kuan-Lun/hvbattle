@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import re
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from .contracts import (
 from .recovery import BattleRecoveryState
 
 logger = setup_logger(__name__)
+
+_STALLED_XHR_MINIMUM_AGE_MS = 5_000.0
 
 
 # HentaiVerse submits a turn through one JSON XHR, then mutates battle panes and
@@ -67,6 +70,8 @@ _ACTION_STATE_JS = r"""
             id: monitorId,
             sent: false,
             sentCount: 0,
+            sentAt: null,
+            completedAt: null,
             completed: false,
             status: null,
             outcome: null,
@@ -133,6 +138,7 @@ _ACTION_STATE_JS = r"""
                 monitor.sentCount += 1;
                 monitor.sent = true;
                 if (monitor.sentCount === 1) {
+                    monitor.sentAt = performance.now();
                     // Ignore any third-party log mutation that happened after
                     // arming but before this exact request was dispatched.
                     if (
@@ -152,6 +158,7 @@ _ACTION_STATE_JS = r"""
                     this.addEventListener(
                         "loadend",
                         () => {
+                            monitor.completedAt = performance.now();
                             monitor.completed = true;
                             monitor.status = this.status;
                             const flags = {
@@ -218,6 +225,14 @@ _ACTION_STATE_JS = r"""
         )
         : null;
     const response = matchingMonitor ? matchingMonitor.response : null;
+    const requestAgeMs = (
+        matchingMonitor
+        && matchingMonitor.sentAt !== null
+    ) ? Math.max(
+        0,
+        (matchingMonitor.completedAt ?? performance.now())
+            - matchingMonitor.sentAt,
+    ) : null;
     const completionPresent = Boolean(
         completion && completion.innerHTML.trim().length > 0
     );
@@ -251,6 +266,7 @@ _ACTION_STATE_JS = r"""
         monitor: matchingMonitor ? {
             sent: matchingMonitor.sent,
             sentCount: matchingMonitor.sentCount,
+            requestAgeMs,
             completed: matchingMonitor.completed,
             status: matchingMonitor.status,
             outcome: matchingMonitor.outcome,
@@ -340,6 +356,7 @@ _BATTLE_EXIT_STATE_JS = r"""
 class _ActionMonitorState:
     sent: bool
     sent_count: int
+    request_age_ms: float | None
     completed: bool
     status: int | None
     outcome: str | None
@@ -370,6 +387,24 @@ def _payload_count(raw: Mapping[object, object], key: str, *, context: str) -> i
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise RuntimeError(f"Invalid {context}: {key} must be a non-negative integer")
     return value
+
+
+def _payload_optional_nonnegative_number(
+    raw: Mapping[object, object], key: str, *, context: str
+) -> float | None:
+    value = _payload_value(raw, key, context=context)
+    if value is None:
+        return None
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise RuntimeError(
+            f"Invalid {context}: {key} must be a non-negative finite number or null"
+        )
+    return float(value)
 
 
 def _payload_optional_bool(
@@ -419,6 +454,9 @@ def _parse_action_monitor(raw: Mapping[object, object]) -> _ActionMonitorState:
     return _ActionMonitorState(
         sent=_payload_bool(raw, "sent", context=context),
         sent_count=_payload_count(raw, "sentCount", context=context),
+        request_age_ms=_payload_optional_nonnegative_number(
+            raw, "requestAgeMs", context=context
+        ),
         completed=_payload_bool(raw, "completed", context=context),
         status=status_raw,
         outcome=outcome_raw,
@@ -527,6 +565,7 @@ class _BattleActionState:
             xhr = (
                 f"sent={int(self.monitor.sent)},"
                 f"sent_count={self.monitor.sent_count},"
+                f"request_age_ms={self.monitor.request_age_ms},"
                 f"completed={int(self.monitor.completed)},"
                 f"status={self.monitor.status},outcome={self.monitor.outcome},"
                 f"parsed={self.monitor.response_parse_ok},"
@@ -714,6 +753,15 @@ def _action_recovery_evidence(
         action_kind=action_kind,
         selector=selector,
         click_started=click_started,
+        xhr_pending_at_least_five_seconds=bool(
+            action_kind is BattleActionKind.TURN
+            and monitor is not None
+            and monitor.completed is False
+            and isinstance(monitor.request_age_ms, (int, float))
+            and not isinstance(monitor.request_age_ms, bool)
+            and math.isfinite(monitor.request_age_ms)
+            and monitor.request_age_ms >= _STALLED_XHR_MINIMUM_AGE_MS
+        ),
         pre_click_document_id=pre_click_document_id,
         post_click_document_id=post_click_document_id,
         dialog_action_id=action_id if dialog_category is not None else None,
@@ -1063,7 +1111,7 @@ class ElementActionManager:
         self,
         selector: str,
         stale_retries: int = 3,
-        timeout: float = 15.0,
+        timeout: float = 5.0,
         check_interval: float = 0.2,
         probe_timeout: float = 3.0,
     ) -> None:
@@ -1102,6 +1150,7 @@ class ElementActionManager:
                 probe_error: Exception | None = None
                 post_click_probe_succeeded = False
                 probe_timed_out = False
+                request_deadline_bound = False
                 receipt_monitor: _ActionMonitorState | None = None
                 started = asyncio.get_running_loop().time()
                 self._begin_submitted_action(monitor_id)
@@ -1111,7 +1160,10 @@ class ElementActionManager:
                 except Exception as error:
                     click_error = error
 
-                deadline = started + timeout
+                # A slow CDP click must not consume the XHR's receipt window.
+                # Rebind this provisional post-click deadline to the browser's
+                # first observed XMLHttpRequest.send() timestamp below.
+                deadline = asyncio.get_running_loop().time() + timeout
                 while True:
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:
@@ -1135,6 +1187,20 @@ class ElementActionManager:
                         last = current
                         if current.monitor is not None:
                             receipt_monitor = current.monitor
+                            if (
+                                not request_deadline_bound
+                                and current.monitor.sent
+                                and current.monitor.request_age_ms is not None
+                            ):
+                                remaining_request_time = max(
+                                    0.0,
+                                    timeout - current.monitor.request_age_ms / 1_000.0,
+                                )
+                                deadline = (
+                                    asyncio.get_running_loop().time()
+                                    + remaining_request_time
+                                )
+                                request_deadline_bound = True
                         post_click_probe_succeeded = True
                         evidence = _confirmed_action_evidence(before, current)
                         if evidence is not None:

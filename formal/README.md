@@ -8,7 +8,8 @@ It covers:
 - next-round transition evidence and document readiness;
 - authoritative XHR/action receipts;
 - immutable action/dialog-token evidence for the exact communication-failure
-  recovery class;
+  recovery class and browser-observed request-age evidence for a stalled
+  single-XHR turn;
 - same-browser reconciliation requiring a new, ready, stable same-realm
   document and a fresh prepare/strategy decision rather than action replay;
 - a consecutive-recovery budget reset only by confirmed `ACTED` or next-floor
@@ -63,25 +64,31 @@ XHR fields from that same retained monitor; the formal API cannot pair a
 duplicate transition receipt with independently injected count-one recovery
 evidence.
 
-An ambiguous submitted turn or next-floor action is recoverable only if its
-immutable evidence has known pre/post document identities and binds the
-sanitized `server-communication-failed` dialog token to the same action token.
+An ambiguous submitted action has two modeled recovery incidents. The first
+requires known pre/post document identities and binds the sanitized
+`server-communication-failed` dialog token to the same turn or next-floor
+action token. Its terminal XHR observation must either be exactly one completed
+status-zero network-error request, or be incomplete with null status/outcome
+and exactly either zero unsent requests or one sent request. The second is a
+turn-only stalled request: browser-observed request age proves that its XHR has
+remained pending for at least five seconds, its known pre/post document is
+unchanged, no dialog was observed, and exactly one sent XHR remains incomplete
+with null status/outcome. This age guard prevents a slow click from making a
+recently sent request look stalled.
+
 The model makes the runtime's strict field types structural: action kind is a
 closed type, click/XHR flags are booleans, and send count is a natural number,
-so a boolean cannot be accepted as integer count `1`.
-The terminal XHR observation must either be exactly one completed status-zero
-network-error request, or be incomplete with null status/outcome and exactly
-either zero unsent requests or one sent request. The coordinator additionally
-requires an available recovery budget and a new document on the expected
-persistent/Isekai realm whose `interactive` or `complete` state has the same
-full signature across at least two reads and final verification. Phase
+so a boolean cannot be accepted as integer count `1`. The coordinator
+additionally requires an available recovery budget and a new document on the
+expected persistent/Isekai realm whose `interactive` or `complete` state has
+the same full signature across at least two reads and final verification. Phase
 classification follows runtime priority: complete, next floor, PonyChart, then
 active. PonyChart remains valid without the ordinary battle container; active
 requires log/action-control markers plus a successful parse with a live
-monster. Accepted recovery clears page/action and session caches, drops the
-cached submitted action, resets parser state unless the accepted phase is
-complete, and leads only to fresh turn preparation. The model has no transition
-from recovery to cached-action replay.
+monster. Accepted recovery performs at most one manual reload, clears
+page/action and session caches, drops the cached submitted action, resets parser
+state unless the accepted phase is complete, and leads only to fresh turn
+preparation. The model has no transition from recovery to cached-action replay.
 
 Another unknown before a confirmed `ACTED` or next-floor receipt produces typed
 recovery exhaustion; either confirmed receipt restores the current browser's

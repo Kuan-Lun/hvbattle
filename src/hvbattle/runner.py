@@ -153,8 +153,7 @@ class BattleRunner:
                     recovered = False
                     evidence = error.recovery_evidence
                     recovery_eligible = bool(
-                        evidence is not None
-                        and evidence.matches_server_communication_failure
+                        evidence is not None and evidence.allows_same_browser_recovery
                     )
                     if recovery_eligible and not recovery_pending_receipt:
                         recover = getattr(
@@ -180,9 +179,9 @@ class BattleRunner:
                         recovery_pending_receipt = True
                         retry_count = 0
                         logger.warning(
-                            "Battle action outcome was unknown after a known "
-                            "communication failure; continuing from reloaded "
-                            "server state"
+                            "Battle action outcome was unknown after a verified "
+                            "receipt-loss incident; continuing from reloaded server "
+                            "state"
                         )
                         continue
                     logger.error(

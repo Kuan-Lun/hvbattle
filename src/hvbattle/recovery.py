@@ -270,13 +270,17 @@ class BattleRecoveryCoordinator:
             raise ValueError("stable_checks must be at least 2")
         if check_interval <= 0 or probe_timeout <= 0:
             raise ValueError("battle recovery timeouts must be positive")
-        if not evidence.matches_server_communication_failure:
+        if not evidence.allows_same_browser_recovery:
             return False
 
         pre_click_document_id = evidence.pre_click_document_id
+        stalled_single_xhr = evidence.matches_stalled_single_xhr
         observation = await self._observe_document_change(
             pre_click_document_id,
-            checks=auto_reload_checks,
+            # The action manager already observed the unchanged document at the
+            # stalled-XHR deadline.  One fresh read prevents a navigation race
+            # without adding another polling grace period before the reload.
+            checks=1 if stalled_single_xhr else auto_reload_checks,
             check_interval=check_interval,
             probe_timeout=probe_timeout,
         )
@@ -290,8 +294,13 @@ class BattleRecoveryCoordinator:
         initial_state = observation.state
         if observation.kind is _DocumentObservationKind.CONFIRMED_UNCHANGED:
             logger.warning(
-                "Server communication failure left the old battle document "
-                "stable; reloading the current page once"
+                "Battle receipt-loss incident left the old document stable; "
+                "reloading the current page once incident=%s",
+                (
+                    "stalled-single-xhr"
+                    if stalled_single_xhr
+                    else "server-communication-failure"
+                ),
             )
             try:
                 await self._actions.reload_current_page(probe_timeout=probe_timeout)

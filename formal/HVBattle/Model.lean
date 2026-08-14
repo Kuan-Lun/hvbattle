@@ -444,7 +444,9 @@ def validExpectedRealm : BattleRealm → Bool
 
 The action manager freezes the evidence below before the exception leaves its
 exactly-once submission boundary. Tokens model the immutable association
-between the submitted action and the sanitized JavaScript-dialog observation.
+between the submitted action and any sanitized JavaScript-dialog observation.
+The request-age flag distinguishes an XHR that has actually remained pending
+for at least five seconds from a request sent only after a slow browser click.
 Known pre/post document identities are required even though the post-click
 document may still be the old one; the coordinator separately proves that the
 accepted server state belongs to a new document.
@@ -471,6 +473,7 @@ structure ActionRecoveryEvidence where
   actionKind : BattleActionKind
   selectorPresent : Bool
   clickStarted : Bool
+  xhrPendingAtLeastFiveSeconds : Bool
   preDocument : Option Nat
   postDocument : Option Nat
   dialogActionToken : Option Nat
@@ -484,10 +487,11 @@ structure ActionRecoveryEvidence where
 
 /-!
 The runtime freezes recovery evidence from the same retained matching monitor
-that gates next-floor transition acceptance. The caller supplies only the
-action/dialog/document envelope; every XHR field below is overwritten from
-that monitor (or with the exact no-monitor defaults), so a duplicate receipt
-cannot be hidden by injecting an unrelated count-one recovery record.
+that gates next-floor transition acceptance. The transition kind and every XHR
+field, including the five-second stalled-turn flag, are fixed below from that
+boundary rather than trusted from the caller. A duplicate transition receipt
+therefore cannot be hidden by injecting a turn-shaped count-one recovery
+record.
 -/
 def freezeTransitionRecoveryEvidence
     (envelope : ActionRecoveryEvidence)
@@ -495,6 +499,8 @@ def freezeTransitionRecoveryEvidence
   match retainedMonitor with
   | none =>
       { envelope with
+        actionKind := .nextFloor
+        xhrPendingAtLeastFiveSeconds := false
         xhrSent := false
         xhrSentCount := 0
         xhrCompleted := false
@@ -502,6 +508,8 @@ def freezeTransitionRecoveryEvidence
         xhrOutcome := none }
   | some monitor =>
       { envelope with
+        actionKind := .nextFloor
+        xhrPendingAtLeastFiveSeconds := false
         xhrSent := monitor.sent
         xhrSentCount := monitor.sentCount
         xhrCompleted := monitor.completed
@@ -519,6 +527,14 @@ theorem frozenTransitionEvidenceUsesExactRetainedReceipt
       frozen.xhrOutcome = monitor.outcome := by
   simp [freezeTransitionRecoveryEvidence]
 
+theorem frozenTransitionEvidenceForcesNextFloorEnvelope
+    (envelope : ActionRecoveryEvidence)
+    (monitor : Option ActionMonitor) :
+    let frozen := freezeTransitionRecoveryEvidence envelope monitor
+    frozen.actionKind = .nextFloor ∧
+      frozen.xhrPendingAtLeastFiveSeconds = false := by
+  cases monitor <;> simp [freezeTransitionRecoveryEvidence]
+
 def exactStatusZeroErrorReceipt (evidence : ActionRecoveryEvidence) : Bool :=
   evidence.xhrCompleted && evidence.xhrSent &&
     decide (evidence.xhrSentCount = 1) &&
@@ -532,10 +548,18 @@ def terminalReceiptUnavailable (evidence : ActionRecoveryEvidence) : Bool :=
     ((!evidence.xhrSent && decide (evidence.xhrSentCount = 0)) ||
       (evidence.xhrSent && decide (evidence.xhrSentCount = 1)))
 
-def actionDialogEvidenceBound (evidence : ActionRecoveryEvidence) : Bool :=
+def exactPendingSingleXhr (evidence : ActionRecoveryEvidence) : Bool :=
+  evidence.xhrSent && decide (evidence.xhrSentCount = 1) &&
+    !evidence.xhrCompleted && decide (evidence.xhrStatus = none) &&
+    decide (evidence.xhrOutcome = none)
+
+def actionEvidenceEnvelopePresent (evidence : ActionRecoveryEvidence) : Bool :=
   decide (0 < evidence.actionToken) && evidence.selectorPresent &&
     evidence.clickStarted && evidence.preDocument.isSome &&
-    evidence.postDocument.isSome &&
+    evidence.postDocument.isSome
+
+def actionDialogEvidenceBound (evidence : ActionRecoveryEvidence) : Bool :=
+  actionEvidenceEnvelopePresent evidence &&
     decide (evidence.dialogActionToken = some evidence.actionToken) &&
     decide (evidence.dialogCategory = some .serverCommunicationFailed)
 
@@ -545,6 +569,26 @@ def matchesServerCommunicationFailure
     (exactStatusZeroErrorReceipt evidence ||
       terminalReceiptUnavailable evidence)
 
+def matchesStalledSingleXhr (evidence : ActionRecoveryEvidence) : Bool :=
+  actionEvidenceEnvelopePresent evidence &&
+    decide (evidence.actionKind = .turn) &&
+    evidence.xhrPendingAtLeastFiveSeconds &&
+    decide (evidence.preDocument = evidence.postDocument) &&
+    decide (evidence.dialogActionToken = none) &&
+    decide (evidence.dialogCategory = none) && exactPendingSingleXhr evidence
+
+def matchesReloadRecoveryIncident (evidence : ActionRecoveryEvidence) : Bool :=
+  matchesServerCommunicationFailure evidence ||
+    matchesStalledSingleXhr evidence
+
+theorem frozenTransitionEvidenceCannotMatchStalledSingleXhr
+    (envelope : ActionRecoveryEvidence)
+    (monitor : Option ActionMonitor) :
+    matchesStalledSingleXhr
+        (freezeTransitionRecoveryEvidence envelope monitor) = false := by
+  cases monitor <;>
+    simp [freezeTransitionRecoveryEvidence, matchesStalledSingleXhr]
+
 /-!
 A post-click Zendriver operation timeout leaves the protocol command alive, so
 the runtime deliberately does not issue another document probe. At this model
@@ -553,9 +597,10 @@ boundary that fact is represented by an unobservable post-click document.
 theorem unobservablePostDocumentCannotMatchRecoveryIncident
     (evidence : ActionRecoveryEvidence)
     (unobservable : evidence.postDocument = none) :
-    matchesServerCommunicationFailure evidence = false := by
-  simp [matchesServerCommunicationFailure, actionDialogEvidenceBound,
-    unobservable]
+    matchesReloadRecoveryIncident evidence = false := by
+  simp [matchesReloadRecoveryIncident, matchesServerCommunicationFailure,
+    matchesStalledSingleXhr, actionDialogEvidenceBound,
+    actionEvidenceEnvelopePresent, unobservable]
 
 inductive RecoveryPhase where
   | active
@@ -698,7 +743,7 @@ def recoveryEligible
     (observed : RecoveryObservation)
     (budget : RecoveryBudget) : Bool :=
   validExpectedRealm expectedRealm &&
-    matchesServerCommunicationFailure evidence &&
+    matchesReloadRecoveryIncident evidence &&
     stableSameRealmNewDocument expectedRealm evidence observed &&
     recoveryBudgetAvailable budget
 
@@ -711,7 +756,7 @@ def classifyUnknownAction
     .interrupt
   else if !recoveryBudgetAvailable budget then
     .recoveryExhausted
-  else if !matchesServerCommunicationFailure evidence then
+  else if !matchesReloadRecoveryIncident evidence then
     .interrupt
   else if stableSameRealmNewDocument expectedRealm evidence observed then
     .recoverToPrepare
@@ -764,12 +809,12 @@ theorem recoveryRequiresEveryGuard
       resolveUnknownAction expectedRealm evidence observed budget =
         .recoverToPrepare) :
     validExpectedRealm expectedRealm = true ∧
-      matchesServerCommunicationFailure evidence = true ∧
+      matchesReloadRecoveryIncident evidence = true ∧
       stableSameRealmNewDocument expectedRealm evidence observed = true ∧
       recoveryBudgetAvailable budget = true := by
   cases validCase : validExpectedRealm expectedRealm <;>
     cases availableCase : recoveryBudgetAvailable budget <;>
-    cases incidentCase : matchesServerCommunicationFailure evidence <;>
+    cases incidentCase : matchesReloadRecoveryIncident evidence <;>
     cases stableCase :
       stableSameRealmNewDocument expectedRealm evidence observed <;>
     simp_all [resolveUnknownAction, decideUnknownAction, classifyUnknownAction]
@@ -784,7 +829,7 @@ theorem recoveryEligibleExactlyWhenResolutionReturnsToPrepare
         .recoverToPrepare := by
   cases validCase : validExpectedRealm expectedRealm <;>
     cases availableCase : recoveryBudgetAvailable budget <;>
-    cases incidentCase : matchesServerCommunicationFailure evidence <;>
+    cases incidentCase : matchesReloadRecoveryIncident evidence <;>
     cases stableCase :
       stableSameRealmNewDocument expectedRealm evidence observed <;>
     simp_all [recoveryEligible, resolveUnknownAction, decideUnknownAction,
@@ -796,7 +841,7 @@ theorem allRecoveryGuardsProduceFreshPrepare
     (observed : RecoveryObservation)
     (budget : RecoveryBudget)
     (validRealm : validExpectedRealm expectedRealm = true)
-    (incident : matchesServerCommunicationFailure evidence = true)
+    (incident : matchesReloadRecoveryIncident evidence = true)
     (stable :
       stableSameRealmNewDocument expectedRealm evidence observed = true)
     (available : recoveryBudgetAvailable budget = true) :
@@ -812,7 +857,7 @@ theorem unmatchedUnknownInterrupts
     (budget : RecoveryBudget)
     (validRealm : validExpectedRealm expectedRealm = true)
     (available : recoveryBudgetAvailable budget = true)
-    (unmatched : matchesServerCommunicationFailure evidence = false) :
+    (unmatched : matchesReloadRecoveryIncident evidence = false) :
     resolveUnknownAction expectedRealm evidence observed budget = .interrupt := by
   simp [resolveUnknownAction, decideUnknownAction, classifyUnknownAction,
     validRealm, available, unmatched]
@@ -837,7 +882,7 @@ theorem failedMatchedRecoveryIsTypedExhaustion
     (budget : RecoveryBudget)
     (validRealm : validExpectedRealm expectedRealm = true)
     (available : recoveryBudgetAvailable budget = true)
-    (incident : matchesServerCommunicationFailure evidence = true)
+    (incident : matchesReloadRecoveryIncident evidence = true)
     (unstable :
       stableSameRealmNewDocument expectedRealm evidence observed = false) :
     resolveUnknownAction expectedRealm evidence observed budget =
@@ -988,6 +1033,7 @@ def observedStatusZeroEvidence : ActionRecoveryEvidence where
   actionKind := .turn
   selectorPresent := true
   clickStarted := true
+  xhrPendingAtLeastFiveSeconds := false
   preDocument := some 133
   postDocument := some 134
   dialogActionToken := some 7
@@ -1011,6 +1057,16 @@ def observedUnboundUnknownEvidence : ActionRecoveryEvidence :=
     dialogActionToken := none
     dialogCategory := none }
 
+def observedStalledSingleXhrEvidence : ActionRecoveryEvidence :=
+  { observedUnboundUnknownEvidence with
+    xhrPendingAtLeastFiveSeconds := true
+    postDocument := some 133
+    xhrSent := true
+    xhrSentCount := 1
+    xhrCompleted := false
+    xhrStatus := none
+    xhrOutcome := none }
+
 def observedRecoveredProbe : RecoveryProbe where
   document := 134
   realm := .persistent
@@ -1033,29 +1089,79 @@ def availableRecoveryBudget : RecoveryBudget := ⟨false⟩
 def consumedRecoveryBudget : RecoveryBudget := ⟨true⟩
 
 theorem observedStatusZeroIncidentMatchesRecoveryBoundary :
-    matchesServerCommunicationFailure observedStatusZeroEvidence = true := by
+    matchesReloadRecoveryIncident observedStatusZeroEvidence = true := by
   native_decide
 
 theorem observedUnavailableReceiptMatchesRecoveryBoundary :
-    matchesServerCommunicationFailure observedReceiptUnavailableEvidence = true := by
+    matchesReloadRecoveryIncident observedReceiptUnavailableEvidence = true := by
   native_decide
 
 theorem duplicateIncompleteReceiptDoesNotMatchRecoveryBoundary :
-    matchesServerCommunicationFailure
+    matchesReloadRecoveryIncident
       { observedReceiptUnavailableEvidence with
         xhrSent := true
         xhrSentCount := 2 } = false := by
   native_decide
 
 theorem staleIncompleteReceiptMetadataDoesNotMatchRecoveryBoundary :
-    matchesServerCommunicationFailure
+    matchesReloadRecoveryIncident
       { observedReceiptUnavailableEvidence with
         xhrStatus := some 0
         xhrOutcome := some .networkError } = false := by
   native_decide
 
 theorem observedUnboundUnknownDoesNotMatchRecoveryBoundary :
-    matchesServerCommunicationFailure observedUnboundUnknownEvidence = false := by
+    matchesReloadRecoveryIncident observedUnboundUnknownEvidence = false := by
+  native_decide
+
+theorem observedStalledSingleXhrMatchesRecoveryBoundary :
+    matchesStalledSingleXhr observedStalledSingleXhrEvidence = true ∧
+      matchesReloadRecoveryIncident observedStalledSingleXhrEvidence = true := by
+  native_decide
+
+theorem stalledSingleXhrRejectsEveryWeakenedGuard :
+    matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with actionToken := 0 } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with selectorPresent := false } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with clickStarted := false } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with
+          xhrPendingAtLeastFiveSeconds := false } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with actionKind := .nextFloor } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with preDocument := none } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with postDocument := none } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with postDocument := some 134 } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with
+          dialogActionToken := some 7 } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with
+          xhrSent := false
+          xhrSentCount := 0 } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with
+          xhrSent := false
+          xhrSentCount := 1 } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with xhrSentCount := 0 } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with xhrSentCount := 2 } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with xhrCompleted := true } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with xhrStatus := some 0 } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with
+          xhrOutcome := some .networkError } = false ∧
+      matchesStalledSingleXhr
+        { observedStalledSingleXhrEvidence with
+          dialogCategory := some .other } = false := by
   native_decide
 
 theorem observedDuplicateRetainedMonitorCannotUseInjectedCountOneEnvelope :
@@ -1075,6 +1181,19 @@ theorem observedDuplicateRetainedMonitorWithConsumedBudgetIsTypedExhaustion :
 theorem observedStableIncidentRecoversToFreshPrepare :
     resolveUnknownAction .persistent observedStatusZeroEvidence
       observedStableRecovery availableRecoveryBudget = .recoverToPrepare := by
+  native_decide
+
+theorem observedStableStalledXhrRecoversToFreshPrepareWithoutReplay :
+    resolveUnknownAction .persistent observedStalledSingleXhrEvidence
+        observedStableRecovery availableRecoveryBudget = .recoverToPrepare ∧
+      recoveryNextStep
+          (resolveUnknownAction .persistent observedStalledSingleXhrEvidence
+            observedStableRecovery availableRecoveryBudget) =
+        .prepareAndRunStrategy ∧
+      recoveryNextStep
+          (resolveUnknownAction .persistent observedStalledSingleXhrEvidence
+            observedStableRecovery availableRecoveryBudget) ≠
+        .replayCachedAction := by
   native_decide
 
 theorem observedSecondUnboundUnknownAfterRecoveryIsTypedExhaustion :
@@ -1112,7 +1231,7 @@ theorem matchedIncidentBindsExactActionAndDialogTokens
       evidence.dialogCategory = some .serverCommunicationFailed := by
   have bound := (matchedIncidentRequiresBoundEvidenceAndTerminalShape
     evidence matched).1
-  simp [actionDialogEvidenceBound] at bound
+  simp [actionDialogEvidenceBound, actionEvidenceEnvelopePresent] at bound
   rcases bound with ⟨throughToken, exactCategory⟩
   rcases throughToken with ⟨throughPostDocument, exactToken⟩
   rcases throughPostDocument with ⟨throughPreDocument, _⟩
@@ -2058,7 +2177,7 @@ theorem unmatchedUnknownActionStopsApplicationWithoutRetry
     (budget : RecoveryBudget)
     (validRealm : validExpectedRealm expectedRealm = true)
     (available : recoveryBudgetAvailable budget = true)
-    (unmatched : matchesServerCommunicationFailure evidence = false)
+    (unmatched : matchesReloadRecoveryIncident evidence = false)
     (failureKind : LauncherFailureKind)
     (teeSucceeded : Bool)
     (attempt maxAttempts retriesUsed maxRetries : Nat) :
@@ -2113,7 +2232,7 @@ theorem failedMatchedCoordinatorRecoveryCanOpenOneFreshReconcile
     (budget : RecoveryBudget)
     (validRealm : validExpectedRealm expectedRealm = true)
     (available : recoveryBudgetAvailable budget = true)
-    (incident : matchesServerCommunicationFailure evidence = true)
+    (incident : matchesReloadRecoveryIncident evidence = true)
     (failed :
       stableSameRealmNewDocument expectedRealm evidence observed = false) :
     let result := decideUnknownApplication expectedRealm evidence observed budget

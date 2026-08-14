@@ -73,7 +73,7 @@ class BattleInterruptedError(RuntimeError):
 
 
 class BattleRecoveryExhaustedError(BattleInterruptedError):
-    """A verified communication failure exhausted same-browser recovery."""
+    """A verified receipt-loss incident exhausted same-browser recovery."""
 
 
 class BattleActionKind(StrEnum):
@@ -91,6 +91,7 @@ class BattleActionRecoveryEvidence:
     action_kind: BattleActionKind
     selector: str
     click_started: bool
+    xhr_pending_at_least_five_seconds: bool
     pre_click_document_id: str
     post_click_document_id: str
     dialog_action_id: str | None
@@ -102,9 +103,8 @@ class BattleActionRecoveryEvidence:
     xhr_outcome: str | None
 
     @property
-    def matches_server_communication_failure(self) -> bool:
-        """Whether a bound dialog explains the missing terminal action receipt."""
-        bound_action_failure = bool(
+    def _has_valid_action_envelope(self) -> bool:
+        return bool(
             isinstance(self.action_kind, BattleActionKind)
             and isinstance(self.action_id, str)
             and self.action_id
@@ -117,6 +117,13 @@ class BattleActionRecoveryEvidence:
             and isinstance(self.post_click_document_id, str)
             and self.post_click_document_id
             and self.post_click_document_id != "unknown"
+        )
+
+    @property
+    def matches_server_communication_failure(self) -> bool:
+        """Whether a bound dialog explains the missing terminal action receipt."""
+        bound_action_failure = bool(
+            self._has_valid_action_envelope
             and self.dialog_action_id == self.action_id
             and self.dialog_category == "server-communication-failed"
         )
@@ -142,6 +149,31 @@ class BattleActionRecoveryEvidence:
         )
         return bound_action_failure and (
             status_zero_receipt or terminal_receipt_unavailable
+        )
+
+    @property
+    def matches_stalled_single_xhr(self) -> bool:
+        """Whether one turn XHR remained pending for at least five seconds."""
+        return bool(
+            self._has_valid_action_envelope
+            and self.action_kind is BattleActionKind.TURN
+            and self.xhr_pending_at_least_five_seconds is True
+            and self.pre_click_document_id == self.post_click_document_id
+            and self.dialog_action_id is None
+            and self.dialog_category is None
+            and self.xhr_sent is True
+            and type(self.xhr_sent_count) is int
+            and self.xhr_sent_count == 1
+            and self.xhr_completed is False
+            and self.xhr_status is None
+            and self.xhr_outcome is None
+        )
+
+    @property
+    def allows_same_browser_recovery(self) -> bool:
+        """Whether immutable evidence permits one guarded same-browser reload."""
+        return bool(
+            self.matches_server_communication_failure or self.matches_stalled_single_xhr
         )
 
 

@@ -41,21 +41,29 @@ evidence remains unknown, recovery evidence freezes its XHR fields from that
 same retained monitor, so a duplicate cannot be hidden behind an unrelated
 count-one record.
 
-An ambiguous turn or next-floor action is eligible for same-browser recovery
-only when immutable evidence binds the `server-communication-failed` dialog to
-that exact action token and the XHR is either the precise terminal status-zero
-error shape or has an incomplete zero/one-send receipt with null status and
-outcome. Recovery never replays the cached action. It accepts only a new, ready
-document on the expected persistent/Isekai realm after at least two stable
-state signatures. Complete and next-floor controls take priority over
-PonyChart; an active phase additionally needs its log/action-control markers
-and must parse with a live monster. The runner then returns to turn preparation
-and asks strategy for a fresh decision. A second ambiguity before a confirmed
-`ACTED` or next-floor receipt exhausts that browser's recovery budget. Only
-this typed exhaustion may open one fresh authenticated browser, whose own
-same-browser budget starts unused; it can never open a third browser.
-Final-completion acknowledgement ambiguity never enters that fresh-browser
-path.
+An ambiguous submitted action has two exact same-browser recovery classes. A
+turn or next-floor action may bind the sanitized
+`server-communication-failed` dialog to its action token and carry either the
+precise terminal status-zero error or an incomplete zero/one-send receipt. A
+turn action is also recoverable without a dialog when the browser observes one
+XHR remaining pending for at least five seconds on the same known document,
+with null status/outcome. For this stalled-XHR class, unknown documents,
+duplicate sends, other dialogs, younger requests, and completed requests fail
+closed.
+
+For the stalled-XHR class, the coordinator reads the document once more to
+avoid racing an automatic navigation, then reloads the current page at most
+once if that document is still unchanged. Recovery never replays the cached
+action. It accepts only a new, ready document on the expected
+persistent/Isekai realm after at least two stable state signatures. Complete
+and next-floor controls take priority over PonyChart; an active phase
+additionally needs its log/action-control markers and must parse with a live
+monster. The runner then returns to turn preparation and asks strategy for a
+fresh decision. A second ambiguity before a confirmed `ACTED` or next-floor
+receipt exhausts that browser's recovery budget. Only this typed exhaustion
+may open one fresh authenticated browser, whose own same-browser budget starts
+unused; it can never open a third browser. Final-completion acknowledgement
+ambiguity never enters that fresh-browser path.
 
 A `ZendriverOperationTimeout` is not treated like an ordinary retryable
 `TimeoutError`, because its CDP command deliberately remains live. A live

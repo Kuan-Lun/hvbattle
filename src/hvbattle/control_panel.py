@@ -15,6 +15,13 @@ from typing import Any
 _GUI_START_TIMEOUT = 10.0
 _GUI_STOP_TIMEOUT = 3.0
 _CHECKLIST_ROWS_PER_COLUMN = 12
+_CHECKLIST_TEXT_MIN_WRAP_LENGTH = 120
+_CHECKLIST_TEXT_MAX_WRAP_LENGTH = 420
+_CHECKLIST_TEXT_HORIZONTAL_OVERHEAD = 48
+_CHECKLIST_CANVAS_HORIZONTAL_OVERHEAD = 24
+_CHECKLIST_NON_CHOICE_VERTICAL_OVERHEAD = 160
+_WINDOW_SCREEN_MARGIN = 80
+_WINDOW_CONTENT_HORIZONTAL_OVERHEAD = 48
 
 
 def _publish_boolean(shared: Any, name: str, variable: Any) -> None:
@@ -99,8 +106,105 @@ def _checklist_render_state(
         return revision, selected
 
 
-def _checklist_grid_position(index: int) -> tuple[int, int]:
-    return index % _CHECKLIST_ROWS_PER_COLUMN, index // _CHECKLIST_ROWS_PER_COLUMN
+def _checklist_grid_position(
+    index: int,
+    rows_per_column: int = _CHECKLIST_ROWS_PER_COLUMN,
+) -> tuple[int, int]:
+    if rows_per_column <= 0:
+        raise ValueError("rows_per_column must be positive")
+    return index % rows_per_column, index // rows_per_column
+
+
+def _checklist_choice_column_count(choice_count: int) -> int:
+    if choice_count < 0:
+        raise ValueError("choice_count must not be negative")
+    return max(
+        1,
+        (choice_count + _CHECKLIST_ROWS_PER_COLUMN - 1) // _CHECKLIST_ROWS_PER_COLUMN,
+    )
+
+
+def _checklist_text_wraplength(
+    screen_width: int,
+    controls_width: int,
+    checklist_count: int,
+    choice_column_count: int,
+) -> int:
+    """Fit dynamic checklist text beside the controls without unbounded width."""
+    if choice_column_count <= 0:
+        raise ValueError("choice_column_count must be positive")
+
+    frame_width = _checklist_frame_width(
+        screen_width,
+        controls_width,
+        checklist_count,
+    )
+    text_width = (
+        frame_width // choice_column_count - _CHECKLIST_TEXT_HORIZONTAL_OVERHEAD
+    )
+    return min(_CHECKLIST_TEXT_MAX_WRAP_LENGTH, max(1, text_width))
+
+
+def _checklist_frame_width(
+    screen_width: int,
+    controls_width: int,
+    checklist_count: int,
+) -> int:
+    if screen_width <= 0:
+        raise ValueError("screen_width must be positive")
+    if controls_width < 0:
+        raise ValueError("controls_width must not be negative")
+    if checklist_count <= 0:
+        raise ValueError("checklist_count must be positive")
+
+    available_width = max(
+        screen_width
+        - controls_width
+        - _WINDOW_SCREEN_MARGIN
+        - _WINDOW_CONTENT_HORIZONTAL_OVERHEAD,
+        0,
+    )
+    return max(1, available_width // checklist_count)
+
+
+def _checklist_choice_layout(
+    screen_width: int,
+    controls_width: int,
+    checklist_count: int,
+    choice_count: int,
+) -> tuple[int, int, int]:
+    """Return inner columns, rows per column, and dynamic text wrap length."""
+    natural_columns = _checklist_choice_column_count(choice_count)
+    frame_width = _checklist_frame_width(
+        screen_width,
+        controls_width,
+        checklist_count,
+    )
+    readable_column_width = (
+        _CHECKLIST_TEXT_MIN_WRAP_LENGTH + _CHECKLIST_TEXT_HORIZONTAL_OVERHEAD
+    )
+    fitting_columns = max(1, frame_width // readable_column_width)
+    column_count = min(natural_columns, fitting_columns)
+    if choice_count == 0 or column_count == natural_columns:
+        rows_per_column = _CHECKLIST_ROWS_PER_COLUMN
+    else:
+        rows_per_column = (choice_count + column_count - 1) // column_count
+    wraplength = _checklist_text_wraplength(
+        screen_width,
+        controls_width,
+        checklist_count,
+        column_count,
+    )
+    return column_count, rows_per_column, wraplength
+
+
+def _allocate_checklist_column(columns: dict[str, int], name: str) -> int:
+    """Keep a checklist in its first assigned column across frame rebuilds."""
+    column = columns.get(name)
+    if column is None:
+        column = len(columns)
+        columns[name] = column
+    return column
 
 
 def _commit_integer_control(
@@ -172,21 +276,44 @@ def _run_gui(
     root = tk.Tk()
     root.title("Battle Control Panel")
     root.minsize(width=300, height=0)
+    root.maxsize(
+        width=max(300, root.winfo_screenwidth() - _WINDOW_SCREEN_MARGIN),
+        height=max(1, root.winfo_screenheight() - _WINDOW_SCREEN_MARGIN),
+    )
 
     pause_button = tk.Button(root, text="Pause")
     pause_button.pack(padx=10, pady=5)
 
-    skill_container = tk.Frame(root)
-    skill_container.pack(padx=10, pady=5, fill="x")
-    toggle_container = tk.Frame(root)
-    toggle_container.pack(padx=10, pady=5, fill="x")
-    checklist_container = tk.Frame(root)
-    checklist_container.pack(padx=10, pady=5, fill="x")
+    body = tk.Frame(root)
+    body.pack(padx=10, pady=5, fill="both", expand=True)
+    body.rowconfigure(0, weight=1)
+
+    controls_container = tk.Frame(body)
+    controls_container.grid(row=0, column=0, sticky="nsew")
+    skill_container = tk.Frame(controls_container)
+    skill_container.pack(pady=(0, 5), fill="x")
+    toggle_container = tk.Frame(controls_container)
+    toggle_container.pack(pady=(5, 0), fill="x")
+
+    checklist_container = tk.Frame(body)
+    checklist_container.grid(row=0, column=1, padx=(5, 0), sticky="nsew")
+    checklist_container.rowconfigure(0, weight=1)
+    body.columnconfigure(1, weight=1)
 
     local_skills: dict[str, tk.BooleanVar] = {}
     local_toggles: dict[str, tk.BooleanVar] = {}
     toggle_groups: dict[str, tk.LabelFrame] = {}
     checklist_frames: dict[str, tk.LabelFrame] = {}
+    # Frames are rebuilt whenever fresh server choices arrive, so their
+    # first-seen outer columns must live independently of the frame objects.
+    checklist_columns: dict[str, int] = {}
+    checklist_spanning_widgets: dict[str, tuple[Any, ...]] = {}
+    checklist_choice_widgets: dict[str, tuple[Any, ...]] = {}
+    checklist_choice_canvases: dict[str, Any] = {}
+    checklist_choice_containers: dict[str, Any] = {}
+    checklist_choice_scrollbars: dict[str, Any] = {}
+    checklist_reflow_pending = False
+    scrollbar_refresh_pending = False
 
     def group_frame(group: str) -> tk.LabelFrame:
         frame = toggle_groups.get(group)
@@ -198,6 +325,122 @@ def _run_gui(
 
     def toggle_pause() -> None:
         _set_paused(pause_flag, pause_button, not pause_flag.is_set())
+
+    def reflow_checklists_impl() -> None:
+        nonlocal checklist_reflow_pending
+        checklist_reflow_pending = False
+        if not checklist_frames:
+            return
+
+        # A command burst can create the left controls and both checklists in
+        # one callback. Flush geometry before budgeting the dynamic labels.
+        root.update_idletasks()
+        screen_width = root.winfo_screenwidth()
+        screen_height = root.winfo_screenheight()
+        controls_width = controls_container.winfo_reqwidth()
+        checklist_count = len(checklist_frames)
+        frame_width = _checklist_frame_width(
+            screen_width,
+            controls_width,
+            checklist_count,
+        )
+        spanning_wraplength = _checklist_text_wraplength(
+            screen_width,
+            controls_width,
+            checklist_count,
+            1,
+        )
+        for name in checklist_frames:
+            choice_layout = _checklist_choice_layout(
+                screen_width,
+                controls_width,
+                checklist_count,
+                len(checklist_choice_widgets[name]),
+            )
+            rows_per_column = choice_layout[1]
+            choice_wraplength = choice_layout[2]
+            for index, widget in enumerate(checklist_choice_widgets[name]):
+                grid_row, grid_column = _checklist_grid_position(
+                    index,
+                    rows_per_column,
+                )
+                widget.grid_configure(row=grid_row, column=grid_column)
+                widget.config(wraplength=choice_wraplength)
+            for widget in checklist_spanning_widgets[name]:
+                widget.config(wraplength=spanning_wraplength)
+
+        root.update_idletasks()
+        # Only the choice area scrolls; titles, status, and Pause remain visible.
+        max_canvas_height = max(
+            1,
+            screen_height
+            - _WINDOW_SCREEN_MARGIN
+            - _CHECKLIST_NON_CHOICE_VERTICAL_OVERHEAD,
+        )
+        max_canvas_width = max(
+            1,
+            frame_width - _CHECKLIST_CANVAS_HORIZONTAL_OVERHEAD,
+        )
+        for name, canvas in checklist_choice_canvases.items():
+            choices_container = checklist_choice_containers[name]
+            content_width = choices_container.winfo_reqwidth()
+            content_height = choices_container.winfo_reqheight()
+            canvas.config(
+                width=min(content_width, max_canvas_width),
+                height=min(content_height, max_canvas_height),
+                scrollregion=(0, 0, content_width, content_height),
+            )
+
+        root.update_idletasks()
+        for name, canvas in checklist_choice_canvases.items():
+            content_height = checklist_choice_containers[name].winfo_reqheight()
+            scrollbar = checklist_choice_scrollbars[name]
+            if content_height > canvas.winfo_height():
+                scrollbar.grid()
+            else:
+                scrollbar.grid_remove()
+
+    def reflow_checklists() -> None:
+        _run_gui_callback_fail_closed(
+            pause_flag,
+            root.destroy,
+            reflow_checklists_impl,
+        )
+
+    def schedule_checklist_reflow() -> None:
+        nonlocal checklist_reflow_pending
+        if checklist_reflow_pending:
+            return
+        checklist_reflow_pending = True
+        root.after(20, reflow_checklists)
+
+    def refresh_scrollbars_impl() -> None:
+        nonlocal scrollbar_refresh_pending
+        # The window manager may allocate less height than Tk requested. Use
+        # the final viewport height instead of the earlier screen-size budget.
+        root.update_idletasks()
+        for name, canvas in checklist_choice_canvases.items():
+            content_height = checklist_choice_containers[name].winfo_reqheight()
+            scrollbar = checklist_choice_scrollbars[name]
+            if content_height > canvas.winfo_height():
+                scrollbar.grid()
+            else:
+                scrollbar.grid_remove()
+        scrollbar_refresh_pending = False
+
+    def refresh_scrollbars() -> None:
+        _run_gui_callback_fail_closed(
+            pause_flag,
+            root.destroy,
+            refresh_scrollbars_impl,
+        )
+
+    def schedule_scrollbar_refresh(event: Any) -> None:
+        nonlocal scrollbar_refresh_pending
+        if event.widget is not root or scrollbar_refresh_pending:
+            return
+        scrollbar_refresh_pending = True
+        root.after(20, refresh_scrollbars)
 
     def sync_to_shared_impl() -> None:
         for name, skill_variable in local_skills.items():
@@ -237,6 +480,7 @@ def _run_gui(
                             toggle_variable,
                         ),
                     ).pack(anchor="w", padx=5, pady=1)
+                    schedule_checklist_reflow()
                 case "register_integer":
                     name, label, default, minimum, maximum, group = arguments
                     frame = group_frame(group)
@@ -268,6 +512,7 @@ def _run_gui(
                     )
 
                     entry.bind("<Return>", partial(_invoke_callback, apply_integer))
+                    schedule_checklist_reflow()
                 case "set_checklist":
                     name, label, choices, revision, selected, status = arguments
                     keys = tuple(key for key, _choice_label in choices)
@@ -286,27 +531,82 @@ def _run_gui(
                     if old_frame is not None:
                         old_frame.destroy()
 
-                    frame = tk.LabelFrame(checklist_container, text=label)
-                    frame.pack(padx=5, pady=3, fill="x")
+                    frame = tk.LabelFrame(checklist_container)
+                    title = tk.Label(
+                        frame,
+                        text=label,
+                        anchor="w",
+                        justify="left",
+                        wraplength=_CHECKLIST_TEXT_MAX_WRAP_LENGTH,
+                    )
+                    frame.config(labelwidget=title)
+                    column = _allocate_checklist_column(checklist_columns, name)
+                    frame.grid(
+                        row=0,
+                        column=column,
+                        padx=5,
+                        pady=3,
+                        sticky="nsew",
+                    )
+                    checklist_container.columnconfigure(column, weight=1)
                     checklist_frames[name] = frame
 
+                    spanning_widgets: list[Any] = [title]
                     if status is not None:
-                        tk.Label(frame, text=status, anchor="w").pack(
-                            anchor="w", padx=5, pady=(2, 1)
+                        status_label = tk.Label(
+                            frame,
+                            text=status,
+                            anchor="w",
+                            justify="left",
+                            wraplength=_CHECKLIST_TEXT_MAX_WRAP_LENGTH,
                         )
-                    choices_container = tk.Frame(frame)
-                    choices_container.pack(fill="x")
+                        status_label.pack(anchor="w", padx=5, pady=(2, 1))
+                        spanning_widgets.append(status_label)
+                    choices_viewport = tk.Frame(frame)
+                    choices_viewport.pack(fill="both", expand=True)
+                    choices_viewport.rowconfigure(0, weight=1)
+                    choices_viewport.columnconfigure(0, weight=1)
+                    canvas = tk.Canvas(
+                        choices_viewport,
+                        width=1,
+                        height=1,
+                        borderwidth=0,
+                        highlightthickness=0,
+                        background=frame.cget("background"),
+                    )
+                    canvas.grid(row=0, column=0, sticky="nsew")
+                    scrollbar = tk.Scrollbar(
+                        choices_viewport,
+                        orient="vertical",
+                        command=canvas.yview,
+                    )
+                    scrollbar.grid(row=0, column=1, sticky="ns")
+                    canvas.config(yscrollcommand=scrollbar.set)
+                    choices_container = tk.Frame(
+                        canvas,
+                        background=frame.cget("background"),
+                    )
+                    canvas.create_window(
+                        (0, 0),
+                        window=choices_container,
+                        anchor="nw",
+                    )
 
                     selected_keys = frozenset(selected)
                     variables = tuple(
                         tk.BooleanVar(value=key in selected_keys) for key in keys
                     )
+                    choice_widgets: list[Any] = []
                     if not choices:
-                        tk.Label(
+                        empty_label = tk.Label(
                             choices_container,
                             text="No choices available",
                             anchor="w",
-                        ).pack(anchor="w", padx=5, pady=1)
+                            justify="left",
+                            wraplength=_CHECKLIST_TEXT_MAX_WRAP_LENGTH,
+                        )
+                        empty_label.pack(anchor="w", padx=5, pady=1)
+                        spanning_widgets.append(empty_label)
                     for index, ((_key, choice_label), variable) in enumerate(
                         zip(choices, variables, strict=True)
                     ):
@@ -314,6 +614,9 @@ def _run_gui(
                             choices_container,
                             text=choice_label,
                             variable=variable,
+                            anchor="w",
+                            justify="left",
+                            wraplength=_CHECKLIST_TEXT_MAX_WRAP_LENGTH,
                             command=partial(
                                 _publish_checklist_selection,
                                 checklist_dict,
@@ -324,6 +627,7 @@ def _run_gui(
                                 variable,
                             ),
                         )
+                        choice_widgets.append(checkbox)
                         grid_row, grid_column = _checklist_grid_position(index)
                         checkbox.grid(
                             row=grid_row,
@@ -332,6 +636,12 @@ def _run_gui(
                             padx=5,
                             pady=1,
                         )
+                    checklist_spanning_widgets[name] = tuple(spanning_widgets)
+                    checklist_choice_widgets[name] = tuple(choice_widgets)
+                    checklist_choice_canvases[name] = canvas
+                    checklist_choice_containers[name] = choices_container
+                    checklist_choice_scrollbars[name] = scrollbar
+                    schedule_checklist_reflow()
                 case "set_skills":
                     skill_groups, forbidden = arguments
                     for widget in skill_container.winfo_children():
@@ -356,6 +666,7 @@ def _run_gui(
                                 ),
                             ).pack(anchor="w", padx=5, pady=1)
                         skill_container.columnconfigure(column, weight=1)
+                    schedule_checklist_reflow()
                 case "set_title":
                     root.title(arguments)
                 case "pause":
@@ -379,6 +690,7 @@ def _run_gui(
         "WM_DELETE_WINDOW",
         partial(_close_gui, pause_flag, root.destroy),
     )
+    root.bind("<Configure>", schedule_scrollbar_refresh)
     root.after(100, poll_commands)
     root.after(200, sync_to_shared)
     ready_event.set()

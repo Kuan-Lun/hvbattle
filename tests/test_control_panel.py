@@ -5,8 +5,12 @@ from unittest.mock import Mock
 
 from hvbattle import BaseControlPanel, ControlPanel, NullControlPanel
 from hvbattle.control_panel import (
+    _allocate_checklist_column,
+    _checklist_choice_column_count,
+    _checklist_choice_layout,
     _checklist_grid_position,
     _checklist_render_state,
+    _checklist_text_wraplength,
     _close_gui,
     _commit_integer_control,
     _invoke_callback,
@@ -433,12 +437,50 @@ class ControlPanelStateTests(unittest.TestCase):
 
 
 class GuiCallbackTests(unittest.TestCase):
+    def test_checklist_columns_stay_stable_across_frame_rebuilds(self) -> None:
+        columns: dict[str, int] = {}
+
+        self.assertEqual(_allocate_checklist_column(columns, "arena"), 0)
+        self.assertEqual(_allocate_checklist_column(columns, "ring"), 1)
+        self.assertEqual(_allocate_checklist_column(columns, "arena"), 0)
+        self.assertEqual(columns, {"arena": 0, "ring": 1})
+
     def test_checklist_grid_starts_a_new_column_every_twelve_choices(self) -> None:
         self.assertEqual(_checklist_grid_position(0), (0, 0))
         self.assertEqual(_checklist_grid_position(11), (11, 0))
         self.assertEqual(_checklist_grid_position(12), (0, 1))
         self.assertEqual(_checklist_grid_position(23), (11, 1))
         self.assertEqual(_checklist_grid_position(24), (0, 2))
+        self.assertEqual(_checklist_grid_position(13, rows_per_column=13), (0, 1))
+
+    def test_checklist_choice_column_count_includes_empty_placeholder(self) -> None:
+        self.assertEqual(_checklist_choice_column_count(0), 1)
+        self.assertEqual(_checklist_choice_column_count(12), 1)
+        self.assertEqual(_checklist_choice_column_count(13), 2)
+
+    def test_dynamic_checklist_width_uses_remaining_screen_space(self) -> None:
+        one_checklist = _checklist_text_wraplength(1_600, 600, 1, 1)
+        two_checklists = _checklist_text_wraplength(1_600, 600, 2, 1)
+        two_choice_columns = _checklist_text_wraplength(1_600, 600, 2, 2)
+
+        self.assertGreater(one_checklist, two_checklists)
+        self.assertGreater(two_checklists, two_choice_columns)
+
+    def test_dynamic_checklist_width_is_bounded_for_extreme_names(self) -> None:
+        self.assertEqual(_checklist_text_wraplength(10_000, 0, 1, 1), 420)
+        self.assertEqual(_checklist_text_wraplength(800, 700, 2, 1), 1)
+
+    def test_narrow_layout_reduces_inner_columns_before_text_width(self) -> None:
+        self.assertEqual(
+            _checklist_choice_layout(1_366, 550, 2, 25),
+            (2, 13, 124),
+        )
+
+    def test_wide_layout_preserves_twelve_rows_per_column(self) -> None:
+        self.assertEqual(
+            _checklist_choice_layout(1_920, 600, 2, 25),
+            (3, 12, 150),
+        )
 
     def test_apply_commits_valid_integer_and_updates_visible_status(self) -> None:
         shared = {"target": 1_000}

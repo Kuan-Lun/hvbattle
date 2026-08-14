@@ -14,10 +14,27 @@ from typing import Any
 
 _GUI_START_TIMEOUT = 10.0
 _GUI_STOP_TIMEOUT = 3.0
+_CHECKLIST_ROWS_PER_COLUMN = 12
 
 
 def _publish_boolean(shared: Any, name: str, variable: Any) -> None:
     shared[name] = bool(variable.get())
+
+
+def _publish_checklist_selection(
+    shared: Any,
+    name: str,
+    keys: tuple[str, ...],
+    variables: tuple[Any, ...],
+) -> None:
+    """Publish one ordered checklist snapshot with a single shared write."""
+    shared[name] = tuple(
+        key for key, variable in zip(keys, variables, strict=True) if variable.get()
+    )
+
+
+def _checklist_grid_position(index: int) -> tuple[int, int]:
+    return index % _CHECKLIST_ROWS_PER_COLUMN, index // _CHECKLIST_ROWS_PER_COLUMN
 
 
 def _commit_integer_control(
@@ -46,6 +63,15 @@ def _close_gui(pause_flag: Any, destroy: Callable[[], None]) -> None:
     destroy()
 
 
+def _set_paused(pause_flag: Any, pause_button: Any, paused: bool) -> None:
+    if paused:
+        pause_flag.set()
+        pause_button.config(text="Resume")
+    else:
+        pause_flag.clear()
+        pause_button.config(text="Pause")
+
+
 def _invoke_callback(callback: Callable[[], None], _event: Any) -> None:
     callback()
 
@@ -54,6 +80,7 @@ def _run_gui(
     pause_flag: Any,
     toggle_dict: Any,
     integer_dict: Any,
+    checklist_dict: Any,
     skill_dict: Any,
     cmd_queue: Queue[tuple[str, Any]],
     ready_event: Any,
@@ -72,10 +99,13 @@ def _run_gui(
     skill_container.pack(padx=10, pady=5, fill="x")
     toggle_container = tk.Frame(root)
     toggle_container.pack(padx=10, pady=5, fill="x")
+    checklist_container = tk.Frame(root)
+    checklist_container.pack(padx=10, pady=5, fill="x")
 
     local_skills: dict[str, tk.BooleanVar] = {}
     local_toggles: dict[str, tk.BooleanVar] = {}
     toggle_groups: dict[str, tk.LabelFrame] = {}
+    checklist_frames: dict[str, tk.LabelFrame] = {}
 
     def group_frame(group: str) -> tk.LabelFrame:
         frame = toggle_groups.get(group)
@@ -86,12 +116,7 @@ def _run_gui(
         return frame
 
     def toggle_pause() -> None:
-        if pause_flag.is_set():
-            pause_flag.clear()
-            pause_button.config(text="Pause")
-        else:
-            pause_flag.set()
-            pause_button.config(text="Resume")
+        _set_paused(pause_flag, pause_button, not pause_flag.is_set())
 
     def sync_to_shared() -> None:
         for name, skill_variable in local_skills.items():
@@ -155,6 +180,58 @@ def _run_gui(
                     )
 
                     entry.bind("<Return>", partial(_invoke_callback, apply_integer))
+                case "set_checklist":
+                    name, label, choices, selected, status = arguments
+                    old_frame = checklist_frames.pop(name, None)
+                    if old_frame is not None:
+                        old_frame.destroy()
+
+                    frame = tk.LabelFrame(checklist_container, text=label)
+                    frame.pack(padx=5, pady=3, fill="x")
+                    checklist_frames[name] = frame
+
+                    if status is not None:
+                        tk.Label(frame, text=status, anchor="w").pack(
+                            anchor="w", padx=5, pady=(2, 1)
+                        )
+                    choices_container = tk.Frame(frame)
+                    choices_container.pack(fill="x")
+
+                    selected_keys = frozenset(selected)
+                    keys = tuple(key for key, _choice_label in choices)
+                    variables = tuple(
+                        tk.BooleanVar(value=key in selected_keys) for key in keys
+                    )
+                    checklist_dict[name] = selected
+                    if not choices:
+                        tk.Label(
+                            choices_container,
+                            text="No choices available",
+                            anchor="w",
+                        ).pack(anchor="w", padx=5, pady=1)
+                    for index, ((_key, choice_label), variable) in enumerate(
+                        zip(choices, variables, strict=True)
+                    ):
+                        checkbox = tk.Checkbutton(
+                            choices_container,
+                            text=choice_label,
+                            variable=variable,
+                            command=partial(
+                                _publish_checklist_selection,
+                                checklist_dict,
+                                name,
+                                keys,
+                                variables,
+                            ),
+                        )
+                        grid_row, grid_column = _checklist_grid_position(index)
+                        checkbox.grid(
+                            row=grid_row,
+                            column=grid_column,
+                            sticky="w",
+                            padx=5,
+                            pady=1,
+                        )
                 case "set_skills":
                     skill_groups, forbidden = arguments
                     for widget in skill_container.winfo_children():
@@ -181,6 +258,8 @@ def _run_gui(
                         skill_container.columnconfigure(column, weight=1)
                 case "set_title":
                     root.title(arguments)
+                case "pause":
+                    _set_paused(pause_flag, pause_button, True)
                 case "destroy":
                     root.destroy()
                     return
@@ -235,6 +314,28 @@ class BaseControlPanel(ABC):
         """Return a committed integer value when supported."""
         raise NotImplementedError("This control panel has no integer controls")
 
+    def set_checklist(
+        self,
+        name: str,
+        label: str,
+        choices: Iterable[tuple[str, str]],
+        selected: Iterable[str] = (),
+        *,
+        status: str | None = None,
+    ) -> None:
+        """Replace a named checklist when the implementation supports it."""
+        raise NotImplementedError("This control panel has no checklist controls")
+
+    def get_checklist_selection(self, name: str) -> tuple[str, ...]:
+        """Return one ordered, atomically committed checklist selection."""
+        raise NotImplementedError("This control panel has no checklist controls")
+
+    def pause(self) -> None:
+        """Request a pause when the implementation supports interaction."""
+        raise NotImplementedError(
+            "This control panel cannot be paused programmatically"
+        )
+
     def set_actions(
         self, action_groups: dict[str, list[str]], disabled: Iterable[str]
     ) -> None:
@@ -268,6 +369,7 @@ class ControlPanel(BaseControlPanel):
         self._pause_flag = self._manager.Event()
         self._toggle_dict = self._manager.dict()
         self._integer_dict = self._manager.dict()
+        self._checklist_dict = self._manager.dict()
         self._skill_dict = self._manager.dict()
         self._cmd_queue = self._manager.Queue()
         ready_event = self._manager.Event()
@@ -278,6 +380,7 @@ class ControlPanel(BaseControlPanel):
                 self._pause_flag,
                 self._toggle_dict,
                 self._integer_dict,
+                self._checklist_dict,
                 self._skill_dict,
                 self._cmd_queue,
                 ready_event,
@@ -342,6 +445,46 @@ class ControlPanel(BaseControlPanel):
         except KeyError:
             raise KeyError(f"Unknown integer control: {name}") from None
 
+    def set_checklist(
+        self,
+        name: str,
+        label: str,
+        choices: Iterable[tuple[str, str]],
+        selected: Iterable[str] = (),
+        *,
+        status: str | None = None,
+    ) -> None:
+        normalized_choices, normalized_selected = _validate_checklist_configuration(
+            name,
+            label,
+            choices,
+            selected,
+            status,
+        )
+        self._checklist_dict[name] = normalized_selected
+        self._cmd_queue.put(
+            (
+                "set_checklist",
+                (
+                    name,
+                    label,
+                    normalized_choices,
+                    normalized_selected,
+                    status,
+                ),
+            )
+        )
+
+    def get_checklist_selection(self, name: str) -> tuple[str, ...]:
+        try:
+            return tuple(self._checklist_dict[name])
+        except KeyError:
+            raise KeyError(f"Unknown checklist control: {name}") from None
+
+    def pause(self) -> None:
+        self._pause_flag.set()
+        self._cmd_queue.put(("pause", None))
+
     def set_skills(
         self, skill_groups: dict[str, list[str]], forbidden: Iterable[str]
     ) -> None:
@@ -382,6 +525,7 @@ class NullControlPanel(BaseControlPanel):
     def __init__(self) -> None:
         self._toggles: dict[str, bool] = {}
         self._integers: dict[str, int] = {}
+        self._checklists: dict[str, tuple[str, ...]] = {}
         self._forbidden_skills: frozenset[str] = frozenset()
 
     def set_title(self, title: str) -> None:
@@ -421,6 +565,33 @@ class NullControlPanel(BaseControlPanel):
         except KeyError:
             raise KeyError(f"Unknown integer control: {name}") from None
 
+    def set_checklist(
+        self,
+        name: str,
+        label: str,
+        choices: Iterable[tuple[str, str]],
+        selected: Iterable[str] = (),
+        *,
+        status: str | None = None,
+    ) -> None:
+        _choices, normalized_selected = _validate_checklist_configuration(
+            name,
+            label,
+            choices,
+            selected,
+            status,
+        )
+        self._checklists[name] = normalized_selected
+
+    def get_checklist_selection(self, name: str) -> tuple[str, ...]:
+        try:
+            return self._checklists[name]
+        except KeyError:
+            raise KeyError(f"Unknown checklist control: {name}") from None
+
+    def pause(self) -> None:
+        return
+
     def set_skills(
         self, skill_groups: dict[str, list[str]], forbidden: Iterable[str]
     ) -> None:
@@ -455,6 +626,64 @@ def _validate_integer_configuration(
         raise ValueError("default cannot be less than minimum")
     if maximum is not None and default > maximum:
         raise ValueError("default cannot exceed maximum")
+
+
+def _validate_checklist_configuration(
+    name: str,
+    label: str,
+    choices: Iterable[tuple[str, str]],
+    selected: Iterable[str],
+    status: str | None,
+) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
+    if not isinstance(name, str):
+        raise TypeError("checklist name must be str")
+    if not name.strip():
+        raise ValueError("checklist name must not be empty")
+    if not isinstance(label, str):
+        raise TypeError("checklist label must be str")
+    if not label.strip():
+        raise ValueError("checklist label must not be empty")
+    if status is not None and not isinstance(status, str):
+        raise TypeError("checklist status must be str or None")
+    if isinstance(choices, (str, bytes)) or not isinstance(choices, Iterable):
+        raise TypeError("checklist choices must be an iterable of key-label tuples")
+    if isinstance(selected, (str, bytes)) or not isinstance(selected, Iterable):
+        raise TypeError("checklist selected keys must be an iterable of strings")
+
+    normalized_choices: list[tuple[str, str]] = []
+    choice_keys: set[str] = set()
+    for choice in choices:
+        if not isinstance(choice, tuple) or len(choice) != 2:
+            raise TypeError("each checklist choice must be a key-label tuple")
+        key, choice_label = choice
+        if not isinstance(key, str):
+            raise TypeError("checklist choice key must be str")
+        if not key.strip():
+            raise ValueError("checklist choice key must not be empty")
+        if not isinstance(choice_label, str):
+            raise TypeError("checklist choice label must be str")
+        if not choice_label.strip():
+            raise ValueError("checklist choice label must not be empty")
+        if key in choice_keys:
+            raise ValueError(f"duplicate checklist choice key: {key}")
+        choice_keys.add(key)
+        normalized_choices.append((key, choice_label))
+
+    selected_keys: set[str] = set()
+    for key in selected:
+        if not isinstance(key, str):
+            raise TypeError("checklist selected key must be str")
+        if key in selected_keys:
+            raise ValueError(f"duplicate checklist selected key: {key}")
+        selected_keys.add(key)
+    unknown = selected_keys.difference(choice_keys)
+    if unknown:
+        raise ValueError(f"unknown checklist selected key: {sorted(unknown)[0]}")
+
+    ordered_selection = tuple(
+        key for key, _choice_label in normalized_choices if key in selected_keys
+    )
+    return tuple(normalized_choices), ordered_selection
 
 
 def _parse_integer(

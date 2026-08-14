@@ -23,14 +23,80 @@ def _publish_boolean(shared: Any, name: str, variable: Any) -> None:
 
 def _publish_checklist_selection(
     shared: Any,
+    checklist_lock: Any,
     name: str,
-    keys: tuple[str, ...],
-    variables: tuple[Any, ...],
+    frame_revision: int,
+    key: str,
+    variable: Any,
 ) -> None:
-    """Publish one ordered checklist snapshot with a single shared write."""
-    shared[name] = tuple(
-        key for key, variable in zip(keys, variables, strict=True) if variable.get()
+    """Merge one checkbox change into the newest checklist generation."""
+    checked = bool(variable.get())
+    with checklist_lock:
+        revision, keys, selected = _unpack_checklist_state(shared[name])
+        if frame_revision > revision:
+            raise RuntimeError("checklist frame revision is newer than shared state")
+        if key not in keys:
+            # The callback came from a frame replaced while the click was in
+            # flight. Removed choices must never be reintroduced.
+            return
+        selected_set = set(selected)
+        if checked:
+            selected_set.add(key)
+        else:
+            selected_set.discard(key)
+        merged = tuple(candidate for candidate in keys if candidate in selected_set)
+        if merged != selected:
+            shared[name] = (revision + 1, keys, merged)
+
+
+def _unpack_checklist_state(
+    state: Any,
+) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
+    revision, keys, selected = state
+    return int(revision), tuple(keys), tuple(selected)
+
+
+def _merge_checklist_replacement(
+    current_keys: tuple[str, ...],
+    current_selected: tuple[str, ...],
+    new_keys: tuple[str, ...],
+    proposed_selected: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Preserve live common choices while applying defaults only to new ones."""
+    current_key_set = frozenset(current_keys)
+    current_selected_set = frozenset(current_selected)
+    proposed_selected_set = frozenset(proposed_selected)
+    return tuple(
+        key
+        for key in new_keys
+        if (
+            key in current_selected_set
+            if key in current_key_set
+            else key in proposed_selected_set
+        )
     )
+
+
+def _checklist_render_state(
+    shared: Any,
+    checklist_lock: Any,
+    name: str,
+    command_revision: int,
+    command_keys: tuple[str, ...],
+    command_selected: tuple[str, ...],
+) -> tuple[int, tuple[str, ...]] | None:
+    """Return the newest compatible state, or skip a superseded command."""
+    with checklist_lock:
+        revision, keys, selected = _unpack_checklist_state(shared[name])
+        if revision < command_revision:
+            raise RuntimeError("shared checklist revision moved backwards")
+        if revision == command_revision:
+            if keys != command_keys or selected != command_selected:
+                raise RuntimeError("shared checklist state does not match its command")
+            return revision, selected
+        if keys != command_keys:
+            return None
+        return revision, selected
 
 
 def _checklist_grid_position(index: int) -> tuple[int, int]:
@@ -59,8 +125,22 @@ def _commit_integer_control(
 
 
 def _close_gui(pause_flag: Any, destroy: Callable[[], None]) -> None:
-    pause_flag.set()
-    destroy()
+    try:
+        pause_flag.set()
+    finally:
+        destroy()
+
+
+def _run_gui_callback_fail_closed(
+    pause_flag: Any,
+    destroy: Callable[[], None],
+    callback: Callable[[], None],
+) -> None:
+    """Close the GUI and pause the parent if a scheduled callback fails."""
+    try:
+        callback()
+    except Exception:
+        _close_gui(pause_flag, destroy)
 
 
 def _set_paused(pause_flag: Any, pause_button: Any, paused: bool) -> None:
@@ -81,6 +161,7 @@ def _run_gui(
     toggle_dict: Any,
     integer_dict: Any,
     checklist_dict: Any,
+    checklist_lock: Any,
     skill_dict: Any,
     cmd_queue: Queue[tuple[str, Any]],
     ready_event: Any,
@@ -118,14 +199,21 @@ def _run_gui(
     def toggle_pause() -> None:
         _set_paused(pause_flag, pause_button, not pause_flag.is_set())
 
-    def sync_to_shared() -> None:
+    def sync_to_shared_impl() -> None:
         for name, skill_variable in local_skills.items():
             skill_dict[name] = skill_variable.get()
         for name, toggle_variable in local_toggles.items():
             toggle_dict[name] = toggle_variable.get()
         root.after(200, sync_to_shared)
 
-    def poll_commands() -> None:
+    def sync_to_shared() -> None:
+        _run_gui_callback_fail_closed(
+            pause_flag,
+            root.destroy,
+            sync_to_shared_impl,
+        )
+
+    def poll_commands_impl() -> None:
         while True:
             try:
                 command, arguments = cmd_queue.get_nowait()
@@ -181,7 +269,19 @@ def _run_gui(
 
                     entry.bind("<Return>", partial(_invoke_callback, apply_integer))
                 case "set_checklist":
-                    name, label, choices, selected, status = arguments
+                    name, label, choices, revision, selected, status = arguments
+                    keys = tuple(key for key, _choice_label in choices)
+                    render_state = _checklist_render_state(
+                        checklist_dict,
+                        checklist_lock,
+                        name,
+                        revision,
+                        keys,
+                        selected,
+                    )
+                    if render_state is None:
+                        continue
+                    frame_revision, selected = render_state
                     old_frame = checklist_frames.pop(name, None)
                     if old_frame is not None:
                         old_frame.destroy()
@@ -198,11 +298,9 @@ def _run_gui(
                     choices_container.pack(fill="x")
 
                     selected_keys = frozenset(selected)
-                    keys = tuple(key for key, _choice_label in choices)
                     variables = tuple(
                         tk.BooleanVar(value=key in selected_keys) for key in keys
                     )
-                    checklist_dict[name] = selected
                     if not choices:
                         tk.Label(
                             choices_container,
@@ -219,9 +317,11 @@ def _run_gui(
                             command=partial(
                                 _publish_checklist_selection,
                                 checklist_dict,
+                                checklist_lock,
                                 name,
-                                keys,
-                                variables,
+                                frame_revision,
+                                _key,
+                                variable,
                             ),
                         )
                         grid_row, grid_column = _checklist_grid_position(index)
@@ -264,6 +364,13 @@ def _run_gui(
                     root.destroy()
                     return
         root.after(100, poll_commands)
+
+    def poll_commands() -> None:
+        _run_gui_callback_fail_closed(
+            pause_flag,
+            root.destroy,
+            poll_commands_impl,
+        )
 
     pause_button.config(command=toggle_pause)
     # Losing the only interactive control surface must fail safe. The current
@@ -380,6 +487,8 @@ class ControlPanel(BaseControlPanel):
         self._toggle_dict = self._manager.dict()
         self._integer_dict = self._manager.dict()
         self._checklist_dict = self._manager.dict()
+        self._checklist_lock = self._manager.RLock()
+        self._checklist_observed_revisions: dict[str, int] = {}
         self._skill_dict = self._manager.dict()
         self._cmd_queue = self._manager.Queue()
         ready_event = self._manager.Event()
@@ -391,6 +500,7 @@ class ControlPanel(BaseControlPanel):
                 self._toggle_dict,
                 self._integer_dict,
                 self._checklist_dict,
+                self._checklist_lock,
                 self._skill_dict,
                 self._cmd_queue,
                 ready_event,
@@ -508,7 +618,28 @@ class ControlPanel(BaseControlPanel):
             selected,
             status,
         )
-        self._checklist_dict[name] = normalized_selected
+        keys = tuple(key for key, _choice_label in normalized_choices)
+        with self._checklist_lock:
+            current_state = self._checklist_dict.get(name)
+            if current_state is None:
+                revision = 1
+                effective_selected = normalized_selected
+            else:
+                current_revision, current_keys, current_selected = (
+                    _unpack_checklist_state(current_state)
+                )
+                revision = current_revision + 1
+                if self._checklist_observed_revisions.get(name) == current_revision:
+                    effective_selected = normalized_selected
+                else:
+                    effective_selected = _merge_checklist_replacement(
+                        current_keys,
+                        current_selected,
+                        keys,
+                        normalized_selected,
+                    )
+            self._checklist_dict[name] = (revision, keys, effective_selected)
+            self._checklist_observed_revisions[name] = revision
         self._cmd_queue.put(
             (
                 "set_checklist",
@@ -516,7 +647,8 @@ class ControlPanel(BaseControlPanel):
                     name,
                     label,
                     normalized_choices,
-                    normalized_selected,
+                    revision,
+                    effective_selected,
                     status,
                 ),
             )
@@ -526,7 +658,11 @@ class ControlPanel(BaseControlPanel):
     def get_checklist_selection(self, name: str) -> tuple[str, ...]:
         self._require_live_gui()
         try:
-            selected = tuple(self._checklist_dict[name])
+            with self._checklist_lock:
+                revision, _keys, selected = _unpack_checklist_state(
+                    self._checklist_dict[name]
+                )
+                self._checklist_observed_revisions[name] = revision
         except KeyError:
             raise KeyError(f"Unknown checklist control: {name}") from None
         self._require_live_gui()

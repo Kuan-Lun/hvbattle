@@ -1,16 +1,19 @@
 import asyncio
+import threading
 import unittest
 from unittest.mock import Mock
 
 from hvbattle import BaseControlPanel, ControlPanel, NullControlPanel
 from hvbattle.control_panel import (
     _checklist_grid_position,
+    _checklist_render_state,
     _close_gui,
     _commit_integer_control,
     _invoke_callback,
     _parse_integer,
     _publish_boolean,
     _publish_checklist_selection,
+    _run_gui_callback_fail_closed,
     _set_paused,
 )
 
@@ -21,6 +24,8 @@ def _control_panel_without_process_start(*, alive: bool = True) -> ControlPanel:
     panel._process = Mock()
     panel._process.is_alive.return_value = alive
     panel._pause_flag = Mock()
+    panel._checklist_lock = threading.RLock()
+    panel._checklist_observed_revisions = {}
     return panel
 
 
@@ -140,6 +145,7 @@ class ControlPanelStateTests(unittest.TestCase):
                         ("first", "First Challenge"),
                         ("second", "Second Challenge"),
                     ),
+                    1,
                     ("first", "second"),
                     "10 Tokens of Blood",
                 ),
@@ -171,11 +177,122 @@ class ControlPanelStateTests(unittest.TestCase):
             (("new", "New Challenge"), ("keep", "Kept Challenge")),
         )
 
+    def test_checklist_replacement_merges_click_after_last_observation(self) -> None:
+        panel = _control_panel_without_process_start()
+        panel._checklist_dict = {}
+        panel._cmd_queue = Mock()
+        panel.set_checklist(
+            "arena",
+            "The Arena",
+            (("old", "Old Challenge"), ("keep", "Kept Challenge")),
+            ("old", "keep"),
+        )
+        self.assertEqual(panel.get_checklist_selection("arena"), ("old", "keep"))
+
+        unchecked = Mock()
+        unchecked.get.return_value = False
+        _publish_checklist_selection(
+            panel._checklist_dict,
+            panel._checklist_lock,
+            "arena",
+            1,
+            "keep",
+            unchecked,
+        )
+        panel.set_checklist(
+            "arena",
+            "The Arena",
+            (("new", "New Challenge"), ("keep", "Kept Challenge")),
+            ("new", "keep"),
+        )
+
+        # The new row gets its proposed default, the live cancellation wins
+        # for the common row, and the removed old row cannot survive.
+        self.assertEqual(panel.get_checklist_selection("arena"), ("new",))
+
+    def test_old_frame_cancellation_after_replace_updates_render_state(self) -> None:
+        panel = _control_panel_without_process_start()
+        panel._checklist_dict = {}
+        panel._cmd_queue = Mock()
+        panel.set_checklist(
+            "arena",
+            "The Arena",
+            (("old", "Old Challenge"), ("keep", "Kept Challenge")),
+            ("old", "keep"),
+        )
+        self.assertEqual(panel.get_checklist_selection("arena"), ("old", "keep"))
+        panel.set_checklist(
+            "arena",
+            "The Arena",
+            (("new", "New Challenge"), ("keep", "Kept Challenge")),
+            ("new", "keep"),
+        )
+        _command, arguments = panel._cmd_queue.put.call_args.args[0]
+        name, _label, choices, command_revision, proposed, _status = arguments
+
+        unchecked = Mock()
+        unchecked.get.return_value = False
+        _publish_checklist_selection(
+            panel._checklist_dict,
+            panel._checklist_lock,
+            "arena",
+            1,
+            "keep",
+            unchecked,
+        )
+
+        keys = tuple(key for key, _choice_label in choices)
+        render_state = _checklist_render_state(
+            panel._checklist_dict,
+            panel._checklist_lock,
+            name,
+            command_revision,
+            keys,
+            proposed,
+        )
+        self.assertEqual(render_state, (3, ("new",)))
+        self.assertEqual(panel.get_checklist_selection("arena"), ("new",))
+
+    def test_old_frame_check_after_replace_preserves_new_default(self) -> None:
+        panel = _control_panel_without_process_start()
+        panel._checklist_dict = {}
+        panel._cmd_queue = Mock()
+        panel.set_checklist(
+            "ring",
+            "Ring of Blood",
+            (("old", "Old Challenge"), ("keep", "Kept Challenge")),
+        )
+        self.assertEqual(panel.get_checklist_selection("ring"), ())
+        panel.set_checklist(
+            "ring",
+            "Ring of Blood",
+            (("new", "New Challenge"), ("keep", "Kept Challenge")),
+            ("new",),
+        )
+
+        checked = Mock()
+        checked.get.return_value = True
+        _publish_checklist_selection(
+            panel._checklist_dict,
+            panel._checklist_lock,
+            "ring",
+            1,
+            "keep",
+            checked,
+        )
+
+        self.assertEqual(
+            panel.get_checklist_selection("ring"),
+            ("new", "keep"),
+        )
+        _revision, keys, _selected = panel._checklist_dict["ring"]
+        self.assertEqual(keys, ("new", "keep"))
+
     def test_checklist_reads_one_live_atomic_tuple(self) -> None:
         panel = _control_panel_without_process_start()
-        panel._checklist_dict = {"arena": ("low", "high")}
+        panel._checklist_dict = {"arena": (1, ("low", "high"), ("low", "high"))}
 
-        panel._checklist_dict["arena"] = ("high",)
+        panel._checklist_dict["arena"] = (2, ("low", "high"), ("high",))
 
         self.assertEqual(panel.get_checklist_selection("arena"), ("high",))
 
@@ -200,6 +317,7 @@ class ControlPanelStateTests(unittest.TestCase):
                     "arena",
                     "The Arena",
                     (),
+                    1,
                     (),
                     "No currently available challenges",
                 ),
@@ -246,7 +364,7 @@ class ControlPanelStateTests(unittest.TestCase):
         panel = _control_panel_without_process_start(alive=False)
         panel._toggle_dict = {"toggle": True}
         panel._integer_dict = {"integer": 7}
-        panel._checklist_dict = {"checklist": ("choice",)}
+        panel._checklist_dict = {"checklist": (1, ("choice",), ("choice",))}
         panel._skill_dict = {"skill": False}
 
         live_reads = (
@@ -375,23 +493,24 @@ class GuiCallbackTests(unittest.TestCase):
 
         self.assertFalse(shared["food"])
 
-    def test_checklist_callback_publishes_one_ordered_tuple(self) -> None:
-        shared = {"ring": ("first",)}
-        first = Mock()
-        second = Mock()
-        third = Mock()
-        first.get.return_value = False
-        second.get.return_value = True
-        third.get.return_value = True
+    def test_checklist_callback_merges_one_choice_in_shared_order(self) -> None:
+        shared = {"ring": (4, ("first", "second", "third"), ("first",))}
+        variable = Mock()
+        variable.get.return_value = True
 
         _publish_checklist_selection(
             shared,
+            threading.RLock(),
             "ring",
-            ("first", "second", "third"),
-            (first, second, third),
+            4,
+            "third",
+            variable,
         )
 
-        self.assertEqual(shared["ring"], ("second", "third"))
+        self.assertEqual(
+            shared["ring"],
+            (5, ("first", "second", "third"), ("first", "third")),
+        )
 
     def test_pause_state_updates_flag_and_button_together(self) -> None:
         pause_flag = Mock()
@@ -423,6 +542,34 @@ class GuiCallbackTests(unittest.TestCase):
         _close_gui(pause_flag, lambda: events.append("destroy"))
 
         self.assertEqual(events, ["pause", "destroy"])
+
+    def test_scheduled_callback_failure_pauses_and_destroys_gui(self) -> None:
+        events: list[str] = []
+        pause_flag = Mock()
+        pause_flag.set.side_effect = lambda: events.append("pause")
+
+        def fail() -> None:
+            events.append("callback")
+            raise RuntimeError("scheduled callback failed")
+
+        _run_gui_callback_fail_closed(
+            pause_flag,
+            lambda: events.append("destroy"),
+            fail,
+        )
+
+        self.assertEqual(events, ["callback", "pause", "destroy"])
+
+    def test_successful_scheduled_callback_keeps_gui_open(self) -> None:
+        pause_flag = Mock()
+        destroy = Mock()
+        callback = Mock()
+
+        _run_gui_callback_fail_closed(pause_flag, destroy, callback)
+
+        callback.assert_called_once_with()
+        pause_flag.set.assert_not_called()
+        destroy.assert_not_called()
 
 
 class NullControlPanelTests(unittest.TestCase):

@@ -138,6 +138,34 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         hentaiverse.realm.current.return_value = Realm.PERSISTENT
         self.assertFalse(await session.is_isekai)
 
+    async def test_attached_session_prepares_without_claiming_browser_lifecycle(
+        self,
+    ) -> None:
+        hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
+        session = BattleSession(
+            hentaiverse=hentaiverse,
+            auto_accept_dialogs=True,
+        )
+        session._setup_alert_handler = AsyncMock()
+
+        with (
+            patch.object(
+                session_module,
+                "preload_ponychart_classifier",
+            ) as preload,
+            patch.object(hentaiverse, "start", new=AsyncMock()) as start,
+            patch.object(hentaiverse, "__aexit__", new=AsyncMock()) as close,
+        ):
+            first = await session.prepare_attached()
+            second = await session.prepare_attached()
+
+        self.assertIs(first, session)
+        self.assertIs(second, session)
+        preload.assert_called_once_with()
+        session._setup_alert_handler.assert_awaited_once_with()
+        start.assert_not_awaited()
+        close.assert_not_awaited()
+
     async def test_ring_of_blood_operations_delegate_to_shared_launcher(self) -> None:
         hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
         session = BattleSession(hentaiverse=hentaiverse)

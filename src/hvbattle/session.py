@@ -95,6 +95,8 @@ class BattleSession:
         self.action_dialog_tracker = ActionDialogTracker()
         self._last_parser_warning_signature: tuple[int, tuple[str, ...]] | None = None
         self._last_reported_round_progress: tuple[int, int] | None = None
+        self._classifier_prepared = False
+        self._browser_hooks_initialized = False
         self.turn = -1
         self.round = -1
         self._initialize_battle_components()
@@ -150,11 +152,30 @@ class BattleSession:
         return await self.hentaiverse.realm.current() is Realm.ISEKAI
 
     async def __aenter__(self) -> Self:
-        await asyncio.to_thread(preload_ponychart_classifier)
+        await self._ensure_classifier()
         await self.hentaiverse.start(
             on_browser_ready=self._on_browser_ready,
         )
         return self
+
+    async def prepare_attached(self) -> Self:
+        """Prepare an injected, externally owned authenticated browser session.
+
+        This method installs BattleSession's browser hooks without starting,
+        authenticating, or later claiming ownership of the composed
+        :class:`HentaiVerseSession`.  It is intended for an account context
+        that already owns a fixed realm tab.
+        """
+
+        await self._ensure_classifier()
+        await self._on_browser_ready()
+        return self
+
+    async def _ensure_classifier(self) -> None:
+        if self._classifier_prepared:
+            return
+        await asyncio.to_thread(preload_ponychart_classifier)
+        self._classifier_prepared = True
 
     async def __aexit__(
         self,
@@ -165,8 +186,11 @@ class BattleSession:
         await self.hentaiverse.__aexit__(exc_type, exc_value, traceback)
 
     async def _on_browser_ready(self) -> None:
+        if self._browser_hooks_initialized:
+            return
         if self.auto_accept_dialogs:
             await self._setup_alert_handler()
+        self._browser_hooks_initialized = True
 
     def _initialize_battle_components(self) -> None:
         """Create battle adapters without parsing a non-battle login page."""

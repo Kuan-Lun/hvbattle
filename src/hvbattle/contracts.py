@@ -68,6 +68,60 @@ class BattleStopped:
     total_rounds: int
 
 
+@dataclass(frozen=True, slots=True)
+class BattleAbsent:
+    """No active battle was present when a cooperative runner was probed."""
+
+
+class BattleStepProgressKind(StrEnum):
+    """A safe cooperative yield boundary reached while a battle remains active."""
+
+    PONYCHART_RESOLVED = "ponychart-resolved"
+    TURN_ACTION_CONFIRMED = "turn-action-confirmed"
+    NEXT_FLOOR_CONFIRMED = "next-floor-confirmed"
+    RECOVERY_RECONCILED = "recovery-reconciled"
+
+
+@dataclass(frozen=True, slots=True)
+class BattleStepProgress:
+    """One confirmed progress boundary after which another actor may run safely.
+
+    ``is_isekai`` is unknown only when a PonyChart challenge was resolved before
+    the runner could inspect the battle realm.
+    """
+
+    kind: BattleStepProgressKind
+    is_isekai: bool | None
+    decision_count: int
+    current_round: int
+    total_rounds: int
+
+
+class BattleStepIdleReason(StrEnum):
+    """Why a cooperative runner yielded without changing server state."""
+
+    POLICY = "policy"
+    RETRYABLE_TIMEOUT = "retryable-timeout"
+    TRANSITION_CONFIRMATION = "transition-confirmation"
+
+
+@dataclass(frozen=True, slots=True)
+class BattleStepIdle:
+    """No mutation was made; retry this runner after the recommended delay."""
+
+    retry_after: float
+    reason: BattleStepIdleReason = BattleStepIdleReason.POLICY
+
+    def __post_init__(self) -> None:
+        if self.retry_after < 0:
+            raise ValueError("retry_after must not be negative")
+
+
+type BattleStepResult = (
+    BattleAbsent | BattleStepProgress | BattleStepIdle | BattleCompleted | BattleStopped
+)
+
+
 class BattleInterruptedError(RuntimeError):
     """The page left battle without positive completion evidence."""
 

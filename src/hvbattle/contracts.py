@@ -29,8 +29,8 @@ class RingOfBloodChallenge:
     """One Ring row, including rows that cannot currently be started."""
 
     challenge_name: str
-    exp_multiplier: float
-    entry_cost: int
+    exp_multiplier: float | None
+    entry_cost: int | None
     start_action: RingOfBloodOption | None = None
 
     def __post_init__(self) -> None:

@@ -31,7 +31,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             (option,),
             (
                 RingOfBloodChallenge("Konata", 1.0, 1, option),
-                RingOfBloodChallenge("Triple Trio and the Tree", 1.0, 10),
+                RingOfBloodChallenge("Triple Trio and the Tree", None, None),
             ),
         )
         payload: dict[str, object] = {
@@ -46,8 +46,8 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "onclick": None,
                     "challengeName": "Triple Trio and the Tree",
-                    "expText": "X1.0",
-                    "entryCostText": "10 Tokens",
+                    "expText": "",
+                    "entryCostText": "Completed",
                 },
             ],
         }
@@ -77,7 +77,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                 "Triple Trio and the Tree",
                 False,
                 None,
-                10,
+                None,
             ),
         ]
 
@@ -271,6 +271,36 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             launcher_logger.info.call_args_list,
             self._ring_inspection_calls(option),
         )
+
+    async def test_ring_inspection_rejection_logs_only_fixed_reason_code(self) -> None:
+        launcher, page = self._launcher()
+        secret = "secret-dom-detail"
+        page.evaluate = AsyncMock(
+            return_value={
+                "tokenText": "You have 20 tokens of blood.",
+                "rows": [
+                    {
+                        "onclick": "init_battle(105,1)",
+                        "challengeName": "Konata",
+                        "expText": secret,
+                        "entryCostText": "1 Token",
+                    }
+                ],
+            }
+        )
+
+        with (
+            patch("hvbattle.battle_launcher.logger") as launcher_logger,
+            self.assertRaisesRegex(RuntimeError, "EXP multiplier"),
+        ):
+            await launcher.inspect_ring_of_blood()
+
+        launcher_logger.warning.assert_called_once_with(
+            "Ring of Blood inspection rejected reason=%s row_index=%s",
+            "ring.exp-invalid",
+            0,
+        )
+        self.assertNotIn(secret, repr(launcher_logger.method_calls))
         logged = repr(launcher_logger.method_calls)
         self.assertNotIn("init_battle", logged)
         self.assertNotIn("tokenText", logged)

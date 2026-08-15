@@ -1426,8 +1426,8 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "onclick": None,
                         "challengeName": "Triple Trio and the Tree",
-                        "expText": "X2.5",
-                        "entryCostText": "10 Tokens",
+                        "expText": "",
+                        "entryCostText": "Completed",
                     },
                 ]
             )
@@ -1449,14 +1449,16 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     RingOfBloodChallenge(
                         "Triple Trio and the Tree",
-                        2.5,
-                        10,
+                        None,
+                        None,
                     ),
                 ),
             ),
         )
         self.assertTrue(snapshot.challenges[0].startable)
         self.assertFalse(snapshot.challenges[1].startable)
+        self.assertIsNone(snapshot.challenges[1].exp_multiplier)
+        self.assertIsNone(snapshot.challenges[1].entry_cost)
         self.assertIsNone(snapshot.challenges[1].start_action)
         inspection_script = page.evaluate.await_args.args[0]
         self.assertIn("rows.slice(1).flatMap", inspection_script)
@@ -1512,6 +1514,30 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 with self.assertRaisesRegex(RuntimeError, "action is malformed"):
+                    await launcher.inspect_ring_of_blood()
+
+    async def test_snapshot_rejects_missing_metadata_for_present_action(self) -> None:
+        cases = (
+            ("", "10 Tokens", "EXP multiplier"),
+            ("X1.0", "Completed", "entry cost"),
+        )
+        for exp_text, entry_cost_text, expected_error in cases:
+            with self.subTest(expected_error=expected_error):
+                launcher, page = self._launcher()
+                page.evaluate = AsyncMock(
+                    return_value=self._payload(
+                        rows=[
+                            {
+                                "onclick": "init_battle(112,10)",
+                                "challengeName": "Triple Trio and the Tree",
+                                "expText": exp_text,
+                                "entryCostText": entry_cost_text,
+                            }
+                        ]
+                    )
+                )
+
+                with self.assertRaisesRegex(RuntimeError, expected_error):
                     await launcher.inspect_ring_of_blood()
 
     async def test_snapshot_rejects_inconsistent_entry_cost(self) -> None:

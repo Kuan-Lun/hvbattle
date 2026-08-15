@@ -140,7 +140,8 @@ option explicitly selected by the caller.
 challenge, including rows without a current start action, together with EXP
 modifiers, entry costs, and the live Tokens of Blood balance. The snapshot's
 `options` tuple contains only submit-capable actions, while `challenges` keeps
-the complete row list. `start_ring_of_blood(option, expected_before=snapshot)`
+the complete row list; unavailable rows use `None` when EXP or entry-cost
+metadata is not exposed. `start_ring_of_blood(option, expected_before=snapshot)`
 revalidates the page and sanitized snapshot before submitting the existing
 form. It returns a typed submitted, insufficient-tokens, unavailable, or
 state-changed outcome; it never chooses a challenge or reads hidden form

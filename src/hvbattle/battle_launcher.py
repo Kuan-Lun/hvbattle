@@ -64,6 +64,30 @@ def _parse_ring_integer(pattern: re.Pattern[str], value: Any, *, field: str) -> 
     return int(match.group(1).replace(",", ""))
 
 
+def _parse_optional_ring_integer(
+    pattern: re.Pattern[str],
+    value: Any,
+) -> int | None:
+    if not isinstance(value, str):
+        return None
+    match = pattern.search(value)
+    return int(match.group(1).replace(",", "")) if match is not None else None
+
+
+def _ring_inspection_error(
+    reason_code: str,
+    message: str,
+    *,
+    row_index: int | None = None,
+) -> RuntimeError:
+    logger.warning(
+        "Ring of Blood inspection rejected reason=%s row_index=%s",
+        reason_code,
+        row_index,
+    )
+    return RuntimeError(message)
+
+
 class BattleLauncher:
     """List and submit battle choices without owning selection policy."""
 
@@ -207,11 +231,7 @@ class BattleLauncher:
                         const cells = Array.from(row.children).filter(
                             (cell) => cell.tagName === 'TD'
                         );
-                        if (
-                            !cells[challengeIndex]
-                            || !cells[expIndex]
-                            || !cells[entryCostIndex]
-                        ) return [];
+                        if (!cells[challengeIndex]) return [];
                         return [{
                             onclick: action
                                 ? (action.getAttribute('onclick') || '')
@@ -229,43 +249,90 @@ class BattleLauncher:
             })()
             """)
         if not isinstance(payload, dict):
-            raise RuntimeError("Ring of Blood page did not expose expected structure")
+            raise _ring_inspection_error(
+                "ring.structure-invalid",
+                "Ring of Blood page did not expose expected structure",
+            )
         rows = payload.get("rows")
         if not isinstance(rows, list):
-            raise RuntimeError("Ring of Blood challenge columns are missing")
-        tokens_of_blood = _parse_ring_integer(
-            _RING_OF_BLOOD_BALANCE_PATTERN,
-            payload.get("tokenText"),
-            field="token balance",
-        )
+            raise _ring_inspection_error(
+                "ring.columns-missing",
+                "Ring of Blood challenge columns are missing",
+            )
+        try:
+            tokens_of_blood = _parse_ring_integer(
+                _RING_OF_BLOOD_BALANCE_PATTERN,
+                payload.get("tokenText"),
+                field="token balance",
+            )
+        except RuntimeError:
+            raise _ring_inspection_error(
+                "ring.token-invalid",
+                "Unable to parse Ring of Blood token balance",
+            ) from None
         options: list[RingOfBloodOption] = []
         challenges: list[RingOfBloodChallenge] = []
-        for row in rows:
+        for row_index, row in enumerate(rows):
             if not isinstance(row, dict):
-                raise RuntimeError("Ring of Blood challenge row is malformed")
+                raise _ring_inspection_error(
+                    "ring.row-invalid",
+                    "Ring of Blood challenge row is malformed",
+                    row_index=row_index,
+                )
             challenge_name = row.get("challengeName")
             if not isinstance(challenge_name, str) or not challenge_name.strip():
-                raise RuntimeError("Ring of Blood challenge name is missing")
-            exp_multiplier = _parse_optional_exp_multiplier(row.get("expText"))
-            if exp_multiplier is None:
-                raise RuntimeError("Unable to parse Ring of Blood EXP multiplier")
-            entry_cost = _parse_ring_integer(
-                _TOKEN_COST_PATTERN,
-                row.get("entryCostText"),
-                field="entry cost",
-            )
+                raise _ring_inspection_error(
+                    "ring.challenge-name-missing",
+                    "Ring of Blood challenge name is missing",
+                    row_index=row_index,
+                )
             onclick = row.get("onclick")
             option: RingOfBloodOption | None = None
-            if onclick is not None:
+            if onclick is None:
+                exp_multiplier = _parse_optional_exp_multiplier(row.get("expText"))
+                entry_cost = _parse_optional_ring_integer(
+                    _TOKEN_COST_PATTERN,
+                    row.get("entryCostText"),
+                )
+            else:
                 if not isinstance(onclick, str):
-                    raise RuntimeError("Ring of Blood challenge action is malformed")
+                    raise _ring_inspection_error(
+                        "ring.action-invalid",
+                        "Ring of Blood challenge action is malformed",
+                        row_index=row_index,
+                    )
                 action_match = _RING_OF_BLOOD_ACTION_PATTERN.fullmatch(onclick.strip())
                 if action_match is None:
-                    raise RuntimeError("Ring of Blood challenge action is malformed")
+                    raise _ring_inspection_error(
+                        "ring.action-invalid",
+                        "Ring of Blood challenge action is malformed",
+                        row_index=row_index,
+                    )
+                exp_multiplier = _parse_optional_exp_multiplier(row.get("expText"))
+                if exp_multiplier is None:
+                    raise _ring_inspection_error(
+                        "ring.exp-invalid",
+                        "Unable to parse Ring of Blood EXP multiplier",
+                        row_index=row_index,
+                    )
+                try:
+                    entry_cost = _parse_ring_integer(
+                        _TOKEN_COST_PATTERN,
+                        row.get("entryCostText"),
+                        field="entry cost",
+                    )
+                except RuntimeError:
+                    raise _ring_inspection_error(
+                        "ring.entry-cost-invalid",
+                        "Unable to parse Ring of Blood entry cost",
+                        row_index=row_index,
+                    ) from None
                 action_cost = int(action_match.group(2))
                 if action_cost != entry_cost:
-                    raise RuntimeError(
-                        "Ring of Blood challenge entry cost is inconsistent"
+                    raise _ring_inspection_error(
+                        "ring.entry-cost-mismatch",
+                        "Ring of Blood challenge entry cost is inconsistent",
+                        row_index=row_index,
                     )
                 option = RingOfBloodOption(
                     battle_id=int(action_match.group(1)),

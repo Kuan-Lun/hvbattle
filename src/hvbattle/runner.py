@@ -394,21 +394,29 @@ class BattleRunner:
 
         self._completed = result
         realm = "Isekai" if result.is_isekai else "Persistent"
+        log_extra = {
+            "activity": "Battle",
+            "realm": realm,
+            "tab_role": realm.casefold(),
+        }
         if result.final_round > 0 and result.total_rounds > 0:
             logger.info(
-                "Battle complete: realm=%s decisions=%d round=%d/%d",
-                realm,
+                "Completed after %d decisions (round %d/%d)",
                 result.decision_count,
                 result.final_round,
                 result.total_rounds,
+                extra=log_extra,
             )
         else:
             logger.info(
-                "Battle complete: realm=%s decisions=%d round=unknown; "
-                "the positive completion control appeared before round "
-                "metadata became available",
-                realm,
+                "Completed after %d decisions; round data was unavailable",
                 result.decision_count,
+                extra=log_extra,
+            )
+            logger.debug(
+                "The positive completion control appeared before round metadata "
+                "became available",
+                extra=log_extra,
             )
         return result
 

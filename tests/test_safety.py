@@ -194,8 +194,11 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
             await BattleSession.prepare_turn(session)
 
         output = "\n".join(captured.output)
-        self.assertEqual(output.count("Battle progress: Round   ? / ?"), 1)
-        self.assertEqual(output.count("Battle progress: Round   2 / 10"), 1)
+        self.assertEqual(
+            output.count("Battle detected; round data is not available yet"),
+            1,
+        )
+        self.assertEqual(output.count("Round 2/10"), 1)
         self.assertNotIn("You hit a monster.", output)
         self.assertNotIn("Round   0 / 0", output)
 
@@ -229,8 +232,18 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             info.call_args_list,
             [
-                call("Battle progress: %s", "Round   2 / 10"),
-                call("Battle progress: %s", "Round   3 / 10"),
+                call(
+                    "Round %d/%d",
+                    2,
+                    10,
+                    extra={"activity": "Battle"},
+                ),
+                call(
+                    "Round %d/%d",
+                    3,
+                    10,
+                    extra={"activity": "Battle"},
+                ),
             ],
         )
         self.assertEqual(
@@ -864,7 +877,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(result, BattleCompleted)
         output = "\n".join(captured.output)
-        self.assertIn("round=unknown", output)
+        self.assertIn("round data was unavailable", output)
         self.assertNotIn("final_round=0", output)
 
     async def test_ponychart_runs_before_optional_strategy_lifecycle(self) -> None:
@@ -1078,11 +1091,15 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, BattleCompleted(False, 0, 1, 1))
         runner_logger.info.assert_called_once_with(
-            "Battle complete: realm=%s decisions=%d round=%d/%d",
-            "Persistent",
+            "Completed after %d decisions (round %d/%d)",
             0,
             1,
             1,
+            extra={
+                "activity": "Battle",
+                "realm": "Persistent",
+                "tab_role": "persistent",
+            },
         )
         strategy.take_turn.assert_not_awaited()
         session.acknowledge_battle_completion.assert_awaited_once_with(

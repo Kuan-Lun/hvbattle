@@ -349,7 +349,7 @@ class BattleLauncher:
                     start_action=option,
                 )
             )
-        logger.info(
+        logger.debug(
             "Ring of Blood inspection complete tokens=%s challenges=%s "
             "start_actions=%s",
             tokens_of_blood,
@@ -358,7 +358,7 @@ class BattleLauncher:
         )
         for challenge in challenges:
             option = challenge.start_action
-            logger.info(
+            logger.debug(
                 "Ring of Blood challenge observed challenge=%r startable=%s "
                 "id=%s entry_cost=%s",
                 challenge.challenge_name,
@@ -387,7 +387,7 @@ class BattleLauncher:
         ring_url = f"{HENTAIVERSE_ROOT_URL}{await self._path_prefix()}/?s=Battle&ss=rb"
         current_url = await self.page.evaluate("window.location.href")
         if current_url != ring_url:
-            logger.info(
+            logger.debug(
                 "Ring of Blood pre-submit check id=%s reason=unexpected-page",
                 option.battle_id,
             )
@@ -399,7 +399,7 @@ class BattleLauncher:
             for current_option in current.options
         }
         current_option = current_by_id.get(option.battle_id)
-        logger.info(
+        logger.debug(
             "Ring of Blood pre-submit check id=%s action_present=%s "
             "snapshot_matches=%s required=%s available=%s",
             option.battle_id,
@@ -409,19 +409,19 @@ class BattleLauncher:
             current.tokens_of_blood,
         )
         if current_option is None:
-            logger.info(
+            logger.debug(
                 "Ring of Blood option is unavailable id=%s",
                 option.battle_id,
             )
             return RingOfBloodStartOutcome.OPTION_UNAVAILABLE
         if current_option != option or current != expected_before:
-            logger.info(
+            logger.debug(
                 "Ring of Blood state changed before submission id=%s",
                 option.battle_id,
             )
             return RingOfBloodStartOutcome.STATE_CHANGED
         if current.tokens_of_blood < current_option.entry_cost:
-            logger.info(
+            logger.debug(
                 "Ring of Blood tokens are insufficient id=%s required=%s available=%s",
                 option.battle_id,
                 current_option.entry_cost,
@@ -476,7 +476,7 @@ class BattleLauncher:
             and atomic_result in _RING_OF_BLOOD_ATOMIC_RESULTS
             else "unexpected-result"
         )
-        logger.info(
+        logger.debug(
             "Ring of Blood atomic submission check id=%s result=%s",
             option.battle_id,
             result,
@@ -489,7 +489,7 @@ class BattleLauncher:
             )
             return RingOfBloodStartOutcome.OPTION_UNAVAILABLE
 
-        logger.info("Submitted Ring of Blood battle form id=%s", option.battle_id)
+        logger.debug("Submitted Ring of Blood battle form id=%s", option.battle_id)
         return RingOfBloodStartOutcome.SUBMITTED
 
     async def start_arena(self, option: ArenaOption) -> bool:

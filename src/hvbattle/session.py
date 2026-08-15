@@ -430,7 +430,18 @@ class BattleSession:
         turn_text = f"Turn {self.turn:>5}"
         round_text = self._round_progress_text()
         if progress_key != getattr(self, "_last_reported_round_progress", None):
-            logger.info("Battle progress: %s", round_text.rstrip())
+            if progress_key == (0, 0):
+                logger.info(
+                    "Battle detected; round data is not available yet",
+                    extra={"activity": "Battle"},
+                )
+            else:
+                logger.info(
+                    "Round %d/%d",
+                    current_round,
+                    total_rounds,
+                    extra={"activity": "Battle"},
+                )
             self._last_reported_round_progress = progress_key
         lines = tuple(
             f"{turn_text} {round_text} {line}"

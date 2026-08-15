@@ -249,11 +249,11 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
-        launcher_logger.info.assert_called_once_with(
+        launcher_logger.debug.assert_called_once_with(
             "Ring of Blood pre-submit check id=%s reason=unexpected-page",
             option.battle_id,
         )
-        launcher_logger.debug.assert_not_called()
+        launcher_logger.info.assert_not_called()
         launcher_logger.warning.assert_not_called()
         self.assertNotIn(expected_url, repr(launcher_logger.method_calls))
         self.assertNotIn(secret, repr(launcher_logger.method_calls))
@@ -268,9 +268,10 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(inspected, snapshot)
         self.assertEqual(
-            launcher_logger.info.call_args_list,
+            launcher_logger.debug.call_args_list,
             self._ring_inspection_calls(option),
         )
+        launcher_logger.info.assert_not_called()
 
     async def test_ring_inspection_rejection_logs_only_fixed_reason_code(self) -> None:
         launcher, page = self._launcher()
@@ -324,7 +325,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(outcome, RingOfBloodStartOutcome.SUBMITTED)
         self.assertEqual(
-            launcher_logger.info.call_args_list,
+            launcher_logger.debug.call_args_list,
             [
                 *self._ring_inspection_calls(option),
                 call(
@@ -347,6 +348,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ],
         )
+        launcher_logger.info.assert_not_called()
         launcher_logger.warning.assert_not_called()
 
     async def test_ring_precheck_logs_when_target_action_disappears(self) -> None:
@@ -367,7 +369,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
-        launcher_logger.info.assert_any_call(
+        launcher_logger.debug.assert_any_call(
             "Ring of Blood pre-submit check id=%s action_present=%s "
             "snapshot_matches=%s required=%s available=%s",
             option.battle_id,
@@ -376,7 +378,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             option.entry_cost,
             snapshot.tokens_of_blood,
         )
-        launcher_logger.info.assert_any_call(
+        launcher_logger.debug.assert_any_call(
             "Ring of Blood option is unavailable id=%s",
             option.battle_id,
         )
@@ -426,7 +428,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                     outcome,
                     RingOfBloodStartOutcome.OPTION_UNAVAILABLE,
                 )
-                launcher_logger.info.assert_any_call(
+                launcher_logger.debug.assert_any_call(
                     "Ring of Blood atomic submission check id=%s result=%s",
                     option.battle_id,
                     expected_reason,
@@ -474,7 +476,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         )
         launcher_logger.exception.assert_not_called()
         self.assertEqual(
-            launcher_logger.info.call_args_list,
+            launcher_logger.debug.call_args_list,
             [
                 *self._ring_inspection_calls(option),
                 call(
@@ -488,6 +490,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ],
         )
+        launcher_logger.info.assert_not_called()
         self.assertNotIn(secret_detail, repr(launcher_logger.method_calls))
 
 

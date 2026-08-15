@@ -16,7 +16,7 @@ class ArenaOption:
 
 @dataclass(frozen=True, slots=True)
 class RingOfBloodOption:
-    """One currently startable Ring of Blood challenge."""
+    """One currently submit-capable Ring of Blood action."""
 
     battle_id: int
     challenge_name: str
@@ -25,11 +25,58 @@ class RingOfBloodOption:
 
 
 @dataclass(frozen=True, slots=True)
+class RingOfBloodChallenge:
+    """One Ring row, including rows that cannot currently be started."""
+
+    challenge_name: str
+    exp_multiplier: float
+    entry_cost: int
+    start_action: RingOfBloodOption | None = None
+
+    def __post_init__(self) -> None:
+        action = self.start_action
+        if action is not None and (
+            action.challenge_name != self.challenge_name
+            or action.exp_multiplier != self.exp_multiplier
+            or action.entry_cost != self.entry_cost
+        ):
+            raise ValueError("Ring start action metadata must match its challenge")
+
+    @property
+    def startable(self) -> bool:
+        """Whether the server exposed a submit action for this challenge."""
+
+        return self.start_action is not None
+
+
+@dataclass(frozen=True, slots=True)
 class RingOfBloodSnapshot:
-    """Read-only Ring of Blood choices and the current token balance."""
+    """Read-only Ring rows, submit actions, and current token balance."""
 
     tokens_of_blood: int
     options: tuple[RingOfBloodOption, ...]
+    challenges: tuple[RingOfBloodChallenge, ...] = ()
+
+    def __post_init__(self) -> None:
+        challenges = self.challenges
+        if not challenges:
+            challenges = tuple(
+                RingOfBloodChallenge(
+                    option.challenge_name,
+                    option.exp_multiplier,
+                    option.entry_cost,
+                    option,
+                )
+                for option in self.options
+            )
+            object.__setattr__(self, "challenges", challenges)
+        derived_options = tuple(
+            challenge.start_action
+            for challenge in challenges
+            if challenge.start_action is not None
+        )
+        if derived_options != self.options:
+            raise ValueError("Ring snapshot options must match challenge start actions")
 
 
 class RingOfBloodStartOutcome(StrEnum):

@@ -33,6 +33,7 @@ class PublicApiTests(unittest.TestCase):
         self.assertTrue(hasattr(hvbattle, "TurnDecision"))
         self.assertTrue(hasattr(hvbattle, "ArenaOption"))
         self.assertTrue(hasattr(hvbattle, "GrindfestOption"))
+        self.assertTrue(hasattr(hvbattle, "RingOfBloodChallenge"))
         self.assertTrue(hasattr(hvbattle, "RingOfBloodOption"))
         self.assertTrue(hasattr(hvbattle, "RingOfBloodSnapshot"))
         self.assertTrue(hasattr(hvbattle, "RingOfBloodStartOutcome"))

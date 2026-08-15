@@ -10,6 +10,7 @@ from hvbrowser.runtime import setup_logger
 from .contracts import (
     ArenaOption,
     GrindfestOption,
+    RingOfBloodChallenge,
     RingOfBloodOption,
     RingOfBloodSnapshot,
     RingOfBloodStartOutcome,
@@ -175,7 +176,7 @@ class BattleLauncher:
         return tuple(options)
 
     async def inspect_ring_of_blood(self) -> RingOfBloodSnapshot:
-        """Inspect available Ring challenges and tokens without selecting one."""
+        """Inspect every listed Ring challenge and tokens without selecting one."""
         payload = await self.page.evaluate(r"""
             (() => {
                 const table = document.getElementById('arena_list');
@@ -203,12 +204,18 @@ class BattleLauncher:
                         const action = row.querySelector(
                             'img[onclick*="init_battle"]'
                         );
-                        if (!action) return [];
                         const cells = Array.from(row.children).filter(
                             (cell) => cell.tagName === 'TD'
                         );
+                        if (
+                            !cells[challengeIndex]
+                            || !cells[expIndex]
+                            || !cells[entryCostIndex]
+                        ) return [];
                         return [{
-                            onclick: action.getAttribute('onclick') || '',
+                            onclick: action
+                                ? (action.getAttribute('onclick') || '')
+                                : null,
                             challengeName: normalize(
                                 cells[challengeIndex]?.textContent
                             ),
@@ -232,6 +239,7 @@ class BattleLauncher:
             field="token balance",
         )
         options: list[RingOfBloodOption] = []
+        challenges: list[RingOfBloodChallenge] = []
         for row in rows:
             if not isinstance(row, dict):
                 raise RuntimeError("Ring of Blood challenge row is malformed")
@@ -247,35 +255,55 @@ class BattleLauncher:
                 field="entry cost",
             )
             onclick = row.get("onclick")
-            if not isinstance(onclick, str):
-                raise RuntimeError("Ring of Blood challenge action is missing")
-            action_match = _RING_OF_BLOOD_ACTION_PATTERN.fullmatch(onclick.strip())
-            if action_match is None:
-                raise RuntimeError("Ring of Blood challenge action is malformed")
-            action_cost = int(action_match.group(2))
-            if action_cost != entry_cost:
-                raise RuntimeError("Ring of Blood challenge entry cost is inconsistent")
-            options.append(
-                RingOfBloodOption(
+            option: RingOfBloodOption | None = None
+            if onclick is not None:
+                if not isinstance(onclick, str):
+                    raise RuntimeError("Ring of Blood challenge action is malformed")
+                action_match = _RING_OF_BLOOD_ACTION_PATTERN.fullmatch(onclick.strip())
+                if action_match is None:
+                    raise RuntimeError("Ring of Blood challenge action is malformed")
+                action_cost = int(action_match.group(2))
+                if action_cost != entry_cost:
+                    raise RuntimeError(
+                        "Ring of Blood challenge entry cost is inconsistent"
+                    )
+                option = RingOfBloodOption(
                     battle_id=int(action_match.group(1)),
                     challenge_name=challenge_name.strip(),
                     exp_multiplier=exp_multiplier,
                     entry_cost=entry_cost,
                 )
+                options.append(option)
+            challenges.append(
+                RingOfBloodChallenge(
+                    challenge_name=challenge_name.strip(),
+                    exp_multiplier=exp_multiplier,
+                    entry_cost=entry_cost,
+                    start_action=option,
+                )
             )
         logger.info(
-            "Ring of Blood inspection complete tokens=%s start_actions=%s",
+            "Ring of Blood inspection complete tokens=%s challenges=%s "
+            "start_actions=%s",
             tokens_of_blood,
+            len(challenges),
             len(options),
         )
-        for option in options:
+        for challenge in challenges:
+            option = challenge.start_action
             logger.info(
-                "Ring of Blood start action found challenge=%r id=%s entry_cost=%s",
-                option.challenge_name,
-                option.battle_id,
-                option.entry_cost,
+                "Ring of Blood challenge observed challenge=%r startable=%s "
+                "id=%s entry_cost=%s",
+                challenge.challenge_name,
+                challenge.startable,
+                None if option is None else option.battle_id,
+                challenge.entry_cost,
             )
-        return RingOfBloodSnapshot(tokens_of_blood, tuple(options))
+        return RingOfBloodSnapshot(
+            tokens_of_blood,
+            tuple(options),
+            tuple(challenges),
+        )
 
     async def start_ring_of_blood(
         self,

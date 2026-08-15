@@ -136,9 +136,11 @@ post-battle tasks, and next-battle selection after the returned
 `BattleCompleted`. Arena choice follows the same boundary:
 `list_arena_options()` returns data and `start_arena(option)` starts only the
 option explicitly selected by the caller.
-`goto_ring_of_blood()` and `inspect_ring_of_blood()` expose the currently
-startable named challenges, EXP modifiers, entry costs, and live Tokens of
-Blood balance. `start_ring_of_blood(option, expected_before=snapshot)`
+`goto_ring_of_blood()` and `inspect_ring_of_blood()` expose every listed named
+challenge, including rows without a current start action, together with EXP
+modifiers, entry costs, and the live Tokens of Blood balance. The snapshot's
+`options` tuple contains only submit-capable actions, while `challenges` keeps
+the complete row list. `start_ring_of_blood(option, expected_before=snapshot)`
 revalidates the page and sanitized snapshot before submitting the existing
 form. It returns a typed submitted, insufficient-tokens, unavailable, or
 state-changed outcome; it never chooses a challenge or reads hidden form

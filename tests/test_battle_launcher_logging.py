@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 from hvbattle import (
     ArenaOption,
     GrindfestOption,
+    RingOfBloodChallenge,
     RingOfBloodOption,
     RingOfBloodSnapshot,
     RingOfBloodStartOutcome,
@@ -24,20 +25,61 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
     def _ring_values() -> (
         tuple[RingOfBloodOption, RingOfBloodSnapshot, dict[str, object]]
     ):
-        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
-        snapshot = RingOfBloodSnapshot(20, (option,))
+        option = RingOfBloodOption(105, "Konata", 1.0, 1)
+        snapshot = RingOfBloodSnapshot(
+            20,
+            (option,),
+            (
+                RingOfBloodChallenge("Konata", 1.0, 1, option),
+                RingOfBloodChallenge("Triple Trio and the Tree", 1.0, 10),
+            ),
+        )
         payload: dict[str, object] = {
             "tokenText": "You have 20 tokens of blood.",
             "rows": [
                 {
-                    "onclick": "init_battle(112,10)",
+                    "onclick": "init_battle(105,1)",
+                    "challengeName": "Konata",
+                    "expText": "X1.0",
+                    "entryCostText": "1 Token",
+                },
+                {
+                    "onclick": None,
                     "challengeName": "Triple Trio and the Tree",
                     "expText": "X1.0",
                     "entryCostText": "10 Tokens",
-                }
+                },
             ],
         }
         return option, snapshot, payload
+
+    @staticmethod
+    def _ring_inspection_calls(option: RingOfBloodOption) -> list[object]:
+        return [
+            call(
+                "Ring of Blood inspection complete tokens=%s challenges=%s "
+                "start_actions=%s",
+                20,
+                2,
+                1,
+            ),
+            call(
+                "Ring of Blood challenge observed challenge=%r startable=%s "
+                "id=%s entry_cost=%s",
+                option.challenge_name,
+                True,
+                option.battle_id,
+                option.entry_cost,
+            ),
+            call(
+                "Ring of Blood challenge observed challenge=%r startable=%s "
+                "id=%s entry_cost=%s",
+                "Triple Trio and the Tree",
+                False,
+                None,
+                10,
+            ),
+        ]
 
     async def test_wrong_page_logs_expected_and_current_at_debug(self) -> None:
         cases = (
@@ -216,7 +258,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(expected_url, repr(launcher_logger.method_calls))
         self.assertNotIn(secret, repr(launcher_logger.method_calls))
 
-    async def test_ring_inspection_logs_only_parsed_start_action_details(self) -> None:
+    async def test_ring_inspection_logs_all_parsed_challenge_details(self) -> None:
         launcher, page = self._launcher()
         option, snapshot, payload = self._ring_values()
         page.evaluate = AsyncMock(return_value=payload)
@@ -227,20 +269,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inspected, snapshot)
         self.assertEqual(
             launcher_logger.info.call_args_list,
-            [
-                call(
-                    "Ring of Blood inspection complete tokens=%s start_actions=%s",
-                    20,
-                    1,
-                ),
-                call(
-                    "Ring of Blood start action found "
-                    "challenge=%r id=%s entry_cost=%s",
-                    option.challenge_name,
-                    option.battle_id,
-                    option.entry_cost,
-                ),
-            ],
+            self._ring_inspection_calls(option),
         )
         logged = repr(launcher_logger.method_calls)
         self.assertNotIn("init_battle", logged)
@@ -267,18 +296,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             launcher_logger.info.call_args_list,
             [
-                call(
-                    "Ring of Blood inspection complete tokens=%s start_actions=%s",
-                    20,
-                    1,
-                ),
-                call(
-                    "Ring of Blood start action found "
-                    "challenge=%r id=%s entry_cost=%s",
-                    option.challenge_name,
-                    option.battle_id,
-                    option.entry_cost,
-                ),
+                *self._ring_inspection_calls(option),
                 call(
                     "Ring of Blood pre-submit check id=%s action_present=%s "
                     "snapshot_matches=%s required=%s available=%s",
@@ -428,18 +446,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             launcher_logger.info.call_args_list,
             [
-                call(
-                    "Ring of Blood inspection complete tokens=%s start_actions=%s",
-                    20,
-                    1,
-                ),
-                call(
-                    "Ring of Blood start action found "
-                    "challenge=%r id=%s entry_cost=%s",
-                    option.challenge_name,
-                    option.battle_id,
-                    option.entry_cost,
-                ),
+                *self._ring_inspection_calls(option),
                 call(
                     "Ring of Blood pre-submit check id=%s action_present=%s "
                     "snapshot_matches=%s required=%s available=%s",

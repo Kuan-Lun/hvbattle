@@ -29,6 +29,7 @@ from hvbattle import (
     BattleTurnState,
     GrindfestOption,
     PonyChartResolutionError,
+    RingOfBloodChallenge,
     RingOfBloodOption,
     RingOfBloodSnapshot,
     RingOfBloodStartOutcome,
@@ -1410,8 +1411,9 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
             ]
         return {"tokenText": tokens, "rows": rows}
 
-    async def test_snapshot_parses_balance_and_available_options(self) -> None:
+    async def test_snapshot_keeps_rows_without_start_actions(self) -> None:
         launcher, page = self._launcher()
+        option = RingOfBloodOption(105, "Konata", 1.0, 1)
         page.evaluate = AsyncMock(
             return_value=self._payload(
                 rows=[
@@ -1422,7 +1424,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
                         "entryCostText": "1 Token",
                     },
                     {
-                        "onclick": "init_battle(112,10)",
+                        "onclick": None,
                         "challengeName": "Triple Trio and the Tree",
                         "expText": "X2.5",
                         "entryCostText": "10 Tokens",
@@ -1437,10 +1439,15 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
             snapshot,
             RingOfBloodSnapshot(
                 1_234,
+                (option,),
                 (
-                    RingOfBloodOption(105, "Konata", 1.0, 1),
-                    RingOfBloodOption(
-                        112,
+                    RingOfBloodChallenge(
+                        "Konata",
+                        1.0,
+                        1,
+                        option,
+                    ),
+                    RingOfBloodChallenge(
                         "Triple Trio and the Tree",
                         2.5,
                         10,
@@ -1448,7 +1455,13 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
         )
+        self.assertTrue(snapshot.challenges[0].startable)
+        self.assertFalse(snapshot.challenges[1].startable)
+        self.assertIsNone(snapshot.challenges[1].start_action)
         inspection_script = page.evaluate.await_args.args[0]
+        self.assertIn("rows.slice(1).flatMap", inspection_script)
+        self.assertIn("!cells[challengeIndex]", inspection_script)
+        self.assertNotIn("if (!action) return []", inspection_script)
         self.assertNotIn("postoken", inspection_script.casefold())
 
     async def test_snapshot_keeps_unaffordable_option_for_client_policy(self) -> None:
@@ -1474,6 +1487,31 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
                 page.evaluate = AsyncMock(return_value=payload)
 
                 with self.assertRaises(RuntimeError):
+                    await launcher.inspect_ring_of_blood()
+
+    async def test_snapshot_rejects_malformed_present_action(self) -> None:
+        malformed_actions: tuple[object, ...] = (
+            "",
+            "init_battle(not-valid)",
+            112,
+        )
+        for onclick in malformed_actions:
+            with self.subTest(onclick=onclick):
+                launcher, page = self._launcher()
+                page.evaluate = AsyncMock(
+                    return_value=self._payload(
+                        rows=[
+                            {
+                                "onclick": onclick,
+                                "challengeName": "Triple Trio and the Tree",
+                                "expText": "X1.0",
+                                "entryCostText": "10 Tokens",
+                            }
+                        ]
+                    )
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "action is malformed"):
                     await launcher.inspect_ring_of_blood()
 
     async def test_snapshot_rejects_inconsistent_entry_cost(self) -> None:

@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from hvbattle import (
     BattleActionKind,
@@ -625,6 +625,11 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         )
         navigated = _action_state(document_id="document-after", monitor=None)
         reads = 0
+        now = 10.0
+
+        async def slow_click(_element: object) -> None:
+            nonlocal now
+            now = 20.0
 
         async def read_state(
             _action_id: str,
@@ -632,7 +637,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
             arm_monitor: bool = False,
             probe_timeout: float = 3,
         ) -> _BattleActionState:
-            nonlocal reads
+            nonlocal now, reads
             del probe_timeout
             reads += 1
             if reads == 1:
@@ -640,16 +645,22 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
                 return before
             self.assertFalse(arm_monitor)
             if reads == 2:
+                now = 21.0
                 return partial
             return navigated
 
+        manager._click = AsyncMock(side_effect=slow_click)
         manager._read_action_state = AsyncMock(side_effect=read_state)
 
-        with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
+        loop = asyncio.get_running_loop()
+        with (
+            patch.object(loop, "time", side_effect=lambda: now),
+            self.assertRaises(BattleActionOutcomeUnknownError) as raised,
+        ):
             await manager.click_and_wait_transition_locator(
                 "#btcp",
-                timeout=0.001,
-                check_interval=1e-9,
+                timeout=0.5,
+                check_interval=0.5,
             )
 
         evidence = raised.exception.recovery_evidence
@@ -662,6 +673,10 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(evidence.xhr_completed)
         self.assertFalse(evidence.xhr_pending_at_least_five_seconds)
         self.assertEqual(evidence.post_click_document_id, "document-after")
+        self.assertEqual(reads, 3)
+        manager._click.assert_awaited_once_with(
+            manager._select_for_single_click.return_value
+        )
         manager._cleanup_action_monitor.assert_not_awaited()
 
     async def test_next_floor_duplicate_receipt_is_preserved_and_rejected(

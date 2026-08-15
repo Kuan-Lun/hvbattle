@@ -1375,7 +1375,9 @@ class ElementActionManager:
                 except Exception as error:
                     click_error = error
 
-                deadline = started + timeout
+                # A slow CDP click must not consume the transition observation
+                # window used to reconcile its possibly submitted result.
+                deadline = asyncio.get_running_loop().time() + timeout
                 while True:
                     remaining = deadline - asyncio.get_running_loop().time()
                     if remaining <= 0:

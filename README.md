@@ -85,6 +85,30 @@ and failures. Each capture receives a collision-resistant `pony_chart_*.png`
 name, and callers own retention for that directory. Without an image directory,
 classifier screenshots remain temporary and are removed after each attempt.
 
+PonyChart model files are stored as immutable, content-addressed generations.
+Each update downloads both files over verified TLS into a same-filesystem
+staging directory with finite socket and whole-bundle deadlines, exact
+`Content-Length` accounting, and artifact size limits. It confirms that each
+available response ETag agrees with HEAD checks before and after the transfer,
+loads the pair through `PonyChartClassifier`, and fsyncs it before one atomic
+`current.json` pointer replacement commits it. A local interrupted, partial, or
+corrupt update therefore cannot advance the pointer to a partial or old/new
+local pair, and old committed generations are retained. ETags are opaque cache
+metadata rather than a cryptographic server-side bundle manifest. A fixed
+advisory lock serializes pointer decisions across processes, preventing a
+slower updater from replacing a newer commit. With no committed pointer, the
+complete remote bundle is always fetched; uncommitted canonical cache files are
+not adopted.
+
+`refresh_ponychart_classifier()` first adopts an already committed generation
+from another process, then checks remote metadata and downloads only when
+needed. It returns `PonyChartRefreshOutcome.UPDATED` or
+`PonyChartRefreshOutcome.CURRENT`; unreachable metadata, transport failures,
+validation failures, and commit failures raise instead of being reported as
+current. Any failure leaves the previously published predictor-generation pair
+available, while each prediction already in flight finishes on the exact
+snapshot with which it started.
+
 ```python
 import asyncio
 

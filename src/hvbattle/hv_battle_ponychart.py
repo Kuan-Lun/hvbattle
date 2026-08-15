@@ -9,6 +9,11 @@ from typing import Any, Protocol
 from hvbrowser import HVDriver
 from hvbrowser.runtime import is_connection_error, notify, setup_logger
 
+from .ponychart_model_store import (
+    PonyChartGenerationStore,
+    PonyChartRefreshOutcome,
+)
+
 logger = setup_logger(__name__)
 
 
@@ -22,7 +27,41 @@ class _PredictionResult(Protocol):
 
 
 _predict: Callable[[str], _PredictionResult] | None = None
-_preload_lock = threading.Lock()
+_generation_id: str | None = None
+_publication_lock = threading.Lock()
+_lifecycle_lock = threading.Lock()
+_store_lock = threading.Lock()
+_model_store: PonyChartGenerationStore | None = None
+
+
+def _get_model_store() -> PonyChartGenerationStore:
+    """Construct the default store lazily so package import stays lightweight."""
+
+    global _model_store
+    if _model_store is not None:
+        return _model_store
+    with _store_lock:
+        if _model_store is None:
+            _model_store = PonyChartGenerationStore.default()
+        return _model_store
+
+
+def _published_snapshot() -> tuple[
+    Callable[[str], _PredictionResult] | None,
+    str | None,
+]:
+    with _publication_lock:
+        return _predict, _generation_id
+
+
+def _publish(
+    predictor: Callable[[str], _PredictionResult],
+    generation: str,
+) -> None:
+    global _generation_id, _predict
+    with _publication_lock:
+        _predict = predictor
+        _generation_id = generation
 
 
 def preload_ponychart_classifier() -> None:
@@ -33,22 +72,33 @@ def preload_ponychart_classifier() -> None:
     unprepared so a later startup can retry instead of publishing partial
     state.
     """
-    global _predict
-    if _predict is not None:
+    predictor, _ = _published_snapshot()
+    if predictor is not None:
         return
 
-    with _preload_lock:
-        if _predict is not None:
+    with _lifecycle_lock:
+        predictor, _ = _published_snapshot()
+        if predictor is not None:
             return
 
-        from ponychart_classifier import predict, preload
+        loaded = _get_model_store().load_or_bootstrap()
+        _publish(loaded.predictor, loaded.generation)
 
-        preload()
 
-        def predict_default(img_path: str) -> _PredictionResult:
-            return predict(img_path)
+def refresh_ponychart_classifier() -> PonyChartRefreshOutcome:
+    """Refresh and atomically publish one immutable classifier generation.
 
-        _predict = predict_default
+    ``CURRENT`` is returned only after a successful remote metadata check (or
+    a byte-identical generation commit). Transport, validation, and commit
+    failures raise and leave the published predictor-generation pair intact.
+    """
+
+    with _lifecycle_lock:
+        _, published_generation = _published_snapshot()
+        result = _get_model_store().refresh(published_generation)
+        if result.loaded is not None:
+            _publish(result.loaded.predictor, result.loaded.generation)
+        return result.outcome
 
 
 class PonyChart:
@@ -147,11 +197,12 @@ class PonyChart:
 
     async def _auto_answer(self, img_path: str) -> frozenset[str] | None:
         """模型推論後依角色名稱比對 label 文字並點擊。"""
-        if _predict is None:
+        predictor, _ = _published_snapshot()
+        if predictor is None:
             raise RuntimeError(
                 "PonyChart classifier was not preloaded before battle startup"
             )
-        result = _predict(img_path)
+        result = await asyncio.to_thread(predictor, img_path)
         labels: frozenset[str] = result.labels
         ordered_labels = tuple(
             sorted(labels, key=lambda label: (label.casefold(), label))

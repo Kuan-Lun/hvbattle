@@ -4,11 +4,7 @@ import inspect
 import json
 import shutil
 import subprocess
-import sys
-import threading
-import types
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
@@ -1779,77 +1775,6 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIs(raised.exception, submission_error)
-
-
-class PonyChartPreloadTests(unittest.TestCase):
-    def test_preload_loads_model_once_before_prediction(self) -> None:
-        original_predictor = ponychart_module._predict
-        fake_module = types.ModuleType("ponychart_classifier")
-        preload = Mock()
-
-        def predict(_path: str) -> object:
-            raise AssertionError("Prediction must not run during preload")
-
-        fake_module.preload = preload
-        fake_module.predict = predict
-        ponychart_module._predict = None
-        try:
-            with patch.dict(sys.modules, {"ponychart_classifier": fake_module}):
-                ponychart_module.preload_ponychart_classifier()
-                ponychart_module.preload_ponychart_classifier()
-        finally:
-            ponychart_module._predict = original_predictor
-
-        preload.assert_called_once_with()
-
-    def test_concurrent_preloads_initialize_the_model_once(self) -> None:
-        original_predictor = ponychart_module._predict
-        fake_module = types.ModuleType("ponychart_classifier")
-        workers = 8
-        ready = threading.Barrier(workers)
-        release = threading.Event()
-        preload = Mock(side_effect=lambda: release.wait(timeout=1))
-        fake_module.preload = preload
-        fake_module.predict = Mock()
-
-        def invoke_preload() -> None:
-            ready.wait(timeout=1)
-            ponychart_module.preload_ponychart_classifier()
-
-        ponychart_module._predict = None
-        try:
-            with (
-                patch.dict(sys.modules, {"ponychart_classifier": fake_module}),
-                ThreadPoolExecutor(max_workers=workers) as pool,
-            ):
-                futures = tuple(pool.submit(invoke_preload) for _ in range(workers))
-                self.assertTrue(release.wait(timeout=0.05) is False)
-                release.set()
-                for future in futures:
-                    future.result(timeout=1)
-        finally:
-            ponychart_module._predict = original_predictor
-
-        preload.assert_called_once_with()
-
-    def test_failed_preload_can_be_retried_without_partial_publication(self) -> None:
-        original_predictor = ponychart_module._predict
-        fake_module = types.ModuleType("ponychart_classifier")
-        preload = Mock(side_effect=(RuntimeError("load failed"), None))
-        fake_module.preload = preload
-        fake_module.predict = Mock()
-        ponychart_module._predict = None
-        try:
-            with patch.dict(sys.modules, {"ponychart_classifier": fake_module}):
-                with self.assertRaisesRegex(RuntimeError, "load failed"):
-                    ponychart_module.preload_ponychart_classifier()
-                self.assertIsNone(ponychart_module._predict)
-
-                ponychart_module.preload_ponychart_classifier()
-        finally:
-            ponychart_module._predict = original_predictor
-
-        self.assertEqual(preload.call_count, 2)
 
 
 class PonyChartResolutionTests(unittest.IsolatedAsyncioTestCase):

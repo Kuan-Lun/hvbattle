@@ -27,7 +27,12 @@ from .contracts import (
 )
 from .control_panel import BaseControlPanel, ControlPanel, NullControlPanel
 from .hv_battle import BattleDriver
-from .hv_battle_ponychart import PonyChartResolutionError, preload_ponychart_classifier
+from .hv_battle_ponychart import (
+    PonyChartResolutionError,
+    preload_ponychart_classifier,
+    refresh_ponychart_classifier,
+)
+from .ponychart_model_store import PonyChartArtifactError, PonyChartRefreshOutcome
 from .runner import BattleRunner
 from .session import BattleSession
 from .strategy import BattleLifecycle, BattleStrategy
@@ -59,6 +64,8 @@ __all__ = [
     "ControlPanel",
     "GrindfestOption",
     "NullControlPanel",
+    "PonyChartArtifactError",
+    "PonyChartRefreshOutcome",
     "PonyChartResolutionError",
     "RingOfBloodChallenge",
     "RingOfBloodOption",
@@ -66,4 +73,5 @@ __all__ = [
     "RingOfBloodStartOutcome",
     "TurnDecision",
     "preload_ponychart_classifier",
+    "refresh_ponychart_classifier",
 ]

@@ -37,7 +37,10 @@ class PublicApiTests(unittest.TestCase):
         self.assertTrue(hasattr(hvbattle, "RingOfBloodOption"))
         self.assertTrue(hasattr(hvbattle, "RingOfBloodSnapshot"))
         self.assertTrue(hasattr(hvbattle, "RingOfBloodStartOutcome"))
+        self.assertTrue(hasattr(hvbattle, "PonyChartArtifactError"))
+        self.assertTrue(hasattr(hvbattle, "PonyChartRefreshOutcome"))
         self.assertTrue(hasattr(hvbattle, "PonyChartResolutionError"))
+        self.assertTrue(hasattr(hvbattle, "refresh_ponychart_classifier"))
 
     def test_strategy_annotations_resolve_at_runtime(self) -> None:
         from hvbattle import BattleStrategy

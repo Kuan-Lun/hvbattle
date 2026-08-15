@@ -20,6 +20,7 @@ from hvbattle import (
     BattleActionOutcomeUnknownError,
     BattleCompleted,
     BattleInterruptedError,
+    BattlePresence,
     BattleRecoveryExhaustedError,
     BattleRunner,
     BattleSession,
@@ -560,6 +561,17 @@ console.log(JSON.stringify({
         self.assertFalse(active)
         self.assertTrue(session.battle_completion_observed)
 
+    async def test_completion_presence_is_distinct_from_absence(self) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_phase = AsyncMock(return_value="complete")
+
+        presence = await BattleSession.inspect_battle_presence(session)
+
+        self.assertIs(presence, BattlePresence.COMPLETION)
+        self.assertTrue(session.battle_completion_observed)
+
     async def test_no_active_battle_probe_is_debug_detail(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
@@ -744,6 +756,9 @@ class _FakeSession:
 
     async def is_in_battle(self) -> bool:
         return self._active
+
+    async def inspect_battle_presence(self) -> BattlePresence:
+        return BattlePresence.ACTIVE if self._active else BattlePresence.ABSENT
 
     def reset_battle_tracking(self) -> None:
         self.turn = -1

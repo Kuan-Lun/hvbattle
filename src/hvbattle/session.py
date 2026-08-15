@@ -16,6 +16,7 @@ from .contracts import (
     ArenaOption,
     BattleActionOutcomeUnknownError,
     BattleInterruptedError,
+    BattlePresence,
     BattleTurnPhase,
     BattleTurnState,
     GrindfestOption,
@@ -623,21 +624,22 @@ class BattleSession:
     async def start_grindfest(self, option: GrindfestOption) -> bool:
         return await self._launcher.start_grindfest(option)
 
-    async def is_in_battle(self) -> bool:
-        """Return whether the current page represents an active battle."""
+    async def inspect_battle_presence(self) -> BattlePresence:
+        """Distinguish an absent, active, or awaiting-acknowledgement battle."""
+
         if await self.is_ponychart_present():
-            return True
+            return BattlePresence.ACTIVE
         phase = await self._read_battle_phase()
         if phase == _BATTLE_PHASE_COMPLETE:
             self._completion_observed = True
-            return False
+            return BattlePresence.COMPLETION
         if phase == _BATTLE_PHASE_NEXT_FLOOR:
-            return True
+            return BattlePresence.ACTIVE
         if not await self._has_battle_marker():
             if await self.is_ponychart_present():
-                return True
+                return BattlePresence.ACTIVE
             logger.debug("No active battle detected.")
-            return False
+            return BattlePresence.ABSENT
 
         last_error: Exception | None = None
         parse_attempts = 2
@@ -646,15 +648,15 @@ class BattleSession:
             try:
                 snapshot = await self._state().inspect()
                 if any(monster.alive for monster in snapshot.monsters.values()):
-                    return True
+                    return BattlePresence.ACTIVE
                 if await self.is_ponychart_present():
-                    return True
+                    return BattlePresence.ACTIVE
                 phase = await self._read_battle_phase()
                 if phase == _BATTLE_PHASE_COMPLETE:
                     self._completion_observed = True
-                    return False
+                    return BattlePresence.COMPLETION
                 if phase == _BATTLE_PHASE_NEXT_FLOOR:
-                    return True
+                    return BattlePresence.ACTIVE
                 warnings = ", ".join(snapshot.warnings[:5]) or "none"
                 raise RuntimeError(
                     "Battle marker is present without monsters, a transition, "
@@ -667,13 +669,13 @@ class BattleSession:
                     raise
                 last_error = error
                 if await self.is_ponychart_present():
-                    return True
+                    return BattlePresence.ACTIVE
                 phase = await self._read_battle_phase()
                 if phase == _BATTLE_PHASE_COMPLETE:
                     self._completion_observed = True
-                    return False
+                    return BattlePresence.COMPLETION
                 if phase == _BATTLE_PHASE_NEXT_FLOOR:
-                    return True
+                    return BattlePresence.ACTIVE
                 if isinstance(error, TimeoutError):
                     raise
                 if attempt + 1 < parse_attempts:
@@ -694,9 +696,9 @@ class BattleSession:
         phase = await self._read_battle_phase()
         if phase == _BATTLE_PHASE_COMPLETE:
             self._completion_observed = True
-            return False
+            return BattlePresence.COMPLETION
         if phase == _BATTLE_PHASE_NEXT_FLOOR:
-            return True
+            return BattlePresence.ACTIVE
         if await self._has_battle_marker():
             logger.error(
                 "Battle state parse failed after %d attempts on an active battle "
@@ -708,4 +710,9 @@ class BattleSession:
             raise last_error
 
         logger.debug("No active battle detected.")
-        return False
+        return BattlePresence.ABSENT
+
+    async def is_in_battle(self) -> bool:
+        """Return whether the current page represents an active battle."""
+
+        return await self.inspect_battle_presence() is BattlePresence.ACTIVE

@@ -12,6 +12,7 @@ from .contracts import (
     BattleActionOutcomeUnknownError,
     BattleCompleted,
     BattleInterruptedError,
+    BattlePresence,
     BattleRecoveryExhaustedError,
     BattleStepIdle,
     BattleStepIdleReason,
@@ -289,10 +290,15 @@ class BattleRunner:
             return self._confirmed_progress(BattleStepProgressKind.PONYCHART_RESOLVED)
         if await self._wait_while_servicing_ponychart():
             return self._confirmed_progress(BattleStepProgressKind.PONYCHART_RESOLVED)
-        if not await self.session.is_in_battle():
+        presence = await self.session.inspect_battle_presence()
+        if presence is BattlePresence.ABSENT:
             return BattleAbsent()
 
         self._is_isekai = await self.session.is_isekai
+        if presence is BattlePresence.COMPLETION:
+            return await self._acknowledge_completion()
+        if presence is not BattlePresence.ACTIVE:
+            raise TypeError("BattleSession returned an unsupported battle presence")
         self.session.reset_battle_tracking()
 
         if await self.session.resolve_ponychart():

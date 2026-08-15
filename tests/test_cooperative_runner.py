@@ -10,6 +10,7 @@ from hvbattle import (
     BattleActionRecoveryEvidence,
     BattleCompleted,
     BattleInterruptedError,
+    BattlePresence,
     BattleRecoveryExhaustedError,
     BattleRunner,
     BattleStepIdle,
@@ -28,10 +29,16 @@ class _StepSession:
         self,
         *phases: BattleTurnPhase,
         active: bool = True,
+        presence: BattlePresence | None = None,
         ponychart_results: tuple[bool, ...] = (),
     ) -> None:
         self._phases = deque(phases)
         self._active = active
+        self._presence = (
+            (BattlePresence.ACTIVE if active else BattlePresence.ABSENT)
+            if presence is None
+            else presence
+        )
         self._ponychart_results = deque(ponychart_results)
         self.turn = -1
         self.current_round = 1
@@ -52,6 +59,12 @@ class _StepSession:
     async def is_in_battle(self) -> bool:
         self.battle_probes += 1
         return self._active
+
+    async def inspect_battle_presence(self) -> BattlePresence:
+        self.battle_probes += 1
+        if self._presence is BattlePresence.COMPLETION:
+            self.battle_completion_observed = True
+        return self._presence
 
     def reset_battle_tracking(self) -> None:
         self.turn = -1
@@ -424,6 +437,28 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, BattleAbsent())
         session.go_next_floor.assert_not_awaited()
         session.acknowledge_battle_completion.assert_not_awaited()
+        strategy.take_turn.assert_not_awaited()
+
+    async def test_restart_completion_is_acknowledged_once_and_cached(self) -> None:
+        session = _StepSession(presence=BattlePresence.COMPLETION)
+        strategy = Mock()
+        strategy.on_battle_started = AsyncMock()
+        strategy.take_turn = AsyncMock()
+        runner = BattleRunner(  # type: ignore[arg-type]
+            session,
+            strategy,
+            sleep=AsyncMock(),
+        )
+
+        completed = await runner.step()
+        cached = await runner.step()
+
+        self.assertEqual(completed, BattleCompleted(False, 0, 1, 10))
+        self.assertIs(cached, completed)
+        session.acknowledge_battle_completion.assert_awaited_once_with(
+            expected_is_isekai=False
+        )
+        strategy.on_battle_started.assert_not_awaited()
         strategy.take_turn.assert_not_awaited()
 
 

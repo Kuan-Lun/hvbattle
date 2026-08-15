@@ -9,6 +9,7 @@ from hvbattle import (
     BattleActionOutcomeUnknownError,
     BattleActionRecoveryEvidence,
     BattleInterruptedError,
+    BattlePresence,
     BattleRecoveryExhaustedError,
     BattleRunner,
     BattleSession,
@@ -1425,6 +1426,9 @@ class _RunnerSession:
 
     async def is_in_battle(self) -> bool:
         return True
+
+    async def inspect_battle_presence(self) -> BattlePresence:
+        return BattlePresence.ACTIVE
 
     def reset_battle_tracking(self) -> None:
         self.turn = -1

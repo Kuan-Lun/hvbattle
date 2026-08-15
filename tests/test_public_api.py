@@ -22,6 +22,7 @@ class PublicApiTests(unittest.TestCase):
         self.assertTrue(hasattr(hvbattle, "BattleCompleted"))
         self.assertTrue(hasattr(hvbattle, "BattleStopped"))
         self.assertTrue(hasattr(hvbattle, "BattleAbsent"))
+        self.assertTrue(hasattr(hvbattle, "BattlePresence"))
         self.assertTrue(hasattr(hvbattle, "BattleStepIdle"))
         self.assertTrue(hasattr(hvbattle, "BattleStepIdleReason"))
         self.assertTrue(hasattr(hvbattle, "BattleStepProgress"))

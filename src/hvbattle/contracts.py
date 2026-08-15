@@ -73,6 +73,14 @@ class BattleAbsent:
     """No active battle was present when a cooperative runner was probed."""
 
 
+class BattlePresence(StrEnum):
+    """Authoritative page state observed at a battle startup boundary."""
+
+    ABSENT = "absent"
+    ACTIVE = "active"
+    COMPLETION = "completion"
+
+
 class BattleStepProgressKind(StrEnum):
     """A safe cooperative yield boundary reached while a battle remains active."""
 

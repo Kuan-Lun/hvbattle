@@ -29,6 +29,7 @@ _MANIFEST_FILENAME = "manifest.json"
 _CURRENT_FILENAME = "current.json"
 _LOCK_FILENAME = ".update.lock"
 _DEFAULT_BASE_URL = "https://www.csie.ntu.edu.tw/~d06922002/ponychart_classifier"
+_COMPATIBILITY_ORIGIN = ("https", "www.csie.ntu.edu.tw", 443)
 _GENERATION_SCHEMA = 1
 _POINTER_SCHEMA = 1
 _COPY_BUFFER_SIZE = 1024 * 1024
@@ -121,16 +122,34 @@ def _default_candidate_factory(
     )
 
 
-def _verified_context() -> ssl.SSLContext:
+def _verified_context(*, strict: bool) -> ssl.SSLContext:
+    context = ssl.create_default_context()
     try:
         import certifi
     except ImportError:
-        context = ssl.create_default_context()
+        pass
     else:
-        context = ssl.create_default_context(cafile=certifi.where())
+        # Keep the platform trust store and add Mozilla's roots. Passing
+        # ``cafile`` to create_default_context() would replace, rather than
+        # augment, the system roots.
+        context.load_verify_locations(cafile=certifi.where())
+
+    if strict:
+        context.verify_flags |= ssl.VERIFY_X509_STRICT
+    else:
+        context.verify_flags &= ~ssl.VERIFY_X509_STRICT
     if not context.check_hostname or context.verify_mode != ssl.CERT_REQUIRED:
         raise RuntimeError("PonyChart artifact TLS context is not verified")
     return context
+
+
+def _is_missing_subject_key_identifier(error: URLError) -> bool:
+    reason = error.reason
+    return (
+        isinstance(reason, ssl.SSLCertVerificationError)
+        and getattr(reason, "verify_code", None) == 86
+        and getattr(reason, "verify_message", None) == "Missing Subject Key Identifier"
+    )
 
 
 def _fsync_directory(path: Path) -> None:
@@ -284,7 +303,8 @@ class PonyChartGenerationStore:
             raise ValueError("transfer_timeout must be a finite positive number")
         if max_model_bytes <= 0 or max_thresholds_bytes <= 0:
             raise ValueError("artifact size limits must be positive")
-        if urlsplit(base_url).scheme.lower() != "https":
+        parsed_base_url = urlsplit(base_url)
+        if parsed_base_url.scheme.lower() != "https":
             raise ValueError("PonyChart artifact base URL must use HTTPS")
         self._root = root
         self._generations = root / "generations"
@@ -298,7 +318,14 @@ class PonyChartGenerationStore:
         }
         self._candidate_factory = candidate_factory
         self._urlopen = urlopen
-        self._ssl_context = _verified_context()
+        self._allows_missing_ski_compatibility = (
+            parsed_base_url.scheme.lower(),
+            parsed_base_url.hostname,
+            parsed_base_url.port or 443,
+        ) == _COMPATIBILITY_ORIGIN
+        self._strict_ssl_context = _verified_context(strict=True)
+        self._compatibility_ssl_context = _verified_context(strict=False)
+        self._active_ssl_context = self._strict_ssl_context
 
     @classmethod
     def default(cls) -> PonyChartGenerationStore:
@@ -470,9 +497,8 @@ class PonyChartGenerationStore:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("artifact bundle transfer deadline expired")
-            with self._urlopen(
+            with self._open_verified(
                 request,
-                context=self._ssl_context,
                 timeout=min(self._timeout, remaining),
             ) as response:
                 self._assert_https_response(response, requested_url=requested_url)
@@ -532,22 +558,48 @@ class PonyChartGenerationStore:
         requested_url = f"{self._base_url}/{filename}"
         request = urllib.request.Request(requested_url, method="HEAD")
         try:
-            with self._urlopen(
+            with self._open_verified(
                 request,
-                context=self._ssl_context,
                 timeout=self._timeout,
             ) as response:
                 self._assert_https_response(response, requested_url=requested_url)
                 return _normalize_etag(response.headers.get("ETag"))
-        except HTTPError:
-            # A reachable server may not implement HEAD. The GET remains the
-            # authority and is still required to succeed.
+        except HTTPError, URLError, TimeoutError, OSError:
+            # HEAD metadata is only a refresh optimization. The GET remains
+            # authoritative and is still required to succeed fail-closed.
             return None
-        except (URLError, TimeoutError, OSError) as error:
-            raise PonyChartArtifactError(
-                f"Failed to inspect PonyChart artifact {filename}: "
-                f"{type(error).__name__}"
-            ) from error
+
+    def _open_verified(
+        self,
+        request: urllib.request.Request,
+        *,
+        timeout: float,
+    ) -> AbstractContextManager[Any]:
+        context = self._active_ssl_context
+        try:
+            return self._urlopen(
+                request,
+                context=context,
+                timeout=timeout,
+            )
+        except URLError as error:
+            if (
+                context is not self._strict_ssl_context
+                or not self._allows_missing_ski_compatibility
+                or not _is_missing_subject_key_identifier(error)
+            ):
+                raise
+        # Python 3.14 enables OpenSSL's strict RFC 5280 checks. The public
+        # artifact host chains to a legacy trust anchor without an SKI. Retry
+        # only that exact verification error while retaining CA and hostname
+        # verification. Remember the proven host compatibility requirement so
+        # later requests do not repeat a strict handshake that cannot succeed.
+        self._active_ssl_context = self._compatibility_ssl_context
+        return self._urlopen(
+            request,
+            context=self._active_ssl_context,
+            timeout=timeout,
+        )
 
     @staticmethod
     def _assert_https_response(response: Any, *, requested_url: str) -> None:

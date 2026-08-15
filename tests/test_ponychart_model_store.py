@@ -30,6 +30,20 @@ from hvbattle.ponychart_model_store import (
 )
 
 
+def _missing_ski_error(
+    *,
+    verify_code: int = 86,
+    verify_message: str = "Missing Subject Key Identifier",
+) -> URLError:
+    reason = ssl.SSLCertVerificationError(
+        1,
+        f"certificate verify failed: {verify_message}",
+    )
+    reason.verify_code = verify_code
+    reason.verify_message = verify_message
+    return URLError(reason)
+
+
 def _hold_store_process_lock(root: str, connection: object) -> None:
     store = PonyChartGenerationStore(root=Path(root))
     with store._process_lock():
@@ -222,6 +236,7 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
         self,
         remote: _Remote | Mock,
         *,
+        base_url: str = "https://models.invalid/ponychart",
         timeout: float = 9.5,
         transfer_timeout: float = 40.0,
         max_model_bytes: int = 1024 * 1024,
@@ -229,7 +244,7 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
     ) -> PonyChartGenerationStore:
         return PonyChartGenerationStore(
             root=self.root,
-            base_url="https://models.invalid/ponychart",
+            base_url=base_url,
             timeout=timeout,
             transfer_timeout=transfer_timeout,
             max_model_bytes=max_model_bytes,
@@ -525,7 +540,224 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
             self.assertIsInstance(context, ssl.SSLContext)
             self.assertTrue(context.check_hostname)
             self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+            self.assertTrue(context.verify_flags & ssl.VERIFY_X509_STRICT)
             self.assertEqual(kwargs["timeout"], 7.25)
+
+    def test_tls_context_adds_certifi_to_system_roots(self) -> None:
+        context = Mock(
+            check_hostname=True,
+            verify_mode=ssl.CERT_REQUIRED,
+            verify_flags=ssl.VERIFY_X509_PARTIAL_CHAIN,
+        )
+
+        with (
+            patch.object(
+                store_module.ssl,
+                "create_default_context",
+                return_value=context,
+            ) as create_default_context,
+            patch("certifi.where", return_value="/certifi/roots.pem") as certifi_where,
+        ):
+            result = store_module._verified_context(strict=True)
+
+        self.assertIs(result, context)
+        create_default_context.assert_called_once_with()
+        certifi_where.assert_called_once_with()
+        context.load_verify_locations.assert_called_once_with(
+            cafile="/certifi/roots.pem"
+        )
+        self.assertTrue(context.verify_flags & ssl.VERIFY_X509_STRICT)
+
+    def test_compatibility_context_only_removes_strict_verification(self) -> None:
+        store = self._store(Mock())
+        strict = store._strict_ssl_context
+        compatibility = store._compatibility_ssl_context
+
+        self.assertTrue(strict.check_hostname)
+        self.assertTrue(compatibility.check_hostname)
+        self.assertEqual(strict.verify_mode, ssl.CERT_REQUIRED)
+        self.assertEqual(compatibility.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(strict.verify_flags & ssl.VERIFY_X509_STRICT)
+        self.assertFalse(compatibility.verify_flags & ssl.VERIFY_X509_STRICT)
+        self.assertEqual(
+            strict.verify_flags & ~ssl.VERIFY_X509_STRICT,
+            compatibility.verify_flags,
+        )
+
+    def test_head_retries_only_exact_missing_ski_then_remembers_compatibility(
+        self,
+    ) -> None:
+        base_url = "https://www.csie.ntu.edu.tw/~d06922002/ponychart_classifier"
+        model_url = f"{base_url}/model.onnx"
+        thresholds_url = f"{base_url}/thresholds.json"
+        urlopen = Mock(
+            side_effect=(
+                _missing_ski_error(),
+                _Response(etag='"model"', final_url=model_url),
+                _Response(etag='"thresholds"', final_url=thresholds_url),
+            )
+        )
+        store = self._store(urlopen, base_url=base_url, timeout=6.5)
+
+        self.assertEqual(store._remote_etag("model.onnx"), '"model"')
+        self.assertEqual(store._remote_etag("thresholds.json"), '"thresholds"')
+
+        self.assertEqual(urlopen.call_count, 3)
+        strict_call, compatibility_retry, next_request = urlopen.call_args_list
+        self.assertIs(
+            strict_call.kwargs["context"],
+            store._strict_ssl_context,
+        )
+        self.assertIs(
+            compatibility_retry.kwargs["context"],
+            store._compatibility_ssl_context,
+        )
+        self.assertIs(
+            next_request.kwargs["context"],
+            store._compatibility_ssl_context,
+        )
+        self.assertEqual(strict_call.kwargs["timeout"], 6.5)
+        self.assertEqual(compatibility_retry.kwargs["timeout"], 6.5)
+        self.assertEqual(next_request.kwargs["timeout"], 6.5)
+
+    def test_head_does_not_retry_near_match_certificate_errors(self) -> None:
+        base_url = "https://www.csie.ntu.edu.tw/~d06922002/ponychart_classifier"
+        errors = (
+            _missing_ski_error(verify_code=85),
+            _missing_ski_error(verify_message="Missing Subject Key Identifier "),
+            URLError("unrelated TLS failure"),
+        )
+        for index, error in enumerate(errors):
+            with self.subTest(index=index):
+                urlopen = Mock(side_effect=error)
+                store = self._store(urlopen, base_url=base_url)
+
+                self.assertIsNone(store._remote_etag("model.onnx"))
+
+                urlopen.assert_called_once()
+                self.assertIs(
+                    urlopen.call_args.kwargs["context"],
+                    store._strict_ssl_context,
+                )
+
+    def test_custom_origin_never_uses_missing_ski_compatibility(self) -> None:
+        urlopen = Mock(side_effect=_missing_ski_error())
+        store = self._store(urlopen)
+
+        self.assertIsNone(store._remote_etag("model.onnx"))
+        with self.assertRaisesRegex(PonyChartArtifactError, "URLError"):
+            store._download(
+                "model.onnx",
+                self.base / "custom-origin-model.onnx",
+                deadline=store_module.time.monotonic() + 10,
+            )
+
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertTrue(
+            all(
+                call.kwargs["context"] is store._strict_ssl_context
+                for call in urlopen.call_args_list
+            )
+        )
+        self.assertIs(store._active_ssl_context, store._strict_ssl_context)
+
+    def test_head_transport_failures_are_advisory(self) -> None:
+        for error in (
+            URLError("offline"),
+            TimeoutError("timed out"),
+            OSError("socket failed"),
+        ):
+            with self.subTest(error_type=type(error).__name__):
+                urlopen = Mock(side_effect=error)
+                store = self._store(urlopen)
+
+                self.assertIsNone(store._remote_etag("model.onnx"))
+
+                urlopen.assert_called_once()
+
+    def test_get_retries_exact_missing_ski_and_stays_fail_closed(self) -> None:
+        base_url = "https://www.csie.ntu.edu.tw/~d06922002/ponychart_classifier"
+        requested_url = f"{base_url}/model.onnx"
+        response = _Response(
+            b"model",
+            etag='"model"',
+            final_url=requested_url,
+            content_length="5",
+        )
+        urlopen = Mock(side_effect=(_missing_ski_error(), response))
+        store = self._store(urlopen, base_url=base_url)
+        destination = self.base / "downloaded-model.onnx"
+
+        etag = store._download(
+            "model.onnx",
+            destination,
+            deadline=store_module.time.monotonic() + 10,
+        )
+
+        self.assertEqual(etag, '"model"')
+        self.assertEqual(destination.read_bytes(), b"model")
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertIs(
+            urlopen.call_args_list[0].kwargs["context"],
+            store._strict_ssl_context,
+        )
+        self.assertIs(
+            urlopen.call_args_list[1].kwargs["context"],
+            store._compatibility_ssl_context,
+        )
+
+        failing_urlopen = Mock(
+            side_effect=(_missing_ski_error(), URLError("fallback failed"))
+        )
+        failing_store = self._store(failing_urlopen, base_url=base_url)
+        with self.assertRaisesRegex(PonyChartArtifactError, "URLError"):
+            failing_store._download(
+                "model.onnx",
+                self.base / "failed-model.onnx",
+                deadline=store_module.time.monotonic() + 10,
+            )
+        self.assertEqual(failing_urlopen.call_count, 2)
+
+    def test_get_does_not_retry_near_match_certificate_errors(self) -> None:
+        base_url = "https://www.csie.ntu.edu.tw/~d06922002/ponychart_classifier"
+        errors = (
+            _missing_ski_error(verify_code=85),
+            _missing_ski_error(verify_message="Missing Subject Key Identifier "),
+        )
+        for index, error in enumerate(errors):
+            with self.subTest(index=index):
+                urlopen = Mock(side_effect=error)
+                store = self._store(urlopen, base_url=base_url)
+
+                with self.assertRaisesRegex(PonyChartArtifactError, "URLError"):
+                    store._download(
+                        "model.onnx",
+                        self.base / f"near-match-{index}.onnx",
+                        deadline=store_module.time.monotonic() + 10,
+                    )
+
+                urlopen.assert_called_once()
+                self.assertIs(
+                    urlopen.call_args.kwargs["context"],
+                    store._strict_ssl_context,
+                )
+
+    def test_get_unrelated_transport_error_does_not_retry(self) -> None:
+        urlopen = Mock(side_effect=URLError("offline"))
+        store = self._store(urlopen)
+
+        with self.assertRaisesRegex(PonyChartArtifactError, "URLError"):
+            store._download(
+                "model.onnx",
+                self.base / "failed-model.onnx",
+                deadline=store_module.time.monotonic() + 10,
+            )
+
+        urlopen.assert_called_once()
+        self.assertIs(
+            urlopen.call_args.kwargs["context"],
+            store._strict_ssl_context,
+        )
 
     def test_https_redirect_downgrade_is_rejected_for_head_and_get(self) -> None:
         for method in ("HEAD", "GET"):

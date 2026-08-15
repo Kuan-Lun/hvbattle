@@ -5,8 +5,10 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
@@ -24,6 +26,10 @@ from hvbattle import (
     BattleRecoveryExhaustedError,
     BattleRunner,
     BattleSession,
+    BattleStepIdle,
+    BattleStepIdleReason,
+    BattleStepProgress,
+    BattleStepProgressKind,
     BattleStopped,
     BattleTurnPhase,
     BattleTurnState,
@@ -1205,18 +1211,14 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         strategy.take_turn.assert_not_awaited()
 
-    async def test_pause_polling_continues_to_service_ponychart(self) -> None:
+    async def test_paused_steps_continue_to_service_ponychart(self) -> None:
         session = _FakeSession(active=True)
-        gate = asyncio.Event()
         challenge_checks = 0
 
         async def resolve_ponychart() -> bool:
             nonlocal challenge_checks
             challenge_checks += 1
-            return False
-
-        async def wait_if_paused() -> None:
-            await gate.wait()
+            return challenge_checks == 3
 
         session.resolve_ponychart = resolve_ponychart  # type: ignore[method-assign]
         strategy = Mock()
@@ -1224,47 +1226,69 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         runner = BattleRunner(
             session,  # type: ignore[arg-type]
             strategy,
-            wait_if_paused=wait_if_paused,
-            challenge_poll_interval=0.001,
+            pause_requested=lambda: True,
+            challenge_poll_interval=0.5,
             sleep=AsyncMock(),
         )
 
-        task = asyncio.create_task(runner.run_current())
-        await asyncio.sleep(0.01)
-        self.assertGreater(challenge_checks, 1)
+        first = await asyncio.wait_for(runner.step(), timeout=0.1)
+        second = await asyncio.wait_for(runner.step(), timeout=0.1)
+        third = await asyncio.wait_for(runner.step(), timeout=0.1)
 
-        gate.set()
-        await task
+        expected = BattleStepIdle(
+            retry_after=0.5,
+            reason=BattleStepIdleReason.PAUSED,
+        )
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(
+            third,
+            BattleStepProgress(
+                kind=BattleStepProgressKind.PONYCHART_RESOLVED,
+                is_isekai=None,
+                decision_count=0,
+                current_round=1,
+                total_rounds=1,
+            ),
+        )
+        self.assertEqual(challenge_checks, 3)
+        strategy.take_turn.assert_not_awaited()
 
-    async def test_pause_after_turn_parse_blocks_strategy_action(self) -> None:
+    async def test_pause_after_turn_parse_defers_strategy_action(self) -> None:
         session = _FakeSession(active=True)
-        release = asyncio.Event()
-        post_parse_gate_entered = asyncio.Event()
         gate_calls = 0
+        resumed = False
 
-        async def wait_if_paused() -> None:
+        def pause_requested() -> bool:
             nonlocal gate_calls
             gate_calls += 1
-            if gate_calls == 3:
-                post_parse_gate_entered.set()
-                await release.wait()
+            return not resumed and gate_calls == 3
 
         strategy = Mock()
         strategy.take_turn = AsyncMock(return_value=TurnDecision.STOP)
         runner = BattleRunner(
             session,  # type: ignore[arg-type]
             strategy,
-            wait_if_paused=wait_if_paused,
-            challenge_poll_interval=0.001,
+            pause_requested=pause_requested,
+            challenge_poll_interval=0.5,
             sleep=AsyncMock(),
         )
 
-        task = asyncio.create_task(runner.run_current())
-        await post_parse_gate_entered.wait()
+        deferred = await asyncio.wait_for(runner.step(), timeout=0.1)
+
+        self.assertEqual(
+            deferred,
+            BattleStepIdle(
+                retry_after=0.5,
+                reason=BattleStepIdleReason.PAUSED,
+            ),
+        )
         strategy.take_turn.assert_not_awaited()
 
-        release.set()
-        await task
+        resumed = True
+        result = await runner.step()
+
+        self.assertIsInstance(result, BattleStopped)
         strategy.take_turn.assert_awaited_once_with(session)
 
     async def test_battle_launcher_uses_composed_realm_navigator(self) -> None:
@@ -1777,6 +1801,55 @@ class PonyChartPreloadTests(unittest.TestCase):
             ponychart_module._predict = original_predictor
 
         preload.assert_called_once_with()
+
+    def test_concurrent_preloads_initialize_the_model_once(self) -> None:
+        original_predictor = ponychart_module._predict
+        fake_module = types.ModuleType("ponychart_classifier")
+        workers = 8
+        ready = threading.Barrier(workers)
+        release = threading.Event()
+        preload = Mock(side_effect=lambda: release.wait(timeout=1))
+        fake_module.preload = preload
+        fake_module.predict = Mock()
+
+        def invoke_preload() -> None:
+            ready.wait(timeout=1)
+            ponychart_module.preload_ponychart_classifier()
+
+        ponychart_module._predict = None
+        try:
+            with (
+                patch.dict(sys.modules, {"ponychart_classifier": fake_module}),
+                ThreadPoolExecutor(max_workers=workers) as pool,
+            ):
+                futures = tuple(pool.submit(invoke_preload) for _ in range(workers))
+                self.assertTrue(release.wait(timeout=0.05) is False)
+                release.set()
+                for future in futures:
+                    future.result(timeout=1)
+        finally:
+            ponychart_module._predict = original_predictor
+
+        preload.assert_called_once_with()
+
+    def test_failed_preload_can_be_retried_without_partial_publication(self) -> None:
+        original_predictor = ponychart_module._predict
+        fake_module = types.ModuleType("ponychart_classifier")
+        preload = Mock(side_effect=(RuntimeError("load failed"), None))
+        fake_module.preload = preload
+        fake_module.predict = Mock()
+        ponychart_module._predict = None
+        try:
+            with patch.dict(sys.modules, {"ponychart_classifier": fake_module}):
+                with self.assertRaisesRegex(RuntimeError, "load failed"):
+                    ponychart_module.preload_ponychart_classifier()
+                self.assertIsNone(ponychart_module._predict)
+
+                ponychart_module.preload_ponychart_classifier()
+        finally:
+            ponychart_module._predict = original_predictor
+
+        self.assertEqual(preload.call_count, 2)
 
 
 class PonyChartResolutionTests(unittest.IsolatedAsyncioTestCase):

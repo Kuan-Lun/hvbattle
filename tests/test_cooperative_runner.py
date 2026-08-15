@@ -173,30 +173,72 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.prepare_calls, 0)
         strategy.take_turn.assert_not_awaited()
 
-    async def test_ponychart_during_pause_yields_after_first_resolution(self) -> None:
+    async def test_pause_services_ponychart_before_returning_deferred_state(
+        self,
+    ) -> None:
         session = _StepSession(
             BattleTurnPhase.ACTIVE,
-            ponychart_results=(False, True, True),
+            ponychart_results=(True,),
         )
         strategy = Mock()
         strategy.take_turn = AsyncMock(return_value=TurnDecision.ACTED)
-        pause = asyncio.Event()
+        pause_requested = Mock(return_value=True)
         runner = BattleRunner(  # type: ignore[arg-type]
             session,
             strategy,
-            wait_if_paused=pause.wait,
-            challenge_poll_interval=0.001,
+            pause_requested=pause_requested,
+            challenge_poll_interval=0.75,
             sleep=AsyncMock(),
         )
 
-        result = await runner.step()
+        resolved = await runner.step()
+        paused = await asyncio.wait_for(runner.step(), timeout=0.1)
 
-        self.assertIsInstance(result, BattleStepProgress)
-        assert isinstance(result, BattleStepProgress)
-        self.assertIs(result.kind, BattleStepProgressKind.PONYCHART_RESOLVED)
-        self.assertEqual(len(session._ponychart_results), 1)
+        self.assertIsInstance(resolved, BattleStepProgress)
+        assert isinstance(resolved, BattleStepProgress)
+        self.assertIs(resolved.kind, BattleStepProgressKind.PONYCHART_RESOLVED)
+        self.assertEqual(
+            paused,
+            BattleStepIdle(
+                retry_after=0.75,
+                reason=BattleStepIdleReason.PAUSED,
+            ),
+        )
+        pause_requested.assert_called_once_with()
         self.assertEqual(session.battle_probes, 0)
+        self.assertEqual(session.realm_probes, 0)
+        self.assertEqual(session.prepare_calls, 0)
         strategy.take_turn.assert_not_awaited()
+
+    async def test_resume_after_paused_idle_allows_the_next_safe_step(self) -> None:
+        session = _StepSession(BattleTurnPhase.ACTIVE)
+        strategy = Mock()
+        strategy.take_turn = AsyncMock(return_value=TurnDecision.ACTED)
+        paused = True
+
+        def pause_requested() -> bool:
+            return paused
+
+        runner = BattleRunner(  # type: ignore[arg-type]
+            session,
+            strategy,
+            pause_requested=pause_requested,
+            sleep=AsyncMock(),
+        )
+
+        deferred = await runner.step()
+        paused = False
+        progressed = await runner.step()
+
+        self.assertEqual(
+            deferred,
+            BattleStepIdle(
+                retry_after=0.25,
+                reason=BattleStepIdleReason.PAUSED,
+            ),
+        )
+        self.assertIsInstance(progressed, BattleStepProgress)
+        strategy.take_turn.assert_awaited_once_with(session)
 
     async def test_next_floor_yields_before_completion_ack(self) -> None:
         session = _StepSession(
@@ -463,9 +505,25 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CooperativeStepContractTests(unittest.TestCase):
-    def test_idle_delay_rejects_negative_values(self) -> None:
-        with self.assertRaisesRegex(ValueError, "must not be negative"):
-            BattleStepIdle(-0.01)
+    def test_idle_delay_requires_a_finite_non_negative_number(self) -> None:
+        for value in (-0.01, float("inf"), float("nan"), True, "1"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "finite non-negative"),
+            ):
+                BattleStepIdle(value)  # type: ignore[arg-type]
+
+    def test_pause_poll_interval_requires_a_finite_positive_number(self) -> None:
+        for value in (0, -1, float("inf"), float("nan"), True):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "finite and positive"),
+            ):
+                BattleRunner(  # type: ignore[arg-type]
+                    Mock(),
+                    Mock(),
+                    challenge_poll_interval=value,
+                )
 
 
 if __name__ == "__main__":

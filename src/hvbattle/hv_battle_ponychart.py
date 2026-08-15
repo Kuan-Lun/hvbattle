@@ -1,5 +1,6 @@
 import asyncio
 import tempfile
+import threading
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -21,22 +22,33 @@ class _PredictionResult(Protocol):
 
 
 _predict: Callable[[str], _PredictionResult] | None = None
+_preload_lock = threading.Lock()
 
 
 def preload_ponychart_classifier() -> None:
-    """Load the classifier and ONNX model before a timed challenge appears."""
+    """Load the classifier and ONNX model exactly once per process.
+
+    The synchronous entry point is intentionally safe to call from multiple
+    ``asyncio.to_thread`` jobs.  A failed attempt leaves the classifier
+    unprepared so a later startup can retry instead of publishing partial
+    state.
+    """
     global _predict
     if _predict is not None:
         return
 
-    from ponychart_classifier import predict, preload
+    with _preload_lock:
+        if _predict is not None:
+            return
 
-    preload()
+        from ponychart_classifier import predict, preload
 
-    def predict_default(img_path: str) -> _PredictionResult:
-        return predict(img_path)
+        preload()
 
-    _predict = predict_default
+        def predict_default(img_path: str) -> _PredictionResult:
+            return predict(img_path)
+
+        _predict = predict_default
 
 
 class PonyChart:

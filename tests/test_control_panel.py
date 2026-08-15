@@ -26,12 +26,120 @@ from hvbattle.control_panel import (
 def _control_panel_without_process_start(*, alive: bool = True) -> ControlPanel:
     panel = object.__new__(ControlPanel)
     panel._destroyed = False
+    panel._manager = Mock()
     panel._process = Mock()
     panel._process.is_alive.return_value = alive
     panel._pause_flag = Mock()
+    panel._cmd_queue = Mock()
     panel._checklist_lock = threading.RLock()
     panel._checklist_observed_revisions = {}
     return panel
+
+
+def _partial_startup_manager() -> tuple[Mock, Mock]:
+    manager = Mock()
+    manager.Event.side_effect = lambda: Mock()
+    manager.dict.side_effect = lambda: {}
+    manager.RLock.side_effect = threading.RLock
+    command_queue = Mock()
+    manager.Queue.return_value = command_queue
+    return manager, command_queue
+
+
+class ControlPanelLifecycleTests(unittest.TestCase):
+    def test_proxy_creation_failure_shuts_down_partial_manager(self) -> None:
+        manager, _command_queue = _partial_startup_manager()
+        manager.dict.side_effect = ({}, RuntimeError("proxy secret"))
+
+        with (
+            patch(
+                "hvbattle.control_panel.multiprocessing.Manager", return_value=manager
+            ),
+            patch("hvbattle.control_panel.multiprocessing.Process") as process,
+            self.assertRaisesRegex(RuntimeError, "proxy secret"),
+        ):
+            ControlPanel()
+
+        process.assert_not_called()
+        manager.shutdown.assert_called_once_with()
+
+    def test_process_start_failure_reaps_process_and_manager(self) -> None:
+        manager, _command_queue = _partial_startup_manager()
+        process = Mock()
+        process.start.side_effect = RuntimeError("start secret")
+        process.is_alive.return_value = False
+
+        with (
+            patch(
+                "hvbattle.control_panel.multiprocessing.Manager", return_value=manager
+            ),
+            patch(
+                "hvbattle.control_panel.multiprocessing.Process", return_value=process
+            ),
+            self.assertRaisesRegex(RuntimeError, "start secret"),
+        ):
+            ControlPanel()
+
+        process.join.assert_called_once_with(timeout=3.0)
+        manager.shutdown.assert_called_once_with()
+
+    def test_ready_failure_terminates_process_before_manager_shutdown(self) -> None:
+        manager, command_queue = _partial_startup_manager()
+        process = Mock()
+        process.is_alive.side_effect = (True, True, False)
+
+        with (
+            patch(
+                "hvbattle.control_panel.multiprocessing.Manager", return_value=manager
+            ),
+            patch(
+                "hvbattle.control_panel.multiprocessing.Process", return_value=process
+            ),
+            patch.object(
+                ControlPanel,
+                "_wait_until_ready",
+                side_effect=RuntimeError("ready secret"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "ready secret"),
+        ):
+            ControlPanel()
+
+        command_queue.put.assert_called_once_with(("destroy", None))
+        process.terminate.assert_called_once_with()
+        self.assertEqual(process.join.call_count, 2)
+        manager.shutdown.assert_called_once_with()
+
+    def test_destroy_exhausts_cleanup_and_logs_only_fixed_reason_codes(self) -> None:
+        panel = _control_panel_without_process_start()
+        secret = "raw DOM and credential secret"
+        panel._process.is_alive.side_effect = (
+            RuntimeError(secret),
+            RuntimeError(secret),
+            RuntimeError(secret),
+        )
+        panel._cmd_queue.put.side_effect = RuntimeError(secret)
+        panel._process.join.side_effect = RuntimeError(secret)
+        panel._process.terminate.side_effect = RuntimeError(secret)
+        panel._manager.shutdown.side_effect = RuntimeError(secret)
+
+        with patch("hvbattle.control_panel.logger") as control_logger:
+            panel.destroy()
+
+        panel._cmd_queue.put.assert_called_once_with(("destroy", None))
+        self.assertEqual(panel._process.join.call_count, 2)
+        panel._process.terminate.assert_called_once_with()
+        panel._manager.shutdown.assert_called_once_with()
+        control_logger.warning.assert_called_once_with(
+            "Battle control panel cleanup incomplete phase=%s reason_codes=%s",
+            "destroy",
+            "process-state-unavailable,destroy-command-failed,"
+            "process-join-failed,process-terminate-failed,"
+            "manager-shutdown-failed",
+        )
+        self.assertNotIn(secret, repr(control_logger.mock_calls))
+
+        panel.destroy()
+        self.assertEqual(panel._process.join.call_count, 2)
 
 
 class ControlPanelStateTests(unittest.TestCase):
@@ -357,6 +465,7 @@ class ControlPanelStateTests(unittest.TestCase):
 
             with patch("hvbattle.control_panel.logger") as control_logger:
                 panel.pause()
+                self.assertTrue(panel.is_paused())
                 waiter = asyncio.create_task(panel.wait_if_paused())
                 await asyncio.sleep(0)
                 self.assertFalse(waiter.done())
@@ -399,6 +508,7 @@ class ControlPanelStateTests(unittest.TestCase):
             lambda: panel.get_integer("integer"),
             lambda: panel.get_checklist_selection("checklist"),
             panel.get_forbidden_skills,
+            panel.is_paused,
         )
         for read in live_reads:
             with (
@@ -455,6 +565,25 @@ class ControlPanelStateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "GUI process is not running"):
             panel.get_toggle("toggle")
+
+        panel._pause_flag.set.assert_called_once_with()
+
+    def test_pause_read_rechecks_gui_after_shared_state_access(self) -> None:
+        panel = _control_panel_without_process_start()
+        panel._process.is_alive.side_effect = (True, False)
+        panel._pause_flag.is_set.return_value = False
+
+        with self.assertRaisesRegex(RuntimeError, "GUI process is not running"):
+            panel.is_paused()
+
+        panel._pause_flag.set.assert_called_once_with()
+
+    def test_pause_read_fails_closed_on_invalid_shared_state(self) -> None:
+        panel = _control_panel_without_process_start()
+        panel._pause_flag.is_set.return_value = object()
+
+        with self.assertRaisesRegex(RuntimeError, "invalid pause state"):
+            panel.is_paused()
 
         panel._pause_flag.set.assert_called_once_with()
 
@@ -684,7 +813,9 @@ class NullControlPanelTests(unittest.TestCase):
         self.assertEqual(panel.get_integer("lottery_target"), 1_000)
         self.assertEqual(panel.get_checklist_selection("ring"), ("triple",))
         self.assertEqual(panel.get_disabled_actions(), frozenset({"imperil"}))
+        self.assertFalse(panel.is_paused())
         panel.pause()
+        self.assertFalse(panel.is_paused())
         asyncio.run(panel.wait_if_paused())
         panel.destroy()
 
@@ -823,6 +954,9 @@ class NullControlPanelTests(unittest.TestCase):
 
             def get_forbidden_skills(self) -> frozenset[str]:
                 return self.disabled
+
+            def is_paused(self) -> bool:
+                return False
 
             async def wait_if_paused(self) -> None:
                 return

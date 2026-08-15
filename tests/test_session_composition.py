@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -124,9 +125,161 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         session._setup_alert_handler.assert_awaited_once_with()
         close.assert_awaited_once_with(None, None, None)
         self.assertEqual(
-            events,
-            ["preload", "browser-ready", "alert-handler", "login"],
+            tuple(event for event in events if event != "preload"),
+            ("browser-ready", "alert-handler", "login"),
         )
+        self.assertIn("preload", events)
+
+    async def test_async_context_preloads_while_browser_starts(self) -> None:
+        browser_started = asyncio.Event()
+        classifier_started = asyncio.Event()
+        hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
+        session = BattleSession(hentaiverse=hentaiverse)
+
+        async def prepare_classifier() -> None:
+            classifier_started.set()
+            await browser_started.wait()
+
+        async def start(
+            *,
+            on_browser_ready: Callable[[], Awaitable[None]],
+        ) -> None:
+            browser_started.set()
+            await classifier_started.wait()
+            await on_browser_ready()
+
+        session._ensure_classifier = AsyncMock(side_effect=prepare_classifier)
+        hentaiverse.start = AsyncMock(side_effect=start)
+        hentaiverse.__aexit__ = AsyncMock()
+
+        async with asyncio.timeout(1):
+            async with session:
+                pass
+
+        session._ensure_classifier.assert_awaited_once_with()
+        hentaiverse.start.assert_awaited_once_with(
+            on_browser_ready=session._on_browser_ready,
+        )
+
+    async def test_classifier_failure_after_browser_start_closes_browser(
+        self,
+    ) -> None:
+        classifier_error = RuntimeError("classifier failed")
+        hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
+        session = BattleSession(hentaiverse=hentaiverse)
+        session._ensure_classifier = AsyncMock(side_effect=classifier_error)
+        hentaiverse.start = AsyncMock()
+        hentaiverse.__aexit__ = AsyncMock()
+
+        with self.assertRaises(RuntimeError) as raised:
+            await session.__aenter__()
+
+        self.assertIs(raised.exception, classifier_error)
+        hentaiverse.__aexit__.assert_awaited_once()
+        cleanup_type, cleanup_error, cleanup_traceback = (
+            hentaiverse.__aexit__.await_args.args
+        )
+        self.assertIs(cleanup_type, RuntimeError)
+        self.assertIs(cleanup_error, classifier_error)
+        self.assertIsNotNone(cleanup_traceback)
+
+    async def test_browser_failure_waits_for_classifier_and_collects_its_error(
+        self,
+    ) -> None:
+        release_classifier = asyncio.Event()
+        classifier_finished = False
+        browser_error = RuntimeError("browser failed")
+        classifier_error = LookupError("classifier failed")
+        hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
+        session = BattleSession(hentaiverse=hentaiverse)
+
+        async def prepare_classifier() -> None:
+            nonlocal classifier_finished
+            await release_classifier.wait()
+            classifier_finished = True
+            raise classifier_error
+
+        session._ensure_classifier = AsyncMock(side_effect=prepare_classifier)
+        hentaiverse.start = AsyncMock(side_effect=browser_error)
+        hentaiverse.__aexit__ = AsyncMock()
+
+        entering = asyncio.create_task(session.__aenter__())
+        await asyncio.sleep(0)
+        self.assertFalse(entering.done())
+
+        release_classifier.set()
+        with self.assertRaises(RuntimeError) as raised:
+            await entering
+
+        self.assertIs(raised.exception, browser_error)
+        self.assertTrue(classifier_finished)
+        self.assertEqual(
+            browser_error.__notes__,
+            ["parallel battle session startup also failed: LookupError"],
+        )
+        hentaiverse.__aexit__.assert_awaited_once()
+        cleanup_type, cleanup_error, cleanup_traceback = (
+            hentaiverse.__aexit__.await_args.args
+        )
+        self.assertIs(cleanup_type, RuntimeError)
+        self.assertIs(cleanup_error, browser_error)
+        self.assertIsNotNone(cleanup_traceback)
+
+    async def test_repeated_startup_cancellation_waits_for_branches_and_cleanup(
+        self,
+    ) -> None:
+        browser_started = asyncio.Event()
+        classifier_started = asyncio.Event()
+        finish_startup = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        finish_cleanup = asyncio.Event()
+        completed: list[str] = []
+        hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
+        session = BattleSession(hentaiverse=hentaiverse)
+
+        async def start(
+            *,
+            on_browser_ready: Callable[[], Awaitable[None]],
+        ) -> None:
+            del on_browser_ready
+            browser_started.set()
+            await finish_startup.wait()
+            completed.append("browser")
+
+        async def prepare_classifier() -> None:
+            classifier_started.set()
+            await finish_startup.wait()
+            completed.append("classifier")
+
+        async def close(*_args: object) -> None:
+            cleanup_started.set()
+            await finish_cleanup.wait()
+            completed.append("cleanup")
+
+        session._ensure_classifier = AsyncMock(side_effect=prepare_classifier)
+        hentaiverse.start = AsyncMock(side_effect=start)
+        hentaiverse.__aexit__ = AsyncMock(side_effect=close)
+
+        entering = asyncio.create_task(session.__aenter__())
+        await browser_started.wait()
+        await classifier_started.wait()
+        entering.cancel("first cancellation")
+        await asyncio.sleep(0)
+        self.assertFalse(entering.done())
+
+        finish_startup.set()
+        await cleanup_started.wait()
+        entering.cancel("second cancellation")
+        await asyncio.sleep(0)
+        self.assertFalse(entering.done())
+
+        finish_cleanup.set()
+        with self.assertRaises(asyncio.CancelledError) as raised:
+            await entering
+
+        self.assertEqual(str(raised.exception), "first cancellation")
+        self.assertCountEqual(completed, ("browser", "classifier", "cleanup"))
+        hentaiverse.__aexit__.assert_awaited_once()
 
     async def test_realm_is_read_from_composed_navigator(self) -> None:
         hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
@@ -146,12 +299,16 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             hentaiverse=hentaiverse,
             auto_accept_dialogs=True,
         )
-        session._setup_alert_handler = AsyncMock()
+        events: list[str] = []
+        session._setup_alert_handler = AsyncMock(
+            side_effect=lambda: events.append("attach-hooks")
+        )
 
         with (
             patch.object(
                 session_module,
                 "preload_ponychart_classifier",
+                side_effect=lambda: events.append("preload"),
             ) as preload,
             patch.object(hentaiverse, "start", new=AsyncMock()) as start,
             patch.object(hentaiverse, "__aexit__", new=AsyncMock()) as close,
@@ -163,8 +320,31 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(second, session)
         preload.assert_called_once_with()
         session._setup_alert_handler.assert_awaited_once_with()
+        self.assertEqual(events, ["attach-hooks", "preload"])
         start.assert_not_awaited()
         close.assert_not_awaited()
+
+    async def test_attaching_browser_hooks_does_not_wait_for_classifier(
+        self,
+    ) -> None:
+        hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
+        session = BattleSession(
+            hentaiverse=hentaiverse,
+            auto_accept_dialogs=True,
+        )
+        session._setup_alert_handler = AsyncMock()
+
+        with patch.object(
+            session_module,
+            "preload_ponychart_classifier",
+        ) as preload:
+            first = await session.attach_browser_hooks()
+            second = await session.attach_browser_hooks()
+
+        self.assertIs(first, session)
+        self.assertIs(second, session)
+        session._setup_alert_handler.assert_awaited_once_with()
+        preload.assert_not_called()
 
     async def test_ring_of_blood_operations_delegate_to_shared_launcher(self) -> None:
         hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))

@@ -1,6 +1,7 @@
 """State inspection and atomic actions for one HentaiVerse battle session."""
 
 import asyncio
+from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, Self
 
@@ -153,10 +154,125 @@ class BattleSession:
         return await self.hentaiverse.realm.current() is Realm.ISEKAI
 
     async def __aenter__(self) -> Self:
-        await self._ensure_classifier()
-        await self.hentaiverse.start(
-            on_browser_ready=self._on_browser_ready,
+        async def capture(operation: Awaitable[Any]) -> BaseException | None:
+            try:
+                await operation
+            except BaseException as error:
+                return error
+            return None
+
+        async def startup() -> tuple[BaseException | None, BaseException | None]:
+            browser_error, classifier_error = await asyncio.gather(
+                capture(
+                    self.hentaiverse.start(
+                        on_browser_ready=self._on_browser_ready,
+                    )
+                ),
+                capture(self._ensure_classifier()),
+            )
+            return browser_error, classifier_error
+
+        startup_task = asyncio.create_task(startup())
+        startup_errors, delayed_cancellation = await self._wait_for_startup_task(
+            startup_task
         )
+        browser_error, classifier_error = startup_errors
+        primary_error = browser_error or classifier_error
+        if primary_error is None and delayed_cancellation is None:
+            return self
+
+        cleanup_cause = delayed_cancellation or primary_error
+        assert cleanup_cause is not None
+        cleanup_task = asyncio.create_task(
+            self.hentaiverse.__aexit__(
+                type(cleanup_cause),
+                cleanup_cause,
+                cleanup_cause.__traceback__,
+            )
+        )
+        cleanup_error, cleanup_cancellation = await self._wait_for_cleanup_task(
+            cleanup_task
+        )
+        cancellation = delayed_cancellation or cleanup_cancellation
+        secondary_error = classifier_error if browser_error is not None else None
+        if cancellation is not None:
+            if primary_error is not None:
+                cancellation.add_note(
+                    "battle session startup also failed: "
+                    f"{type(primary_error).__name__}"
+                )
+            if secondary_error is not None:
+                cancellation.add_note(
+                    "parallel battle session startup also failed: "
+                    f"{type(secondary_error).__name__}"
+                )
+            if cleanup_error is not None:
+                cancellation.add_note(
+                    "battle session startup cleanup also failed: "
+                    f"{type(cleanup_error).__name__}"
+                )
+            raise cancellation from None
+
+        assert primary_error is not None
+        if secondary_error is not None:
+            primary_error.add_note(
+                "parallel battle session startup also failed: "
+                f"{type(secondary_error).__name__}"
+            )
+        if cleanup_error is not None:
+            primary_error.add_note(
+                "battle session startup cleanup also failed: "
+                f"{type(cleanup_error).__name__}"
+            )
+        raise primary_error
+
+    @staticmethod
+    async def _wait_for_startup_task(
+        task: asyncio.Task[tuple[BaseException | None, BaseException | None]],
+    ) -> tuple[
+        tuple[BaseException | None, BaseException | None],
+        asyncio.CancelledError | None,
+    ]:
+        """Settle both startup branches before propagating cancellation."""
+
+        delayed_cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if delayed_cancellation is None:
+                    delayed_cancellation = error
+        return task.result(), delayed_cancellation
+
+    @staticmethod
+    async def _wait_for_cleanup_task(
+        task: asyncio.Task[None],
+    ) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+        """Settle startup cleanup before propagating repeated cancellation."""
+
+        delayed_cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if delayed_cancellation is None:
+                    delayed_cancellation = error
+        try:
+            task.result()
+        except BaseException as error:
+            return error, delayed_cancellation
+        return None, delayed_cancellation
+
+    async def attach_browser_hooks(self) -> Self:
+        """Install browser hooks without waiting for classifier preload.
+
+        Account-level orchestration can use this boundary immediately after
+        login, inspect every fixed realm tab, and await one shared classifier
+        preload task only after those latency-sensitive checks are complete.
+        The operation is idempotent and never claims browser ownership.
+        """
+
+        await self._on_browser_ready()
         return self
 
     async def prepare_attached(self) -> Self:
@@ -168,8 +284,8 @@ class BattleSession:
         that already owns a fixed realm tab.
         """
 
+        await self.attach_browser_hooks()
         await self._ensure_classifier()
-        await self._on_browser_ready()
         return self
 
     async def _ensure_classifier(self) -> None:

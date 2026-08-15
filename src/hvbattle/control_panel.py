@@ -24,6 +24,12 @@ _CHECKLIST_CANVAS_HORIZONTAL_OVERHEAD = 24
 _CHECKLIST_NON_CHOICE_VERTICAL_OVERHEAD = 160
 _WINDOW_SCREEN_MARGIN = 80
 _WINDOW_CONTENT_HORIZONTAL_OVERHEAD = 48
+_CLEANUP_PROCESS_STATE = "process-state-unavailable"
+_CLEANUP_DESTROY_COMMAND = "destroy-command-failed"
+_CLEANUP_PROCESS_JOIN = "process-join-failed"
+_CLEANUP_PROCESS_TERMINATE = "process-terminate-failed"
+_CLEANUP_PROCESS_ALIVE = "process-still-alive"
+_CLEANUP_MANAGER_SHUTDOWN = "manager-shutdown-failed"
 
 
 def _publish_boolean(shared: Any, name: str, variable: Any) -> None:
@@ -816,6 +822,10 @@ class BaseControlPanel(ABC):
     def get_forbidden_skills(self) -> frozenset[str]: ...
 
     @abstractmethod
+    def is_paused(self) -> bool:
+        """Return the committed pause state without blocking."""
+
+    @abstractmethod
     async def wait_if_paused(self) -> None: ...
 
     @abstractmethod
@@ -826,33 +836,47 @@ class ControlPanel(BaseControlPanel):
     """Tk control panel hosted in a dedicated child process."""
 
     def __init__(self) -> None:
-        self._manager = multiprocessing.Manager()
-        self._pause_flag = self._manager.Event()
-        self._toggle_dict = self._manager.dict()
-        self._integer_dict = self._manager.dict()
-        self._checklist_dict = self._manager.dict()
-        self._checklist_lock = self._manager.RLock()
-        self._checklist_observed_revisions: dict[str, int] = {}
-        self._skill_dict = self._manager.dict()
-        self._cmd_queue = self._manager.Queue()
-        ready_event = self._manager.Event()
         self._destroyed = False
-        self._process = multiprocessing.Process(
-            target=_run_gui,
-            args=(
-                self._pause_flag,
-                self._toggle_dict,
-                self._integer_dict,
-                self._checklist_dict,
-                self._checklist_lock,
-                self._skill_dict,
-                self._cmd_queue,
-                ready_event,
-            ),
-            daemon=True,
-        )
-        self._process.start()
-        self._wait_until_ready(ready_event)
+        self._manager: Any = None
+        self._pause_flag: Any = None
+        self._toggle_dict: Any = None
+        self._integer_dict: Any = None
+        self._checklist_dict: Any = None
+        self._checklist_lock: Any = None
+        self._checklist_observed_revisions: dict[str, int] = {}
+        self._skill_dict: Any = None
+        self._cmd_queue: Any = None
+        self._process: Any = None
+        try:
+            self._manager = multiprocessing.Manager()
+            self._pause_flag = self._manager.Event()
+            self._toggle_dict = self._manager.dict()
+            self._integer_dict = self._manager.dict()
+            self._checklist_dict = self._manager.dict()
+            self._checklist_lock = self._manager.RLock()
+            self._skill_dict = self._manager.dict()
+            self._cmd_queue = self._manager.Queue()
+            ready_event = self._manager.Event()
+            self._process = multiprocessing.Process(
+                target=_run_gui,
+                args=(
+                    self._pause_flag,
+                    self._toggle_dict,
+                    self._integer_dict,
+                    self._checklist_dict,
+                    self._checklist_lock,
+                    self._skill_dict,
+                    self._cmd_queue,
+                    ready_event,
+                ),
+                daemon=True,
+            )
+            self._process.start()
+            self._wait_until_ready(ready_event)
+        except BaseException:
+            self._destroyed = True
+            self._report_cleanup_failures("startup", self._cleanup_resources())
+            raise
 
     def _wait_until_ready(self, ready_event: Any) -> None:
         deadline = time.monotonic() + _GUI_START_TIMEOUT
@@ -863,11 +887,77 @@ class ControlPanel(BaseControlPanel):
                 break
             if not self._process.is_alive():
                 break
-        if self._process.is_alive():
-            self._process.terminate()
-        self._process.join(timeout=_GUI_STOP_TIMEOUT)
-        self._manager.shutdown()
         raise RuntimeError("Battle control panel failed to start")
+
+    def _cleanup_resources(self) -> tuple[str, ...]:
+        """Best-effort cleanup for both partial startup and normal destroy."""
+
+        reasons: list[str] = []
+
+        def record(reason: str) -> None:
+            if reason not in reasons:
+                reasons.append(reason)
+
+        process = self._process
+        if process is not None:
+            alive: bool | None
+            try:
+                alive = bool(process.is_alive())
+            except BaseException:
+                alive = None
+                record(_CLEANUP_PROCESS_STATE)
+
+            if alive is not False:
+                try:
+                    if self._cmd_queue is None:
+                        raise RuntimeError
+                    self._cmd_queue.put(("destroy", None))
+                except BaseException:
+                    record(_CLEANUP_DESTROY_COMMAND)
+
+            try:
+                process.join(timeout=_GUI_STOP_TIMEOUT)
+            except BaseException:
+                record(_CLEANUP_PROCESS_JOIN)
+
+            try:
+                alive = bool(process.is_alive())
+            except BaseException:
+                alive = None
+                record(_CLEANUP_PROCESS_STATE)
+
+            if alive is not False:
+                try:
+                    process.terminate()
+                except BaseException:
+                    record(_CLEANUP_PROCESS_TERMINATE)
+                try:
+                    process.join(timeout=_GUI_STOP_TIMEOUT)
+                except BaseException:
+                    record(_CLEANUP_PROCESS_JOIN)
+
+            try:
+                if process.is_alive():
+                    record(_CLEANUP_PROCESS_ALIVE)
+            except BaseException:
+                record(_CLEANUP_PROCESS_STATE)
+
+        if self._manager is not None:
+            try:
+                self._manager.shutdown()
+            except BaseException:
+                record(_CLEANUP_MANAGER_SHUTDOWN)
+
+        return tuple(reasons)
+
+    @staticmethod
+    def _report_cleanup_failures(phase: str, reasons: tuple[str, ...]) -> None:
+        if reasons:
+            logger.warning(
+                "Battle control panel cleanup incomplete phase=%s reason_codes=%s",
+                phase,
+                ",".join(reasons),
+            )
 
     def _require_live_gui(self) -> None:
         """Fail closed instead of using stale state after the GUI exits."""
@@ -1039,13 +1129,27 @@ class ControlPanel(BaseControlPanel):
         self._require_live_gui()
         return forbidden
 
+    def is_paused(self) -> bool:
+        """Read the live pause flag, failing closed if the GUI is unavailable."""
+
+        self._require_live_gui()
+        try:
+            paused = self._pause_flag.is_set()
+        except Exception as error:
+            self._pause_best_effort()
+            raise RuntimeError(
+                "Battle control panel pause state is unavailable"
+            ) from error
+        self._require_live_gui()
+        if not isinstance(paused, bool):
+            self._pause_best_effort()
+            raise RuntimeError("Battle control panel returned an invalid pause state")
+        return paused
+
     async def wait_if_paused(self) -> None:
         waiting = False
         while True:
-            self._require_live_gui()
-            paused = self._pause_flag.is_set()
-            self._require_live_gui()
-            if not paused:
+            if not self.is_paused():
                 if waiting:
                     logger.info("Battle control panel resumed")
                 return
@@ -1058,15 +1162,7 @@ class ControlPanel(BaseControlPanel):
         if self._destroyed:
             return
         self._destroyed = True
-        try:
-            if self._process.is_alive():
-                self._cmd_queue.put(("destroy", None))
-                self._process.join(timeout=_GUI_STOP_TIMEOUT)
-            if self._process.is_alive():
-                self._process.terminate()
-                self._process.join(timeout=_GUI_STOP_TIMEOUT)
-        finally:
-            self._manager.shutdown()
+        self._report_cleanup_failures("destroy", self._cleanup_resources())
 
 
 class NullControlPanel(BaseControlPanel):
@@ -1150,6 +1246,9 @@ class NullControlPanel(BaseControlPanel):
 
     def get_forbidden_skills(self) -> frozenset[str]:
         return self._forbidden_skills
+
+    def is_paused(self) -> bool:
+        return False
 
     async def wait_if_paused(self) -> None:
         return

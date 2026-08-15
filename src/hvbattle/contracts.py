@@ -1,5 +1,6 @@
 """Stable contracts between battle sessions, runners, and client policies."""
 
+import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -155,6 +156,7 @@ class BattleStepProgress:
 class BattleStepIdleReason(StrEnum):
     """Why a cooperative runner yielded without changing server state."""
 
+    PAUSED = "paused"
     POLICY = "policy"
     RETRYABLE_TIMEOUT = "retryable-timeout"
     TRANSITION_CONFIRMATION = "transition-confirmation"
@@ -168,8 +170,13 @@ class BattleStepIdle:
     reason: BattleStepIdleReason = BattleStepIdleReason.POLICY
 
     def __post_init__(self) -> None:
-        if self.retry_after < 0:
-            raise ValueError("retry_after must not be negative")
+        if (
+            not isinstance(self.retry_after, (int, float))
+            or isinstance(self.retry_after, bool)
+            or not math.isfinite(self.retry_after)
+            or self.retry_after < 0
+        ):
+            raise ValueError("retry_after must be a finite non-negative number")
 
 
 type BattleStepResult = (

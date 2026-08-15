@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import math
 from collections.abc import Awaitable, Callable
 
 from hvbrowser.runtime import setup_logger
@@ -29,8 +30,8 @@ from .strategy import BattleStrategy
 logger = setup_logger(__name__)
 
 
-async def _not_paused() -> None:
-    return
+def _not_paused() -> bool:
+    return False
 
 
 class BattleRunner:
@@ -47,7 +48,7 @@ class BattleRunner:
         session: BattleSession,
         strategy: BattleStrategy,
         *,
-        wait_if_paused: Callable[[], Awaitable[None]] = _not_paused,
+        pause_requested: Callable[[], bool] = _not_paused,
         timeout_retries: int = 3,
         idle_delay: float = 2,
         retry_delay: float = 5,
@@ -59,13 +60,20 @@ class BattleRunner:
             raise ValueError("timeout_retries must be at least 1")
         if transition_checks < 1:
             raise ValueError("transition_checks must be at least 1")
-        if challenge_poll_interval <= 0:
-            raise ValueError("challenge_poll_interval must be positive")
+        if (
+            not isinstance(challenge_poll_interval, (int, float))
+            or isinstance(challenge_poll_interval, bool)
+            or not math.isfinite(challenge_poll_interval)
+            or challenge_poll_interval <= 0
+        ):
+            raise ValueError("challenge_poll_interval must be finite and positive")
         if idle_delay < 0:
             raise ValueError("idle_delay must not be negative")
+        if not callable(pause_requested):
+            raise TypeError("pause_requested must be callable")
         self.session = session
         self.strategy = strategy
-        self.wait_if_paused = wait_if_paused
+        self.pause_requested = pause_requested
         self.timeout_retries = timeout_retries
         self.idle_delay = idle_delay
         self.retry_delay = retry_delay
@@ -142,15 +150,9 @@ class BattleRunner:
 
         while True:
             try:
-                if await self.session.resolve_ponychart():
-                    return self._confirmed_progress(
-                        BattleStepProgressKind.PONYCHART_RESOLVED
-                    )
-
-                if await self._wait_while_servicing_ponychart():
-                    return self._confirmed_progress(
-                        BattleStepProgressKind.PONYCHART_RESOLVED
-                    )
+                pause_result = await self._service_ponychart_or_pause()
+                if pause_result is not None:
+                    return pause_result
                 if await self.session.resolve_ponychart():
                     return self._confirmed_progress(
                         BattleStepProgressKind.PONYCHART_RESOLVED
@@ -169,10 +171,16 @@ class BattleRunner:
                     # code is allowed to act.
                     continue
                 if prepared.phase is BattleTurnPhase.COMPLETE:
+                    pause_result = await self._service_ponychart_or_pause()
+                    if pause_result is not None:
+                        return pause_result
                     return await self._acknowledge_completion()
                 if prepared.phase is BattleTurnPhase.ABSENT:
                     if self.session.battle_completion_observed:
                         self._clear_transition_confirmation()
+                        pause_result = await self._service_ponychart_or_pause()
+                        if pause_result is not None:
+                            return pause_result
                         return await self._acknowledge_completion()
                     if not self._transition_pending:
                         self._transition_pending = True
@@ -186,6 +194,9 @@ class BattleRunner:
                         continue
                     if self.session.battle_completion_observed:
                         self._clear_transition_confirmation()
+                        pause_result = await self._service_ponychart_or_pause()
+                        if pause_result is not None:
+                            return pause_result
                         return await self._acknowledge_completion()
                     self._transition_checks_completed += 1
                     if self._transition_checks_completed >= self.transition_checks:
@@ -198,10 +209,9 @@ class BattleRunner:
                         reason=BattleStepIdleReason.TRANSITION_CONFIRMATION,
                     )
                 if prepared.phase is BattleTurnPhase.NEXT_FLOOR:
-                    if await self._wait_while_servicing_ponychart():
-                        return self._confirmed_progress(
-                            BattleStepProgressKind.PONYCHART_RESOLVED
-                        )
+                    pause_result = await self._service_ponychart_or_pause()
+                    if pause_result is not None:
+                        return pause_result
                     if await self.session.resolve_ponychart():
                         return self._confirmed_progress(
                             BattleStepProgressKind.PONYCHART_RESOLVED
@@ -220,10 +230,9 @@ class BattleRunner:
                         f"Unsupported battle turn phase: {prepared.phase!r}"
                     )
 
-                if await self._wait_while_servicing_ponychart():
-                    return self._confirmed_progress(
-                        BattleStepProgressKind.PONYCHART_RESOLVED
-                    )
+                pause_result = await self._service_ponychart_or_pause()
+                if pause_result is not None:
+                    return pause_result
                 if await self.session.resolve_ponychart():
                     return self._confirmed_progress(
                         BattleStepProgressKind.PONYCHART_RESOLVED
@@ -286,16 +295,18 @@ class BattleRunner:
         if self._initialized:
             return None
 
-        if await self.session.resolve_ponychart():
-            return self._confirmed_progress(BattleStepProgressKind.PONYCHART_RESOLVED)
-        if await self._wait_while_servicing_ponychart():
-            return self._confirmed_progress(BattleStepProgressKind.PONYCHART_RESOLVED)
+        pause_result = await self._service_ponychart_or_pause()
+        if pause_result is not None:
+            return pause_result
         presence = await self.session.inspect_battle_presence()
         if presence is BattlePresence.ABSENT:
             return BattleAbsent()
 
         self._is_isekai = await self.session.is_isekai
         if presence is BattlePresence.COMPLETION:
+            pause_result = await self._service_ponychart_or_pause()
+            if pause_result is not None:
+                return pause_result
             return await self._acknowledge_completion()
         if presence is not BattlePresence.ACTIVE:
             raise TypeError("BattleSession returned an unsupported battle presence")
@@ -452,21 +463,19 @@ class BattleRunner:
         self._transition_pending = False
         self._transition_checks_completed = 0
 
-    async def _wait_while_servicing_ponychart(self) -> bool:
-        """Honor pause, service timed challenges, and report any safe receipt."""
-        pause_task: asyncio.Future[None] = asyncio.ensure_future(self.wait_if_paused())
-        try:
-            while not pause_task.done():
-                done, _ = await asyncio.wait(
-                    {pause_task}, timeout=self.challenge_poll_interval
-                )
-                if pause_task not in done and await self.session.resolve_ponychart():
-                    # Yield on the first resolved challenge. A later step will
-                    # recreate the pause waiter if the caller is still paused.
-                    return True
-            await pause_task
-            return False
-        finally:
-            if not pause_task.done():
-                pause_task.cancel()
-                await asyncio.gather(pause_task, return_exceptions=True)
+    async def _service_ponychart_or_pause(
+        self,
+    ) -> BattleStepProgress | BattleStepIdle | None:
+        """Resolve a timed challenge before cooperatively deferring for Pause."""
+
+        if await self.session.resolve_ponychart():
+            return self._confirmed_progress(BattleStepProgressKind.PONYCHART_RESOLVED)
+        paused = self.pause_requested()
+        if not isinstance(paused, bool):
+            raise TypeError("pause_requested() must return bool")
+        if not paused:
+            return None
+        return BattleStepIdle(
+            retry_after=self.challenge_poll_interval,
+            reason=BattleStepIdleReason.PAUSED,
+        )

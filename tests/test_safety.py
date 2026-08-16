@@ -206,7 +206,7 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
         self.assertEqual(
-            output.count("Round 2/10 HP 87.0% MP 100.0% SP 42.0% OC 30.0"), 1
+            output.count("Round 2/10 HP 87.0% MP 100.0% SP 42.0% OC 30"), 1
         )
         self.assertNotIn("You hit a monster.", output)
         self.assertNotIn("Round   0 / 0", output)
@@ -247,23 +247,23 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
             info.call_args_list,
             [
                 call(
-                    "Round %d/%d HP %.1f%% MP %.1f%% SP %.1f%% OC %.1f",
+                    "Round %d/%d HP %.1f%% MP %.1f%% SP %.1f%% OC %d",
                     2,
                     10,
                     87.0,
                     100.0,
                     42.0,
-                    30.0,
+                    30,
                     extra={"activity": "Battle"},
                 ),
                 call(
-                    "Round %d/%d HP %.1f%% MP %.1f%% SP %.1f%% OC %.1f",
+                    "Round %d/%d HP %.1f%% MP %.1f%% SP %.1f%% OC %d",
                     3,
                     10,
                     87.0,
                     100.0,
                     42.0,
-                    30.0,
+                    30,
                     extra={"activity": "Battle"},
                 ),
             ],

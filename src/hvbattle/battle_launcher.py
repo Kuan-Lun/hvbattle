@@ -3,8 +3,17 @@
 import json
 import re
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
-from hvbrowser import HENTAIVERSE_ROOT_URL, HVDriver, Realm, RealmNavigator
+from hvbrowser import (
+    HENTAIVERSE_ROOT_URL,
+    HVDriver,
+    MaintenanceNavigationBlockedError,
+    Realm,
+    RealmNavigator,
+    classify_maintenance_navigation_blocker,
+    realm_from_url,
+)
 from hvbrowser.runtime import setup_logger
 
 from .contracts import (
@@ -46,6 +55,27 @@ _RING_OF_BLOOD_ATOMIC_RESULTS = frozenset(
         "missing-exact-action",
     }
 )
+_BATTLE_MENU_LABELS = {
+    "ar": "The Arena",
+    "rb": "Ring of Blood",
+    "gr": "GrindFest",
+}
+_BATTLE_ROUTE_READY_SCRIPTS = {
+    "ar": "Boolean(document.getElementById('arena_list'))",
+    "rb": (
+        "Boolean(document.getElementById('arena_list') "
+        "&& document.getElementById('arena_tokens'))"
+    ),
+    "gr": "Boolean(document.getElementById('grindfest'))",
+}
+
+
+class _BattleMenuPageError(RuntimeError):
+    """The requested Battle menu route could not be opened or verified."""
+
+
+class _BattleMenuNavigationSafetyError(_BattleMenuPageError):
+    """Battle state, origin, path, or realm could not be trusted."""
 
 
 def _parse_optional_exp_multiplier(value: Any) -> float | None:
@@ -102,31 +132,189 @@ class BattleLauncher:
     async def _path_prefix(self) -> str:
         return "/isekai" if await self.realm.current() is Realm.ISEKAI else ""
 
-    async def _goto_via_battle_menu(self, label: str) -> bool:
-        battle_menu = await self.page.select("#parent_Battle")
-        target_elements = await self.page.xpath(
-            f"//div[contains(text(), '{label}')]", timeout=5
-        )
-        if not target_elements:
-            logger.warning("Unable to find %r in the Battle menu", label)
-            return False
+    async def _goto_via_battle_menu(self, route: str) -> bool:
+        label = _BATTLE_MENU_LABELS[route]
+        realm = await self._trusted_current_realm()
+        try:
+            await self._open_battle_route_from_menu(realm, route)
+            return True
+        except MaintenanceNavigationBlockedError:
+            raise
+        except _BattleMenuNavigationSafetyError:
+            raise
+        except _BattleMenuPageError as error:
+            logger.warning(
+                "Battle menu navigation did not open the requested page; "
+                "retrying once through the realm-scoped direct URL: "
+                "kind=%s realm=%s error_type=%s",
+                label,
+                realm.value,
+                type(error).__name__,
+            )
 
-        await battle_menu.mouse_move()
-        await target_elements[0].mouse_move()
-        await self.browser.wait(
-            target_elements[0].mouse_click,
-            ischangeurl=True,
-        )
+        await self._open_battle_route_directly(realm, route)
         return True
 
+    async def _open_battle_route_from_menu(
+        self,
+        realm: Realm,
+        route: str,
+    ) -> None:
+        await self._ensure_battle_navigation_is_safe("before opening Battle menu")
+        try:
+            battle_menu = await self.page.select("#parent_Battle")
+        except Exception as error:
+            raise _BattleMenuPageError("Battle menu is missing") from error
+        if battle_menu is None:
+            raise _BattleMenuPageError("Battle menu is missing")
+
+        menu_xpath = (
+            "//*[@id='child_Battle']"
+            "//*[@onclick and contains(@onclick, 's=Battle') "
+            f"and contains(@onclick, 'ss={route}')]"
+            " | //*[@id='child_Battle']//a[contains(@href, 's=Battle') "
+            f"and contains(@href, 'ss={route}')]"
+        )
+        try:
+            target_elements = await self.page.xpath(menu_xpath, timeout=5)
+        except Exception as error:
+            raise _BattleMenuPageError(
+                f"Unable to find {_BATTLE_MENU_LABELS[route]} in the Battle menu"
+            ) from error
+        if not target_elements:
+            raise _BattleMenuPageError(
+                f"Unable to find {_BATTLE_MENU_LABELS[route]} in the Battle menu"
+            )
+
+        try:
+            await battle_menu.mouse_move()
+            await target_elements[0].mouse_move()
+            await self.browser.wait(
+                target_elements[0].mouse_click,
+                ischangeurl=True,
+            )
+        except Exception as error:
+            try:
+                await self._verify_battle_route_destination(realm, route)
+            except MaintenanceNavigationBlockedError as blocked:
+                raise blocked from error
+            except _BattleMenuNavigationSafetyError as safety_error:
+                raise safety_error from error
+            except _BattleMenuPageError:
+                pass
+            else:
+                return
+            raise _BattleMenuPageError(
+                f"Unable to open {_BATTLE_MENU_LABELS[route]}"
+            ) from error
+
+        await self._verify_battle_route_destination(realm, route)
+
+    async def _open_battle_route_directly(
+        self,
+        realm: Realm,
+        route: str,
+    ) -> None:
+        await self._ensure_battle_navigation_is_safe("before direct Battle navigation")
+        direct_url = self._battle_route_url(realm, route)
+        try:
+            await self.browser.get(direct_url)
+        except Exception as error:
+            try:
+                await self._ensure_battle_navigation_is_safe(
+                    "after direct Battle navigation"
+                )
+            except MaintenanceNavigationBlockedError as blocked:
+                raise blocked from error
+            except _BattleMenuNavigationSafetyError as safety_error:
+                raise safety_error from error
+            raise _BattleMenuPageError(
+                f"Unable to open {_BATTLE_MENU_LABELS[route]} through its direct URL"
+            ) from error
+
+        await self._verify_battle_route_destination(realm, route)
+
+    async def _trusted_current_realm(self) -> Realm:
+        try:
+            realm = await self.realm.current()
+        except Exception as error:
+            raise _BattleMenuNavigationSafetyError(
+                "Unable to determine the current Battle navigation realm"
+            ) from error
+        if not isinstance(realm, Realm):
+            raise _BattleMenuNavigationSafetyError("Battle navigation realm is invalid")
+        return realm
+
+    async def _ensure_battle_navigation_is_safe(self, context: str) -> None:
+        try:
+            blocker = await classify_maintenance_navigation_blocker(self.page)
+        except Exception as error:
+            raise _BattleMenuNavigationSafetyError(
+                f"Unable to verify battle state {context}"
+            ) from error
+        if blocker is not None:
+            raise MaintenanceNavigationBlockedError(blocker)
+
+    @staticmethod
+    def _battle_route_url(realm: Realm, route: str) -> str:
+        path_prefix = "/isekai" if realm is Realm.ISEKAI else ""
+        return f"{HENTAIVERSE_ROOT_URL}{path_prefix}/?s=Battle&ss={route}"
+
+    async def _verify_battle_route_destination(
+        self,
+        realm: Realm,
+        route: str,
+    ) -> None:
+        await self._ensure_battle_navigation_is_safe(
+            f"after opening {_BATTLE_MENU_LABELS[route]}"
+        )
+        try:
+            current_url = await self.page.evaluate("window.location.href")
+            landed_realm = realm_from_url(current_url)
+        except Exception as error:
+            raise _BattleMenuNavigationSafetyError(
+                f"Unable to verify the {_BATTLE_MENU_LABELS[route]} URL"
+            ) from error
+        if landed_realm is not realm:
+            raise _BattleMenuNavigationSafetyError(
+                "Battle navigation landed in the wrong realm"
+            )
+        if not isinstance(current_url, str):
+            raise _BattleMenuNavigationSafetyError("Battle URL is invalid")
+        parsed_url = urlsplit(current_url)
+        expected_path = "/isekai/" if realm is Realm.ISEKAI else "/"
+        if parsed_url.path != expected_path:
+            raise _BattleMenuNavigationSafetyError(
+                "Battle navigation landed on an unexpected path"
+            )
+        query = parse_qs(parsed_url.query, keep_blank_values=True)
+        expected_query = {
+            "s": ["Battle"],
+            "ss": [route],
+        }
+        if any(query.get(key) != value for key, value in expected_query.items()):
+            raise _BattleMenuPageError(
+                f"Battle navigation did not land on {_BATTLE_MENU_LABELS[route]}"
+            )
+        try:
+            route_ready = await self.page.evaluate(_BATTLE_ROUTE_READY_SCRIPTS[route])
+        except Exception as error:
+            raise _BattleMenuPageError(
+                f"Unable to inspect {_BATTLE_MENU_LABELS[route]} page structure"
+            ) from error
+        if route_ready is not True:
+            raise _BattleMenuPageError(
+                f"{_BATTLE_MENU_LABELS[route]} page structure is not ready"
+            )
+
     async def goto_arena(self) -> bool:
-        return await self._goto_via_battle_menu("The Arena")
+        return await self._goto_via_battle_menu("ar")
 
     async def goto_ring_of_blood(self) -> bool:
-        return await self._goto_via_battle_menu("Ring of Blood")
+        return await self._goto_via_battle_menu("rb")
 
     async def goto_grindfest(self) -> bool:
-        return await self._goto_via_battle_menu("GrindFest")
+        return await self._goto_via_battle_menu("gr")
 
     async def list_arena_options(self) -> tuple[ArenaOption, ...]:
         """Return Arena choices without selecting one for the client."""

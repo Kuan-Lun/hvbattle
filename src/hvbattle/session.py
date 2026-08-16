@@ -553,9 +553,13 @@ class BattleSession:
                 )
             else:
                 logger.info(
-                    "Round %d/%d",
+                    "Round %d/%d HP %.1f%% MP %.1f%% SP %.1f%% OC %.1f",
                     current_round,
                     total_rounds,
+                    self.hp_percent,
+                    self.mp_percent,
+                    self.sp_percent,
+                    self.overcharge,
                     extra={"activity": "Battle"},
                 )
             self._last_reported_round_progress = progress_key

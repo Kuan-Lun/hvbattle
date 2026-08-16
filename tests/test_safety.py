@@ -183,7 +183,12 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.is_ponychart_present = AsyncMock(return_value=False)
         session.battle_dashboard = Mock()
         session.battle_dashboard.update = AsyncMock()
-        session.battle_dashboard.snap = SimpleNamespace(warnings=[])
+        session.battle_dashboard.snap = SimpleNamespace(
+            warnings=[],
+            player=SimpleNamespace(
+                hp_percent=87.0, mp_percent=100.0, sp_percent=42.0, overcharge_value=30
+            ),
+        )
         session.battle_dashboard.overview_monsters.alive_monster = [0]
         session.battle_dashboard.log_entries.current_round = 2
         session.battle_dashboard.log_entries.total_round = 0
@@ -200,7 +205,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
             output.count("Battle detected; round data is not available yet"),
             1,
         )
-        self.assertEqual(output.count("Round 2/10"), 1)
+        self.assertEqual(
+            output.count("Round 2/10 HP 87.0% MP 100.0% SP 42.0% OC 30.0"), 1
+        )
         self.assertNotIn("You hit a monster.", output)
         self.assertNotIn("Round   0 / 0", output)
 
@@ -216,7 +223,12 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.is_ponychart_present = AsyncMock(return_value=False)
         session.battle_dashboard = Mock()
         session.battle_dashboard.update = AsyncMock()
-        session.battle_dashboard.snap = SimpleNamespace(warnings=[])
+        session.battle_dashboard.snap = SimpleNamespace(
+            warnings=[],
+            player=SimpleNamespace(
+                hp_percent=87.0, mp_percent=100.0, sp_percent=42.0, overcharge_value=30
+            ),
+        )
         session.battle_dashboard.overview_monsters.alive_monster = [0]
         session.battle_dashboard.log_entries.current_round = 2
         session.battle_dashboard.log_entries.total_round = 10
@@ -235,15 +247,23 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
             info.call_args_list,
             [
                 call(
-                    "Round %d/%d",
+                    "Round %d/%d HP %.1f%% MP %.1f%% SP %.1f%% OC %.1f",
                     2,
                     10,
+                    87.0,
+                    100.0,
+                    42.0,
+                    30.0,
                     extra={"activity": "Battle"},
                 ),
                 call(
-                    "Round %d/%d",
+                    "Round %d/%d HP %.1f%% MP %.1f%% SP %.1f%% OC %.1f",
                     3,
                     10,
+                    87.0,
+                    100.0,
+                    42.0,
+                    30.0,
                     extra={"activity": "Battle"},
                 ),
             ],
@@ -308,7 +328,12 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.is_ponychart_present = AsyncMock(return_value=False)
         session.battle_dashboard = Mock()
         session.battle_dashboard.update = AsyncMock()
-        session.battle_dashboard.snap = SimpleNamespace(warnings=first_warnings)
+        session.battle_dashboard.snap = SimpleNamespace(
+            warnings=first_warnings,
+            player=SimpleNamespace(
+                hp_percent=87.0, mp_percent=100.0, sp_percent=42.0, overcharge_value=30
+            ),
+        )
         session.battle_dashboard.overview_monsters.alive_monster = [0]
         session.battle_dashboard.log_entries.current_round = 2
         session.battle_dashboard.log_entries.total_round = 10

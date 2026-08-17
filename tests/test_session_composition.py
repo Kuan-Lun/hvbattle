@@ -14,7 +14,6 @@ from hvbattle import (
     RingOfBloodSnapshot,
     RingOfBloodStartOutcome,
 )
-from hvbattle.battle_state import BattleStateStore
 
 
 class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
@@ -65,10 +64,6 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             session.action_dialog_tracker,
         )
         self.assertFalse(hasattr(browser, "_hvbattle_action_lock"))
-
-        with self.assertRaisesRegex(AttributeError, "read-only compatibility"):
-            session.battle_dashboard = BattleStateStore(browser)
-        self.assertIs(items.state_store, session.battle_state)
 
     def test_injected_session_cannot_be_combined_with_browser_options(self) -> None:
         hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
@@ -405,7 +400,6 @@ class BattleSessionBoundaryTests(unittest.TestCase):
         self.assertEqual(session.mp_percent, 50.0)
         self.assertEqual(session.sp_percent, 75.0)
         self.assertEqual(session.overcharge, 240.0)
-        self.assertEqual(session.get_stat_percent("overcharge"), 240.0)
 
 
 if __name__ == "__main__":

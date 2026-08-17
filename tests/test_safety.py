@@ -39,8 +39,8 @@ from hvbattle import (
 )
 from hvbattle._zendriver import ZendriverOperationTimeout
 from hvbattle.battle_launcher import BattleLauncher
+from hvbattle.battle_state import BattleStateStore, CombatLogTracker
 from hvbattle.hv_battle_buff_manager import BuffManager
-from hvbattle.hv_battle_observer_pattern import BattleDashboard, LogEntry
 from hvbattle.hv_battle_ponychart import PonyChart
 from hvbattle.recovery import ActionDialogTracker
 
@@ -98,8 +98,8 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
 
     def test_snapshot_is_unavailable_before_first_prepared_turn(self) -> None:
         session = object.__new__(BattleSession)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.snap = None
+        session.battle_state = Mock()
+        session.battle_state.snap = None
 
         with self.assertRaisesRegex(RuntimeError, "before prepare_turn"):
             _ = session.snapshot
@@ -123,20 +123,20 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BattleInterruptedError, "Target disappeared"):
             await BattleSession.attack_monster_by_skill(session, 3, "imperil")
 
-    async def test_challenge_presence_is_checked_before_dashboard_parse(self) -> None:
+    async def test_challenge_presence_is_checked_before_state_parse(self) -> None:
         session = object.__new__(BattleSession)
         session.is_ponychart_present = AsyncMock(return_value=True)
         session._read_battle_phase = AsyncMock()
         session._has_battle_marker = AsyncMock()
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.inspect = AsyncMock(
+        session.battle_state = Mock()
+        session.battle_state.inspect = AsyncMock(
             side_effect=AssertionError("ordinary parser ran before PonyChart")
         )
 
         active = await BattleSession.is_in_battle(session)
 
         self.assertTrue(active)
-        session.battle_dashboard.inspect.assert_not_awaited()
+        session.battle_state.inspect.assert_not_awaited()
         session._read_battle_phase.assert_not_awaited()
         session._has_battle_marker.assert_not_awaited()
 
@@ -166,9 +166,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.round = 3
         session._has_battle_marker = AsyncMock(return_value=False)
 
-        prepared = await BattleSession.prepare_turn(session)
+        state = await BattleSession.prepare_turn_state(session)
 
-        self.assertIsNone(prepared)
+        self.assertFalse(state.actionable)
         self.assertEqual(session.turn, 4)
 
     async def test_resumed_turn_logs_unknown_then_available_progress_once(
@@ -181,24 +181,24 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session._has_battle_marker = AsyncMock(return_value=True)
         session._read_battle_phase = AsyncMock(return_value="active")
         session.is_ponychart_present = AsyncMock(return_value=False)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.update = AsyncMock()
-        session.battle_dashboard.snap = SimpleNamespace(
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock()
+        session.battle_state.snap = SimpleNamespace(
             warnings=[],
             player=SimpleNamespace(
                 hp_percent=87.0, mp_percent=100.0, sp_percent=42.0, overcharge_value=30
             ),
         )
-        session.battle_dashboard.overview_monsters.alive_monster = [0]
-        session.battle_dashboard.log_entries.current_round = 2
-        session.battle_dashboard.log_entries.total_round = 0
-        session.battle_dashboard.log_entries.current_lines = ["You hit a monster."]
+        session.battle_state.overview_monsters.alive_monster = [0]
+        session.battle_state.log_entries.current_round = 2
+        session.battle_state.log_entries.total_round = 0
+        session.battle_state.log_entries.current_lines = ["You hit a monster."]
 
         with self.assertLogs("hvbattle.session", level="INFO") as captured:
-            await BattleSession.prepare_turn(session)
-            await BattleSession.prepare_turn(session)
-            session.battle_dashboard.log_entries.total_round = 10
-            await BattleSession.prepare_turn(session)
+            await BattleSession.prepare_turn_state(session)
+            await BattleSession.prepare_turn_state(session)
+            session.battle_state.log_entries.total_round = 10
+            await BattleSession.prepare_turn_state(session)
 
         output = "\n".join(captured.output)
         self.assertEqual(
@@ -221,27 +221,27 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session._has_battle_marker = AsyncMock(return_value=True)
         session._read_battle_phase = AsyncMock(return_value="active")
         session.is_ponychart_present = AsyncMock(return_value=False)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.update = AsyncMock()
-        session.battle_dashboard.snap = SimpleNamespace(
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock()
+        session.battle_state.snap = SimpleNamespace(
             warnings=[],
             player=SimpleNamespace(
                 hp_percent=87.0, mp_percent=100.0, sp_percent=42.0, overcharge_value=30
             ),
         )
-        session.battle_dashboard.overview_monsters.alive_monster = [0]
-        session.battle_dashboard.log_entries.current_round = 2
-        session.battle_dashboard.log_entries.total_round = 10
-        session.battle_dashboard.log_entries.current_lines = ["You hit a monster."]
+        session.battle_state.overview_monsters.alive_monster = [0]
+        session.battle_state.log_entries.current_round = 2
+        session.battle_state.log_entries.total_round = 10
+        session.battle_state.log_entries.current_lines = ["You hit a monster."]
 
         with (
             patch.object(session_module.logger, "info") as info,
             patch.object(session_module.logger, "debug") as debug,
         ):
-            first_lines = await BattleSession.prepare_turn(session)
-            second_lines = await BattleSession.prepare_turn(session)
-            session.battle_dashboard.log_entries.current_round = 3
-            third_lines = await BattleSession.prepare_turn(session)
+            first_state = await BattleSession.prepare_turn_state(session)
+            second_state = await BattleSession.prepare_turn_state(session)
+            session.battle_state.log_entries.current_round = 3
+            third_state = await BattleSession.prepare_turn_state(session)
 
         self.assertEqual(
             info.call_args_list,
@@ -276,16 +276,19 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
                 call("%s", "Turn     2 Round   3 / 10  You hit a monster."),
             ],
         )
+        self.assertTrue(first_state.actionable)
         self.assertEqual(
-            first_lines,
+            first_state.log_lines,
             ("Turn     0 Round   2 / 10  You hit a monster.",),
         )
+        self.assertTrue(second_state.actionable)
         self.assertEqual(
-            second_lines,
+            second_state.log_lines,
             ("Turn     1 Round   2 / 10  You hit a monster.",),
         )
+        self.assertTrue(third_state.actionable)
         self.assertEqual(
-            third_lines,
+            third_state.log_lines,
             ("Turn     2 Round   3 / 10  You hit a monster.",),
         )
 
@@ -326,30 +329,30 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session._has_battle_marker = AsyncMock(return_value=True)
         session._read_battle_phase = AsyncMock(return_value="active")
         session.is_ponychart_present = AsyncMock(return_value=False)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.update = AsyncMock()
-        session.battle_dashboard.snap = SimpleNamespace(
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock()
+        session.battle_state.snap = SimpleNamespace(
             warnings=first_warnings,
             player=SimpleNamespace(
                 hp_percent=87.0, mp_percent=100.0, sp_percent=42.0, overcharge_value=30
             ),
         )
-        session.battle_dashboard.overview_monsters.alive_monster = [0]
-        session.battle_dashboard.log_entries.current_round = 2
-        session.battle_dashboard.log_entries.total_round = 10
-        session.battle_dashboard.log_entries.current_lines = []
+        session.battle_state.overview_monsters.alive_monster = [0]
+        session.battle_state.log_entries.current_round = 2
+        session.battle_state.log_entries.total_round = 10
+        session.battle_state.log_entries.current_lines = []
 
         with (
             patch.object(session_module.logger, "info"),
             patch.object(session_module.logger, "warning") as warning,
             patch.object(session_module.logger, "debug") as debug,
         ):
-            await BattleSession.prepare_turn(session)
-            await BattleSession.prepare_turn(session)
-            session.battle_dashboard.snap.warnings = hidden_warning_changed
-            await BattleSession.prepare_turn(session)
-            session.battle_dashboard.snap.warnings = visible_warning_changed
-            await BattleSession.prepare_turn(session)
+            await BattleSession.prepare_turn_state(session)
+            await BattleSession.prepare_turn_state(session)
+            session.battle_state.snap.warnings = hidden_warning_changed
+            await BattleSession.prepare_turn_state(session)
+            session.battle_state.snap.warnings = visible_warning_changed
+            await BattleSession.prepare_turn_state(session)
 
         displayed_warnings = ", ".join(first_warnings[:5])
         changed_displayed_warnings = ", ".join(visible_warning_changed[:5])
@@ -412,15 +415,15 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session._has_battle_marker = AsyncMock(return_value=True)
         session._read_battle_phase = AsyncMock(return_value="active")
         session.is_ponychart_present = AsyncMock(return_value=False)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.update = AsyncMock()
-        session.battle_dashboard.snap = SimpleNamespace(warnings=[])
-        session.battle_dashboard.overview_monsters.alive_monster = []
-        session.battle_dashboard.log_entries.current_round = 5
-        session.battle_dashboard.log_entries.total_round = 5
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock()
+        session.battle_state.snap = SimpleNamespace(warnings=[])
+        session.battle_state.overview_monsters.alive_monster = []
+        session.battle_state.log_entries.current_round = 5
+        session.battle_state.log_entries.total_round = 5
 
         with self.assertRaisesRegex(TimeoutError, "no monsters"):
-            await BattleSession.prepare_turn(session)
+            await BattleSession.prepare_turn_state(session)
 
         self.assertFalse(session.battle_completion_observed)
         self.assertEqual(session.turn, 0)
@@ -435,23 +438,23 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session._has_battle_marker = AsyncMock(return_value=True)
         session._read_battle_phase = AsyncMock(return_value="complete")
         session.is_ponychart_present = AsyncMock(return_value=False)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.update = AsyncMock()
-        session.battle_dashboard.snap = SimpleNamespace(warnings=[])
-        session.battle_dashboard.overview_monsters.alive_monster = []
-        session.battle_dashboard.log_entries.current_round = 5
-        session.battle_dashboard.log_entries.total_round = 5
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock()
+        session.battle_state.snap = SimpleNamespace(warnings=[])
+        session.battle_state.overview_monsters.alive_monster = []
+        session.battle_state.log_entries.current_round = 5
+        session.battle_state.log_entries.total_round = 5
 
         with (
             patch.object(session_module.logger, "info") as info,
             patch.object(session_module.logger, "debug") as debug,
         ):
-            prepared = await BattleSession.prepare_turn(session)
+            state = await BattleSession.prepare_turn_state(session)
 
-        self.assertIsNone(prepared)
+        self.assertFalse(state.actionable)
         self.assertTrue(session.battle_completion_observed)
         self.assertEqual(session.turn, 0)
-        session.battle_dashboard.update.assert_not_awaited()
+        session.battle_state.update.assert_not_awaited()
         info.assert_not_called()
         debug.assert_called_once_with("Final battle completion control is ready.")
 
@@ -463,16 +466,17 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session._has_battle_marker = AsyncMock(return_value=True)
         session._read_battle_phase = AsyncMock(return_value="next-floor")
         session.is_ponychart_present = AsyncMock(return_value=False)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.update = AsyncMock(
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock(
             side_effect=AssertionError("parser must not run during transition")
         )
 
-        prepared = await BattleSession.prepare_turn(session)
+        state = await BattleSession.prepare_turn_state(session)
 
-        self.assertEqual(prepared, ())
+        self.assertTrue(state.actionable)
+        self.assertEqual(state.log_lines, ())
         self.assertEqual(session.turn, 3)
-        session.battle_dashboard.update.assert_not_awaited()
+        session.battle_state.update.assert_not_awaited()
 
     async def test_parser_error_reconciles_completion_that_appeared(self) -> None:
         session = object.__new__(BattleSession)
@@ -482,8 +486,8 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session._has_battle_marker = AsyncMock(return_value=True)
         session._read_battle_phase = AsyncMock(side_effect=["active", "complete"])
         session.is_ponychart_present = AsyncMock(return_value=False)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.update = AsyncMock(
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock(
             side_effect=TimeoutError("monsters disappeared during parse")
         )
 
@@ -491,11 +495,11 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
             patch.object(session_module.logger, "info") as info,
             patch.object(session_module.logger, "debug") as debug,
         ):
-            prepared = await BattleSession.prepare_turn(session)
+            state = await BattleSession.prepare_turn_state(session)
 
-        self.assertIsNone(prepared)
+        self.assertFalse(state.actionable)
         self.assertTrue(session.battle_completion_observed)
-        session.battle_dashboard.update.assert_awaited_once()
+        session.battle_state.update.assert_awaited_once()
         info.assert_not_called()
         debug.assert_called_once_with(
             "Final battle completion control appeared while parsing."
@@ -509,18 +513,18 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session._has_battle_marker = AsyncMock(return_value=True)
         session._read_battle_phase = AsyncMock(side_effect=["active", "complete"])
         session.is_ponychart_present = AsyncMock(return_value=False)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.update = AsyncMock()
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock()
 
         with (
             patch.object(session_module.logger, "info") as info,
             patch.object(session_module.logger, "debug") as debug,
         ):
-            prepared = await BattleSession.prepare_turn(session)
+            state = await BattleSession.prepare_turn_state(session)
 
-        self.assertIsNone(prepared)
+        self.assertFalse(state.actionable)
         self.assertTrue(session.battle_completion_observed)
-        session.battle_dashboard.update.assert_awaited_once_with()
+        session.battle_state.update.assert_awaited_once_with()
         info.assert_not_called()
         debug.assert_called_once_with(
             "Final battle completion control appeared after parsing."
@@ -640,10 +644,8 @@ console.log(JSON.stringify({
         session._has_battle_marker = AsyncMock(return_value=True)
         session.page = Mock()
         session.page.wait = AsyncMock()
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.inspect = AsyncMock(
-            side_effect=[first_error, last_error]
-        )
+        session.battle_state = Mock()
+        session.battle_state.inspect = AsyncMock(side_effect=[first_error, last_error])
 
         with (
             patch.object(session_module.logger, "warning") as warning,
@@ -715,8 +717,8 @@ console.log(JSON.stringify({
         session.is_ponychart_present = AsyncMock(return_value=False)
         session._read_battle_phase = AsyncMock(side_effect=["active", "complete"])
         session._has_battle_marker = AsyncMock(return_value=True)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.inspect = AsyncMock(
+        session.battle_state = Mock()
+        session.battle_state.inspect = AsyncMock(
             side_effect=ValueError("monsters disappeared during inspect")
         )
 
@@ -724,7 +726,7 @@ console.log(JSON.stringify({
 
         self.assertFalse(active)
         self.assertTrue(session.battle_completion_observed)
-        session.battle_dashboard.inspect.assert_awaited_once()
+        session.battle_state.inspect.assert_awaited_once()
 
     async def test_inspect_timeout_reconciles_next_floor_phase(self) -> None:
         session = object.__new__(BattleSession)
@@ -732,15 +734,15 @@ console.log(JSON.stringify({
         session.is_ponychart_present = AsyncMock(return_value=False)
         session._read_battle_phase = AsyncMock(side_effect=["active", "next-floor"])
         session._has_battle_marker = AsyncMock(return_value=True)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.inspect = AsyncMock(
+        session.battle_state = Mock()
+        session.battle_state.inspect = AsyncMock(
             side_effect=TimeoutError("inspect raced with transition")
         )
 
         active = await BattleSession.is_in_battle(session)
 
         self.assertTrue(active)
-        session.battle_dashboard.inspect.assert_awaited_once()
+        session.battle_state.inspect.assert_awaited_once()
 
     async def test_live_zendriver_timeout_does_not_probe_after_battle_inspect(
         self,
@@ -751,14 +753,14 @@ console.log(JSON.stringify({
         session.is_ponychart_present = AsyncMock(return_value=False)
         session._read_battle_phase = AsyncMock(return_value="active")
         session._has_battle_marker = AsyncMock(return_value=True)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.inspect = AsyncMock(side_effect=operation_timeout)
+        session.battle_state = Mock()
+        session.battle_state.inspect = AsyncMock(side_effect=operation_timeout)
 
         with self.assertRaises(ZendriverOperationTimeout) as raised:
             await BattleSession.is_in_battle(session)
 
         self.assertIs(raised.exception, operation_timeout)
-        session.battle_dashboard.inspect.assert_awaited_once_with()
+        session.battle_state.inspect.assert_awaited_once_with()
         session.is_ponychart_present.assert_awaited_once_with()
         session._read_battle_phase.assert_awaited_once_with()
 
@@ -1826,40 +1828,40 @@ class PonyChartResolutionTests(unittest.IsolatedAsyncioTestCase):
 class BattleLogTests(unittest.TestCase):
     def test_unknown_round_metadata_is_rendered_as_unknown(self) -> None:
         session = object.__new__(BattleSession)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.log_entries.current_round = 0
-        session.battle_dashboard.log_entries.total_round = 0
+        session.battle_state = Mock()
+        session.battle_state.log_entries.current_round = 0
+        session.battle_state.log_entries.total_round = 0
 
         self.assertEqual(session._round_progress_text(), "Round   ? / ?  ")
 
     def test_observed_round_metadata_is_rendered_numerically(self) -> None:
         session = object.__new__(BattleSession)
-        session.battle_dashboard = Mock()
-        session.battle_dashboard.log_entries.current_round = 2
-        session.battle_dashboard.log_entries.total_round = 10
+        session.battle_state = Mock()
+        session.battle_state.log_entries.current_round = 2
+        session.battle_state.log_entries.total_round = 10
 
         self.assertEqual(session._round_progress_text(), "Round   2 / 10 ")
 
     def test_empty_refresh_clears_previous_log_delta(self) -> None:
-        entry = LogEntry()
+        entry = CombatLogTracker()
         entry.update(SimpleNamespace(log=SimpleNamespace(lines=["first"])))
 
         entry.update(SimpleNamespace(log=SimpleNamespace(lines=[])))
 
         self.assertEqual(entry.current_lines, [])
 
-    def test_dashboard_reset_discards_previous_battle_log_state(self) -> None:
-        dashboard = BattleDashboard(Mock())
-        previous = dashboard.log_entries
+    def test_state_store_reset_discards_previous_battle_log_state(self) -> None:
+        state_store = BattleStateStore(Mock())
+        previous = state_store.log_entries
         previous.prev_lines.append("old battle")
-        dashboard.overview_monsters.alive_monster = [2]
+        state_store.overview_monsters.alive_monster = [2]
 
-        dashboard.reset()
+        state_store.reset()
 
-        self.assertIsNot(dashboard.log_entries, previous)
-        self.assertEqual(list(dashboard.log_entries.prev_lines), [])
-        self.assertEqual(dashboard.overview_monsters.alive_monster, [])
-        self.assertIsNone(dashboard.snap)
+        self.assertIsNot(state_store.log_entries, previous)
+        self.assertEqual(list(state_store.log_entries.prev_lines), [])
+        self.assertEqual(state_store.overview_monsters.alive_monster, [])
+        self.assertIsNone(state_store.snap)
 
 
 class ArchitectureTests(unittest.TestCase):

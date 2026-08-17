@@ -15,8 +15,7 @@ post-battle work belong to the calling application.
 action/item/skill/buff collaborators. The raw browser used by battle components
 is `session.hentaiverse.browser`; non-battle operations remain grouped under
 the other `session.hentaiverse` services instead of leaking into the
-battle-domain surface. The legacy `battle_dashboard` name remains a
-compatibility alias for the state store.
+battle-domain surface.
 
 Version 0.2.7 restores the game's final completion acknowledgement as a
 runner-owned safety step. `BattleRunner` captures the immutable completion and
@@ -30,9 +29,8 @@ state probes and is never resent; missing positive exit evidence raises
 
 Turn preparation uses `BattleTurnState` and `BattleTurnPhase` to distinguish an
 active turn, next-floor transition, PonyChart challenge, positive completion,
-and an absent battle page. `BattleRunner` consumes this typed state directly;
-the former sentinel-returning `prepare_turn()` remains only as a compatibility
-adapter.
+and an absent battle page. `BattleRunner` consumes this typed state directly
+via `prepare_turn_state()`.
 
 Next-floor transition DOM is never accepted over a retained duplicate XHR
 receipt: a matching monitor must be either unsent with count zero or sent once
@@ -152,12 +150,11 @@ The example requires credentials through the normal `EH_USERNAME` and
 completion evidence raises `BattleInterruptedError`, so callers cannot mistake
 an expired login or unexpected navigation for a completed battle.
 
-`BattleDriver` is only a transitional name alias for `BattleSession`, not an
-API-compatible implementation of the old driver. Migrate constructor strategy
-settings into a `BattleStrategy`, replace `driver.battle()` with
-`BattleRunner(driver, strategy).run_current()`, and perform maintenance,
-post-battle tasks, and next-battle selection after the returned
-`BattleCompleted`. Arena choice follows the same boundary:
+`BattleSession` is not an API-compatible implementation of the old driver.
+Migrate constructor strategy settings into a `BattleStrategy`, replace
+`driver.battle()` with `BattleRunner(session, strategy).run_current()`, and
+perform maintenance, post-battle tasks, and next-battle selection after the
+returned `BattleCompleted`. Arena choice follows the same boundary:
 `list_arena_options()` returns data and `start_arena(option)` starts only the
 option explicitly selected by the caller.
 `goto_ring_of_blood()` and `inspect_ring_of_blood()` expose every listed named

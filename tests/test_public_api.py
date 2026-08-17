@@ -49,12 +49,6 @@ class PublicApiTests(unittest.TestCase):
 
         self.assertIn("session", hints)
 
-    def test_battle_driver_is_only_a_session_compatibility_alias(self) -> None:
-        from hvbattle import BattleDriver, BattleSession
-
-        self.assertIs(BattleDriver, BattleSession)
-        self.assertFalse(hasattr(BattleDriver, "battle"))
-
     def test_import_does_not_eagerly_load_ml_runtime(self) -> None:
         completed = subprocess.run(
             [

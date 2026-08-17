@@ -26,7 +26,6 @@ from .contracts import (
     TurnDecision,
 )
 from .control_panel import BaseControlPanel, ControlPanel, NullControlPanel
-from .hv_battle import BattleDriver
 from .hv_battle_ponychart import (
     PonyChartResolutionError,
     preload_ponychart_classifier,
@@ -45,7 +44,6 @@ __all__ = [
     "BattleActionOutcomeUnknownError",
     "BattleActionRecoveryEvidence",
     "BattleCompleted",
-    "BattleDriver",
     "BattleInterruptedError",
     "BattlePresence",
     "BattleRecoveryExhaustedError",

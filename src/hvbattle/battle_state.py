@@ -103,10 +103,6 @@ class BattleStateStore:
                 self._driver.page.get_content(), timeout=remaining
             )
 
-    async def init(self) -> None:
-        """Compatibility spelling for the first state refresh."""
-        await self.update()
-
     async def inspect(self, *, timeout: float = 10.0) -> BattleSnapshot:
         """Parse the page without consuming log or derived-view state."""
         return parse_snapshot(await self._get_content(timeout=timeout))
@@ -122,12 +118,6 @@ class BattleStateStore:
         self.snap = None
         self.overview_monsters = OverviewMonsters()
         self.log_entries = CombatLogTracker()
-
-    def update_overview_monsters(self) -> None:
-        """Compatibility helper for callers that assign ``snap`` in tests."""
-        if self.snap is None:
-            raise RuntimeError("No battle snapshot is available")
-        self.overview_monsters = OverviewMonsters.from_snapshot(self.snap)
 
 
 __all__ = ["BattleStateStore", "CombatLogTracker", "OverviewMonsters"]

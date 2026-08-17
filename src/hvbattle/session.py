@@ -125,30 +125,6 @@ class BattleSession:
         return bool(self.hentaiverse.browser.headless)
 
     @property
-    def battle_dashboard(self) -> BattleStateStore | None:
-        """Compatibility alias for the former observer-oriented state name."""
-        return self.__dict__.get("battle_state")
-
-    @battle_dashboard.setter
-    def battle_dashboard(self, value: BattleStateStore | None) -> None:
-        current = self.__dict__.get("battle_state")
-        component_graph_exists = any(
-            self.__dict__.get(name) is not None
-            for name in (
-                "element_action_manager",
-                "_item_provider",
-                "_skill_manager",
-                "_buff_manager",
-            )
-        )
-        if component_graph_exists and value is not current:
-            raise AttributeError(
-                "battle_dashboard is a read-only compatibility alias after "
-                "battle components are initialized"
-            )
-        self.battle_state = value
-
-    @property
     async def is_isekai(self) -> bool:
         """Expose the realm needed by battle-run completion results."""
         return await self.hentaiverse.realm.current() is Realm.ISEKAI
@@ -387,7 +363,9 @@ class BattleSession:
     def snapshot(self) -> BattleSnapshot:
         snapshot = self._state().snap
         if snapshot is None:
-            raise RuntimeError("No battle snapshot is available before prepare_turn()")
+            raise RuntimeError(
+                "No battle snapshot is available before prepare_turn_state()"
+            )
         return snapshot
 
     @property
@@ -465,11 +443,6 @@ class BattleSession:
         if self.current_round <= 0 or self.total_rounds <= 0:
             return "Round   ? / ?  "
         return f"Round {self.current_round:>3} / {self.total_rounds:<3}"
-
-    async def prepare_turn(self) -> tuple[str, ...] | None:
-        """Compatibility adapter for the former sentinel-based turn API."""
-        state = await self.prepare_turn_state()
-        return state.log_lines if state.actionable else None
 
     async def prepare_turn_state(self) -> BattleTurnState:
         """Refresh the page and return one explicit turn-preparation state."""
@@ -615,20 +588,6 @@ class BattleSession:
     def overcharge(self) -> float:
         """Return the raw overcharge value; it is not a percentage."""
         return float(self.snapshot.player.overcharge_value)
-
-    def get_stat_percent(self, stat: str) -> float:
-        """Compatibility adapter; new code should use the named properties."""
-        match stat.casefold():
-            case "hp":
-                return self.hp_percent
-            case "mp":
-                return self.mp_percent
-            case "sp":
-                return self.sp_percent
-            case "overcharge":
-                return self.overcharge
-            case _:
-                raise ValueError(f"Unknown stat: {stat}")
 
     async def cast_skill(self, key: str) -> bool:
         """Cast a non-targeted skill and wait for the resulting game action."""

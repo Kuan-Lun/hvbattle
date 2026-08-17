@@ -262,7 +262,10 @@ class BattleRunner:
             except BattleActionOutcomeUnknownError as error:
                 return await self._reconcile_unknown_action(error)
             except ZendriverOperationTimeout as error:
-                logger.error("Battle browser operation timed out and remains in flight")
+                logger.error(
+                    "Battle browser operation timed out and remains in flight",
+                    exc_info=True,
+                )
                 raise BattleInterruptedError(
                     "Battle browser operation remains in flight after timeout"
                 ) from error

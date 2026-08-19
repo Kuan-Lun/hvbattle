@@ -10,7 +10,7 @@ from hvbrowser import HentaiVerseSession, Realm
 from hvbrowser.runtime import is_connection_error, setup_logger
 from zendriver import cdp
 
-from ._zendriver import ZendriverOperationTimeout
+from ._zendriver import ZendriverOperationTimeout, wait_for_zendriver
 from .battle_launcher import BattleLauncher
 from .battle_state import BattleStateStore
 from .contracts import (
@@ -556,7 +556,9 @@ class BattleSession:
 
     async def _read_battle_phase(self) -> str:
         """Read final and next-floor controls atomically, with final priority."""
-        phase = await self.page.evaluate(_BATTLE_PHASE_JS)
+        phase = await wait_for_zendriver(
+            self.page.evaluate(_BATTLE_PHASE_JS), timeout=3.0
+        )
         if phase not in {
             _BATTLE_PHASE_ACTIVE,
             _BATTLE_PHASE_COMPLETE,
@@ -570,7 +572,11 @@ class BattleSession:
         return await self._read_battle_phase() == _BATTLE_PHASE_COMPLETE
 
     async def _has_battle_marker(self) -> bool:
-        return bool(await self.page.xpath("//*[@id='battle_main']", timeout=2))
+        return bool(
+            await wait_for_zendriver(
+                self.page.xpath("//*[@id='battle_main']", timeout=2), timeout=2.0
+            )
+        )
 
     @property
     def hp_percent(self) -> float:
@@ -621,7 +627,9 @@ class BattleSession:
 
     async def attack_monster(self, slot: int) -> bool:
         selector = f'[id="mkey_{slot}"]'
-        elements = await self.page.query_selector_all(selector)
+        elements = await wait_for_zendriver(
+            self.page.query_selector_all(selector), timeout=3.0
+        )
         if not elements:
             return False
         await self._actions().click_and_wait_log_locator(selector)
@@ -671,7 +679,9 @@ class BattleSession:
         return await self._launcher.goto_grindfest()
 
     async def go_next_floor(self) -> bool:
-        elements = await self.page.query_selector_all("#btcp")
+        elements = await wait_for_zendriver(
+            self.page.query_selector_all("#btcp"), timeout=3.0
+        )
         if not elements:
             return False
         await self._actions().click_and_wait_transition_locator("#btcp")
@@ -781,7 +791,9 @@ class BattleSession:
                         "Battle state parse retry error detail",
                         exc_info=True,
                     )
-                    await self.page.wait(retry_delay)
+                    await wait_for_zendriver(
+                        self.page.wait(retry_delay), timeout=retry_delay + 2.0
+                    )
 
         phase = await self._read_battle_phase()
         if phase == _BATTLE_PHASE_COMPLETE:

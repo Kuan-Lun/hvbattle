@@ -16,6 +16,7 @@ from hvbrowser import (
 )
 from hvbrowser.runtime import setup_logger
 
+from ._zendriver import wait_for_zendriver
 from .contracts import (
     ArenaOption,
     GrindfestOption,
@@ -68,6 +69,7 @@ _BATTLE_ROUTE_READY_SCRIPTS = {
     ),
     "gr": "Boolean(document.getElementById('grindfest'))",
 }
+_NAVIGATION_READ_TIMEOUT_SECONDS = 5.0
 
 
 class _BattleMenuPageError(RuntimeError):
@@ -162,7 +164,10 @@ class BattleLauncher:
     ) -> None:
         await self._ensure_battle_navigation_is_safe("before opening Battle menu")
         try:
-            battle_menu = await self.page.select("#parent_Battle")
+            battle_menu = await wait_for_zendriver(
+                self.page.select("#parent_Battle"),
+                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            )
         except Exception as error:
             raise _BattleMenuPageError("Battle menu is missing") from error
         if battle_menu is None:
@@ -176,7 +181,10 @@ class BattleLauncher:
             f"and contains(@href, 'ss={route}')]"
         )
         try:
-            target_elements = await self.page.xpath(menu_xpath, timeout=5)
+            target_elements = await wait_for_zendriver(
+                self.page.xpath(menu_xpath, timeout=5),
+                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            )
         except Exception as error:
             raise _BattleMenuPageError(
                 f"Unable to find {_BATTLE_MENU_LABELS[route]} in the Battle menu"
@@ -269,7 +277,10 @@ class BattleLauncher:
             f"after opening {_BATTLE_MENU_LABELS[route]}"
         )
         try:
-            current_url = await self.page.evaluate("window.location.href")
+            current_url = await wait_for_zendriver(
+                self.page.evaluate("window.location.href"),
+                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            )
             landed_realm = realm_from_url(current_url)
         except Exception as error:
             raise _BattleMenuNavigationSafetyError(
@@ -297,7 +308,10 @@ class BattleLauncher:
                 f"Battle navigation did not land on {_BATTLE_MENU_LABELS[route]}"
             )
         try:
-            route_ready = await self.page.evaluate(_BATTLE_ROUTE_READY_SCRIPTS[route])
+            route_ready = await wait_for_zendriver(
+                self.page.evaluate(_BATTLE_ROUTE_READY_SCRIPTS[route]),
+                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            )
         except Exception as error:
             raise _BattleMenuPageError(
                 f"Unable to inspect {_BATTLE_MENU_LABELS[route]} page structure"
@@ -318,7 +332,8 @@ class BattleLauncher:
 
     async def list_arena_options(self) -> tuple[ArenaOption, ...]:
         """Return Arena choices without selecting one for the client."""
-        row_payloads = await self.page.evaluate(r"""
+        row_payloads = await wait_for_zendriver(
+            self.page.evaluate(r"""
             (() => {
                 const table = document.getElementById('arena_list');
                 if (!table) return [];
@@ -349,7 +364,9 @@ class BattleLauncher:
                     }];
                 });
             })()
-            """)
+            """),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
         options: list[ArenaOption] = []
         for payload in row_payloads or ():
             if isinstance(payload, str):
@@ -389,7 +406,8 @@ class BattleLauncher:
 
     async def inspect_ring_of_blood(self) -> RingOfBloodSnapshot:
         """Inspect every listed Ring challenge and tokens without selecting one."""
-        payload = await self.page.evaluate(r"""
+        payload = await wait_for_zendriver(
+            self.page.evaluate(r"""
             (() => {
                 const table = document.getElementById('arena_list');
                 const tokenContainer = document.getElementById('arena_tokens');
@@ -435,7 +453,9 @@ class BattleLauncher:
                     }),
                 };
             })()
-            """)
+            """),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
         if not isinstance(payload, dict):
             raise _ring_inspection_error(
                 "ring.structure-invalid",
@@ -573,7 +593,10 @@ class BattleLauncher:
             raise TypeError("expected_before must be a RingOfBloodSnapshot")
 
         ring_url = f"{HENTAIVERSE_ROOT_URL}{await self._path_prefix()}/?s=Battle&ss=rb"
-        current_url = await self.page.evaluate("window.location.href")
+        current_url = await wait_for_zendriver(
+            self.page.evaluate("window.location.href"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
         if current_url != ring_url:
             logger.debug(
                 "Ring of Blood pre-submit check id=%s reason=unexpected-page",
@@ -619,7 +642,8 @@ class BattleLauncher:
 
         ring_url_js = json.dumps(ring_url)
         try:
-            atomic_result = await self.page.evaluate(rf"""
+            atomic_result = await wait_for_zendriver(
+                self.page.evaluate(rf"""
                 (() => {{
                     const expectedUrl = {ring_url_js};
                     if (window.location.href !== expectedUrl) return 'unexpected-page';
@@ -649,7 +673,9 @@ class BattleLauncher:
                     initform.submit();
                     return 'submitted';
                 }})()
-                """)
+                """),
+                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            )
         except Exception as error:
             logger.error(
                 "Battle form submission outcome is unknown "
@@ -683,7 +709,10 @@ class BattleLauncher:
     async def start_arena(self, option: ArenaOption) -> bool:
         """Submit one Arena option explicitly selected by the caller."""
         arena_url = f"{HENTAIVERSE_ROOT_URL}{await self._path_prefix()}/?s=Battle&ss=ar"
-        current_url = await self.page.evaluate("window.location.href")
+        current_url = await wait_for_zendriver(
+            self.page.evaluate("window.location.href"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
         if current_url != arena_url:
             logger.debug(
                 "Battle form submission skipped kind=arena id=%s "
@@ -696,7 +725,8 @@ class BattleLauncher:
 
         token_js = json.dumps(option.token)
         try:
-            submitted = await self.page.evaluate(f"""
+            submitted = await wait_for_zendriver(
+                self.page.evaluate(f"""
                 (() => {{
                     const initid = document.getElementById('initid');
                     const initform = document.getElementById('initform');
@@ -710,7 +740,9 @@ class BattleLauncher:
                     initform.submit();
                     return true;
                 }})()
-                """)
+                """),
+                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            )
         except Exception as error:
             logger.error(
                 "Battle form submission outcome is unknown kind=arena id=%s "
@@ -731,7 +763,8 @@ class BattleLauncher:
 
     async def list_grindfest_options(self) -> tuple[GrindfestOption, ...]:
         """Return GrindFest choices without selecting one for the client."""
-        onclick_list = await self.page.evaluate("""
+        onclick_list = await wait_for_zendriver(
+            self.page.evaluate("""
             (() => {
                 const imgs = document.querySelectorAll(
                     '#grindfest img[onclick*="init_battle"]'
@@ -740,7 +773,9 @@ class BattleLauncher:
                     (el) => el.getAttribute('onclick') || ''
                 );
             })()
-            """)
+            """),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
         options: list[GrindfestOption] = []
         for onclick in onclick_list or ():
             match = re.match(r"init_battle\(\s*(\d+)\s*\)", onclick)
@@ -758,7 +793,10 @@ class BattleLauncher:
         grindfest_url = (
             f"{HENTAIVERSE_ROOT_URL}{await self._path_prefix()}/?s=Battle&ss=gr"
         )
-        current_url = await self.page.evaluate("window.location.href")
+        current_url = await wait_for_zendriver(
+            self.page.evaluate("window.location.href"),
+            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+        )
         if current_url != grindfest_url:
             logger.debug(
                 "Battle form submission skipped kind=grindfest id=%s "
@@ -770,7 +808,8 @@ class BattleLauncher:
             return False
 
         try:
-            submitted = await self.page.evaluate(f"""
+            submitted = await wait_for_zendriver(
+                self.page.evaluate(f"""
                 (() => {{
                     const initid = document.getElementById('initid');
                     const initform = document.getElementById('initform');
@@ -779,7 +818,9 @@ class BattleLauncher:
                     initform.submit();
                     return true;
                 }})()
-                """)
+                """),
+                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            )
         except Exception as error:
             logger.error(
                 "Battle form submission outcome is unknown kind=grindfest id=%s "

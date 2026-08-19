@@ -64,6 +64,31 @@ class _HangingElement:
         await asyncio.Event().wait()
 
 
+class _SlowPage:
+    """A page that takes a real, bounded number of seconds to answer.
+
+    Models the page right after login navigates from Forums to the
+    HentaiVerse realm root: still settling, not stuck. A production incident
+    (2026-08-19) showed the first _has_battle_marker/_read_battle_phase call
+    after that navigation can legitimately take several seconds; a timeout
+    tight enough to reject that turned normal startup latency into a fatal,
+    non-retried ZendriverOperationTimeout (retries are deliberately refused
+    for that exception -- see session.py's inspect_battle_presence).
+    """
+
+    def __init__(self, delay_seconds: float, result: Any) -> None:
+        self._delay_seconds = delay_seconds
+        self._result = result
+
+    async def evaluate(self, expression: str) -> Any:
+        await asyncio.sleep(self._delay_seconds)
+        return self._result
+
+    async def xpath(self, expression: str, timeout: float = 2.0) -> Any:
+        await asyncio.sleep(self._delay_seconds)
+        return self._result
+
+
 class BattleSessionHangProtectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_read_battle_phase_times_out_instead_of_hanging_forever(
         self,
@@ -72,7 +97,31 @@ class BattleSessionHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         session.page = _HangingPage()
 
         with self.assertRaises(ZendriverOperationTimeout):
-            await asyncio.wait_for(session._read_battle_phase(), timeout=5)
+            await asyncio.wait_for(session._read_battle_phase(), timeout=15)
+
+    async def test_read_battle_phase_tolerates_post_navigation_settling(
+        self,
+    ) -> None:
+        """Regression test for the 2026-08-19 startup incident: a several-
+        second-but-not-infinite delay right after login/realm navigation
+        must succeed, not be misclassified as a fatal, non-retried hang."""
+
+        session = object.__new__(BattleSession)
+        session.page = _SlowPage(6.0, "active")
+
+        phase = await asyncio.wait_for(session._read_battle_phase(), timeout=15)
+
+        self.assertEqual(phase, "active")
+
+    async def test_has_battle_marker_tolerates_post_navigation_settling(
+        self,
+    ) -> None:
+        session = object.__new__(BattleSession)
+        session.page = _SlowPage(6.0, [object()])
+
+        has_marker = await asyncio.wait_for(session._has_battle_marker(), timeout=15)
+
+        self.assertTrue(has_marker)
 
     async def test_has_battle_marker_times_out_instead_of_hanging_forever(
         self,
@@ -81,7 +130,7 @@ class BattleSessionHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         session.page = _HangingPage()
 
         with self.assertRaises(ZendriverOperationTimeout):
-            await asyncio.wait_for(session._has_battle_marker(), timeout=5)
+            await asyncio.wait_for(session._has_battle_marker(), timeout=15)
 
     async def test_attack_monster_times_out_instead_of_hanging_forever(
         self,

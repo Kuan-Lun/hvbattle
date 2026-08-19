@@ -1070,7 +1070,10 @@ class ElementActionManager:
         last_error: Exception | None = None
         for attempt in range(retries):
             try:
-                return await self.page.select(selector, timeout=wait_timeout)
+                return await wait_for_zendriver(
+                    self.page.select(selector, timeout=wait_timeout),
+                    timeout=wait_timeout,
+                )
             except Exception as error:
                 last_error = error
                 if attempt + 1 < retries:

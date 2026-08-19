@@ -11,9 +11,11 @@ itself via asyncio.wait() regardless of what zendriver is doing internally.
 import asyncio
 import unittest
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
+from hvbattle import ArenaOption, GrindfestOption
 from hvbattle._zendriver import ZendriverOperationTimeout
+from hvbattle.battle_launcher import BattleLauncher
 from hvbattle.hv_battle_item_provider import ItemProvider
 from hvbattle.hv_battle_ponychart import PonyChart
 from hvbattle.hv_battle_skill_manager import SkillManager
@@ -33,6 +35,27 @@ class _HangingPage:
         await asyncio.Event().wait()
 
     async def select(self, selector: str, timeout: float = 10) -> Any:
+        await asyncio.Event().wait()
+
+    async def select_all(self, selector: str, timeout: float = 10) -> Any:
+        await asyncio.Event().wait()
+
+
+class _RespondsOnceThenHangsPage:
+    """A page whose first evaluate() succeeds, and every call after hangs.
+
+    Models a launcher submission flow: the pre-submit URL check succeeds,
+    but the browser stops responding to the actual form-submission call.
+    """
+
+    def __init__(self, first_result: Any) -> None:
+        self._first_result = first_result
+        self._calls = 0
+
+    async def evaluate(self, expression: str) -> Any:
+        self._calls += 1
+        if self._calls == 1:
+            return self._first_result
         await asyncio.Event().wait()
 
 
@@ -88,6 +111,30 @@ class PonyChartHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ZendriverOperationTimeout):
             await asyncio.wait_for(pony_chart._check(), timeout=5)
 
+    async def test_wait_for_image_loaded_times_out_instead_of_hanging_forever(
+        self,
+    ) -> None:
+        pony_chart = object.__new__(PonyChart)
+        pony_chart.hvdriver = Mock()
+        pony_chart.hvdriver.page = _HangingPage()
+
+        with self.assertRaises(ZendriverOperationTimeout):
+            await asyncio.wait_for(
+                pony_chart._wait_for_image_loaded(timeout=0.2), timeout=5
+            )
+
+    async def test_save_pony_chart_image_times_out_instead_of_hanging_forever(
+        self,
+    ) -> None:
+        pony_chart = object.__new__(PonyChart)
+        pony_chart.hvdriver = Mock()
+        pony_chart.hvdriver.page = _HangingPage()
+        pony_chart._image_directory = None
+        pony_chart._wait_for_image_loaded = AsyncMock(return_value=None)
+
+        with self.assertRaises(ZendriverOperationTimeout):
+            await asyncio.wait_for(pony_chart._save_pony_chart_image(), timeout=5)
+
 
 class SkillManagerHangProtectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_select_pane_control_times_out_instead_of_hanging_forever(
@@ -121,6 +168,39 @@ class ItemProviderHangProtectionTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ZendriverOperationTimeout):
             await asyncio.wait_for(provider.is_open_items_menu(), timeout=5)
+
+
+class BattleLauncherHangProtectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_grindfest_times_out_instead_of_hanging_forever(
+        self,
+    ) -> None:
+        client = Mock()
+        client.page = _HangingPage()
+        launcher = BattleLauncher(client, Mock())
+        launcher._path_prefix = AsyncMock(return_value="")
+
+        with self.assertRaises(ZendriverOperationTimeout):
+            await asyncio.wait_for(
+                launcher.start_grindfest(GrindfestOption(battle_id=1)), timeout=10
+            )
+
+    async def test_start_arena_submission_times_out_instead_of_hanging_forever(
+        self,
+    ) -> None:
+        """The pre-submit URL check succeeds; the form-submission call hangs."""
+
+        client = Mock()
+        client.page = _RespondsOnceThenHangsPage(
+            "https://hentaiverse.org/?s=Battle&ss=ar"
+        )
+        launcher = BattleLauncher(client, Mock())
+        launcher._path_prefix = AsyncMock(return_value="")
+
+        with self.assertRaises(ZendriverOperationTimeout):
+            await asyncio.wait_for(
+                launcher.start_arena(ArenaOption(battle_id=1, token=None)),
+                timeout=10,
+            )
 
 
 async def _get_hanging_element() -> _HangingElement:

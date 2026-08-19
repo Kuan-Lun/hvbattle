@@ -555,9 +555,17 @@ class BattleSession:
         return await self._ponychart.is_present()
 
     async def _read_battle_phase(self) -> str:
-        """Read final and next-floor controls atomically, with final priority."""
+        """Read final and next-floor controls atomically, with final priority.
+
+        Bounded generously (not the usual few seconds): this is called right
+        after login navigates from Forums to the HentaiVerse realm root, and
+        that freshly loaded page legitimately needs a few seconds to settle.
+        ZendriverOperationTimeout is never retried by callers, so a timeout
+        here is fatal to worker startup -- a tight bound turns normal
+        post-navigation latency into a false "stuck" verdict.
+        """
         phase = await wait_for_zendriver(
-            self.page.evaluate(_BATTLE_PHASE_JS), timeout=3.0
+            self.page.evaluate(_BATTLE_PHASE_JS), timeout=10.0
         )
         if phase not in {
             _BATTLE_PHASE_ACTIVE,
@@ -572,9 +580,10 @@ class BattleSession:
         return await self._read_battle_phase() == _BATTLE_PHASE_COMPLETE
 
     async def _has_battle_marker(self) -> bool:
+        """See _read_battle_phase: bounded generously for the same reason."""
         return bool(
             await wait_for_zendriver(
-                self.page.xpath("//*[@id='battle_main']", timeout=2), timeout=2.0
+                self.page.xpath("//*[@id='battle_main']", timeout=10), timeout=10.0
             )
         )
 

@@ -1091,6 +1091,86 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(timeout.default, 5.0)
 
+    async def test_select_for_single_click_times_out_instead_of_hanging_forever(
+        self,
+    ) -> None:
+        """zendriver's own timeout= kwarg on page.select() only checks a
+        deadline between polling iterations; a single hung query_selector
+        call never returns control to that check. _select_for_single_click
+        must bound the call itself via wait_for_zendriver instead."""
+
+        manager = object.__new__(ElementActionManager)
+        manager.hvdriver = Mock()
+        select_calls = 0
+
+        class _HangingPage:
+            async def select(self, selector: str, timeout: float) -> object:
+                nonlocal select_calls
+                select_calls += 1
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        manager.hvdriver.page = _HangingPage()
+
+        with self.assertRaises(ZendriverOperationTimeout):
+            await manager._select_for_single_click(
+                "#mkey_1", retries=2, wait_timeout=0.02, delay=0
+            )
+
+        self.assertEqual(select_calls, 2)
+
+    async def test_select_for_single_click_succeeds_when_element_found(
+        self,
+    ) -> None:
+        manager = object.__new__(ElementActionManager)
+        manager.hvdriver = Mock()
+        target = object()
+
+        class _RespondingPage:
+            async def select(self, selector: str, timeout: float) -> object:
+                return target
+
+        manager.hvdriver.page = _RespondingPage()
+
+        result = await manager._select_for_single_click(
+            "#mkey_1", retries=1, wait_timeout=1.0, delay=0
+        )
+
+        self.assertIs(result, target)
+
+    async def test_select_timeout_releases_action_lock_without_hanging(
+        self,
+    ) -> None:
+        """End-to-end proof that a wedged element-select can no longer hold
+        _action_lock forever: click_and_wait_log_locator must surface the
+        timeout and release the lock within a bounded time, not silently
+        wedge the whole realm the way the original click hang did."""
+
+        manager = object.__new__(ElementActionManager)
+        manager._action_lock = asyncio.Lock()
+        manager._click = AsyncMock()
+        manager._cleanup_action_monitor = AsyncMock()
+        manager.hvdriver = Mock()
+
+        class _HangingPage:
+            async def select(self, selector: str, timeout: float) -> object:
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        manager.hvdriver.page = _HangingPage()
+
+        with self.assertRaises(ZendriverOperationTimeout):
+            await asyncio.wait_for(
+                manager.click_and_wait_log_locator(
+                    "#mkey_1", stale_retries=1, timeout=1
+                ),
+                timeout=5,
+            )
+
+        self.assertFalse(manager._action_lock.locked())
+        manager._click.assert_not_awaited()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
     async def test_selector_is_resolved_before_monitor_arm_and_single_click(
         self,
     ) -> None:

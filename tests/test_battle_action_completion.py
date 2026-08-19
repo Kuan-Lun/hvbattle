@@ -1361,6 +1361,43 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         manager._select_for_single_click.assert_awaited_once()
         manager._cleanup_action_monitor.assert_not_awaited()
 
+    async def test_click_timeout_is_never_retried(self) -> None:
+        """A hung click (hbrowser's ElementAction.click bounded by
+        wait_for_zendriver) raises a plain TimeoutError, which must flow
+        through the same never-retry reconciliation path as any other click
+        exception rather than hanging the action lock indefinitely."""
+
+        manager = _manager()
+        click_error = TimeoutError("click did not complete before deadline")
+        manager._click = AsyncMock(side_effect=click_error)
+        before = _state(monitor=_pending_monitor())
+        sent_without_commit = _state(
+            monitor=_monitor(log_mutations=0),
+        )
+
+        async def read_state(
+            _monitor_id: str,
+            *,
+            arm_monitor: bool = False,
+            probe_timeout: float = 3,
+        ) -> _BattleActionState:
+            del probe_timeout
+            return before if arm_monitor else sent_without_commit
+
+        manager._read_action_state = AsyncMock(side_effect=read_state)
+
+        with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
+            await manager.click_and_wait_log_locator(
+                "#mkey_1",
+                timeout=1e-9,
+                check_interval=1e-9,
+            )
+
+        self.assertIs(raised.exception.__cause__, click_error)
+        manager._click.assert_awaited_once()
+        manager._select_for_single_click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
     async def test_click_exception_without_post_click_probe_is_unknown(self) -> None:
         manager = _manager()
         click_error = RuntimeError("connection lost after click started")

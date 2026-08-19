@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from hvbrowser import HVDriver
 from hvbrowser.runtime import is_connection_error, notify, setup_logger
 
+from ._zendriver import wait_for_zendriver
 from .ponychart_model_store import (
     PonyChartGenerationStore,
     PonyChartRefreshOutcome,
@@ -248,7 +249,9 @@ class PonyChart:
         return labels
 
     async def _check(self) -> bool:
-        elements = await self.page.query_selector_all("#riddlesubmit")
+        elements = await wait_for_zendriver(
+            self.page.query_selector_all("#riddlesubmit"), timeout=3.0
+        )
         return bool(elements)
 
     async def is_present(self) -> bool:

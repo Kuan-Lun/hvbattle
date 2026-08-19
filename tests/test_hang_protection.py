@@ -117,11 +117,31 @@ class BattleSessionHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         session = object.__new__(BattleSession)
-        session.page = _SlowPage(6.0, [object()])
+        session.page = _SlowPage(3.0, True)
 
-        has_marker = await asyncio.wait_for(session._has_battle_marker(), timeout=15)
+        has_marker = await asyncio.wait_for(session._has_battle_marker(), timeout=10)
 
         self.assertTrue(has_marker)
+
+    async def test_has_battle_marker_returns_promptly_when_genuinely_absent(
+        self,
+    ) -> None:
+        """Regression test for the 2026-08-19 startup incident's actual root
+        cause: zendriver's xpath() retries in an enable/find/disable loop
+        until its own timeout elapses whenever the element is absent -- the
+        common case whenever no battle is running -- so it always burns the
+        full timeout on the single most frequent startup check. evaluate()
+        must answer immediately instead, not just "eventually, boundedly"."""
+
+        session = object.__new__(BattleSession)
+        session.page = _SlowPage(0.01, False)
+
+        started = asyncio.get_running_loop().time()
+        has_marker = await asyncio.wait_for(session._has_battle_marker(), timeout=2)
+        elapsed = asyncio.get_running_loop().time() - started
+
+        self.assertFalse(has_marker)
+        self.assertLess(elapsed, 1.0)
 
     async def test_has_battle_marker_times_out_instead_of_hanging_forever(
         self,

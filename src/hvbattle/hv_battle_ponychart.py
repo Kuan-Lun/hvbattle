@@ -143,7 +143,10 @@ class PonyChart:
         last_src: str | None = None
         stable_count = 0
         while asyncio.get_event_loop().time() < deadline:
-            state = await self.page.evaluate(get_state_js)
+            remaining = max(0.05, deadline - asyncio.get_event_loop().time())
+            state = await wait_for_zendriver(
+                self.page.evaluate(get_state_js), timeout=min(2.0, remaining)
+            )
             if (
                 state
                 and state.get("w", 0) >= min_size
@@ -167,9 +170,15 @@ class PonyChart:
         """Capture one challenge for classification and optional retention."""
         await self._wait_for_image_loaded()
 
-        riddleimage_div = await self.page.select("#riddleimage")
-        img_element = await riddleimage_div.query_selector("img")
-        img_src = await img_element.apply("(el) => el.src || ''")
+        riddleimage_div = await wait_for_zendriver(
+            self.page.select("#riddleimage"), timeout=3.0
+        )
+        img_element = await wait_for_zendriver(
+            riddleimage_div.query_selector("img"), timeout=3.0
+        )
+        img_src = await wait_for_zendriver(
+            img_element.apply("(el) => el.src || ''"), timeout=3.0
+        )
 
         if not img_src:
             raise ValueError("無法獲取圖片 src")
@@ -190,7 +199,9 @@ class PonyChart:
         ) as temporary:
             filepath = Path(temporary.name)
         try:
-            await img_element.save_screenshot(str(filepath))
+            await wait_for_zendriver(
+                img_element.save_screenshot(str(filepath)), timeout=10.0
+            )
         except BaseException:
             filepath.unlink(missing_ok=True)
             raise
@@ -208,7 +219,9 @@ class PonyChart:
         ordered_labels = tuple(
             sorted(labels, key=lambda label: (label.casefold(), label))
         )
-        label_elements = await self.page.select_all("label.lc", timeout=2)
+        label_elements = await wait_for_zendriver(
+            self.page.select_all("label.lc", timeout=2), timeout=2.0
+        )
         norm_map = {}
         for lab in label_elements:
             txt = lab.text.strip()
@@ -225,7 +238,7 @@ class PonyChart:
                 )
                 continue
             try:
-                await _lab.click()
+                await wait_for_zendriver(_lab.click(), timeout=3.0)
                 clicked.append(name)
             except Exception as error:
                 if is_connection_error(error):
@@ -301,12 +314,17 @@ class PonyChart:
                 xpath_error_type: str | None = None
                 selector_error_type: str | None = None
                 try:
-                    submit_elements = await self.hvdriver.page.xpath(
-                        "//input[@type='submit' and @value='Submit Answer']",
-                        timeout=2,
+                    submit_elements = await wait_for_zendriver(
+                        self.hvdriver.page.xpath(
+                            "//input[@type='submit' and @value='Submit Answer']",
+                            timeout=2,
+                        ),
+                        timeout=2.0,
                     )
                     if submit_elements:
-                        await submit_elements[0].click()
+                        await wait_for_zendriver(
+                            submit_elements[0].click(), timeout=3.0
+                        )
                         clicked = True
                 except Exception as error:
                     if is_connection_error(error):
@@ -319,8 +337,10 @@ class PonyChart:
 
                 if not clicked:
                     try:
-                        riddle_submit = await self.hvdriver.page.select("#riddlesubmit")
-                        await riddle_submit.click()
+                        riddle_submit = await wait_for_zendriver(
+                            self.hvdriver.page.select("#riddlesubmit"), timeout=2.0
+                        )
+                        await wait_for_zendriver(riddle_submit.click(), timeout=3.0)
                         clicked = True
                     except Exception as error:
                         if is_connection_error(error):

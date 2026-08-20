@@ -62,6 +62,7 @@ class BattleSession:
         auto_accept_dialogs: bool = False,
         hentaiverse: HentaiVerseSession | None = None,
         ponychart_image_directory: str | Path | None = None,
+        ponychart_scratch_directory: str | Path | None = None,
         **kwargs: Any,
     ) -> None:
         if hentaiverse is not None and (args or kwargs):
@@ -80,9 +81,15 @@ class BattleSession:
             if ponychart_image_directory is not None
             else None
         )
+        scratch_directory = (
+            Path(ponychart_scratch_directory)
+            if ponychart_scratch_directory is not None
+            else None
+        )
         self._ponychart = PonyChart(
             self.hentaiverse.browser,
             image_directory=image_directory,
+            scratch_directory=scratch_directory,
         )
         self._launcher = BattleLauncher(
             self.hentaiverse.browser,

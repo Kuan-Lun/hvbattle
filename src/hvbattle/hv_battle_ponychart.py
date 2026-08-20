@@ -1,4 +1,5 @@
 import asyncio
+import shutil
 import tempfile
 import threading
 from collections.abc import Callable
@@ -108,9 +109,11 @@ class PonyChart:
         driver: HVDriver,
         *,
         image_directory: Path | None = None,
+        scratch_directory: Path | None = None,
     ) -> None:
         self.hvdriver = driver
         self._image_directory = image_directory
+        self._scratch_directory = scratch_directory
 
     @property
     def page(self) -> Any:
@@ -167,7 +170,20 @@ class PonyChart:
         raise TimeoutError("PonyChart image did not finish loading in time")
 
     async def _save_pony_chart_image(self) -> str:
-        """Capture one challenge for classification and optional retention."""
+        """Capture one challenge into a local scratch file for classification.
+
+        The scratch file lives under ``scratch_directory`` (or, when that is
+        left unset, whatever ``tempfile.gettempdir()`` resolves to for this
+        process). That default is a convention, not a guarantee: it is
+        expected to be local, fast storage in every environment this class
+        has been deployed to so far, but a deployment that redirects
+        ``TMPDIR``/``TEMP``/``TMP`` (or the platform default) at something
+        slow or remote would silently reintroduce the exact NAS-latency
+        problem this scratch step exists to avoid. Callers that cannot rely
+        on the process default should pass an explicit ``scratch_directory``.
+        Retention, if configured, is persisted separately by
+        ``_retain_pony_chart_image`` after the challenge has been answered.
+        """
         await self._wait_for_image_loaded()
 
         riddleimage_div = await wait_for_zendriver(
@@ -183,18 +199,10 @@ class PonyChart:
         if not img_src:
             raise ValueError("無法獲取圖片 src")
 
-        directory = self._image_directory
-        if directory is not None:
-            directory.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         with tempfile.NamedTemporaryFile(
-            prefix=(
-                f"pony_chart_{timestamp}_"
-                if directory is not None
-                else "hvbattle-ponychart-"
-            ),
+            prefix="hvbattle-ponychart-",
             suffix=".png",
-            dir=directory,
+            dir=self._scratch_directory,
             delete=False,
         ) as temporary:
             filepath = Path(temporary.name)
@@ -206,6 +214,37 @@ class PonyChart:
             filepath.unlink(missing_ok=True)
             raise
         return str(filepath)
+
+    @staticmethod
+    def _copy_pony_chart_image(img_path: str, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        with tempfile.NamedTemporaryFile(
+            prefix=f"pony_chart_{timestamp}_",
+            suffix=".png",
+            dir=directory,
+            delete=False,
+        ) as temporary:
+            destination = Path(temporary.name)
+        shutil.copy2(img_path, destination)
+
+    async def _retain_pony_chart_image(self, img_path: str) -> None:
+        """Best-effort, non-blocking persistence of the captured challenge.
+
+        Runs after answering so a slow or unavailable retention directory
+        never delays or blocks the answer flow. Failures are logged and
+        swallowed rather than propagated.
+        """
+        directory = self._image_directory
+        if directory is None:
+            return
+        try:
+            await asyncio.to_thread(self._copy_pony_chart_image, img_path, directory)
+        except OSError as error:
+            logger.warning(
+                "PonyChart image retention copy failed error_type=%s",
+                type(error).__name__,
+            )
 
     async def _auto_answer(self, img_path: str) -> frozenset[str] | None:
         """模型推論後依角色名稱比對 label 文字並點擊。"""
@@ -291,7 +330,7 @@ class PonyChart:
                     "PonyChart auto-answer failed; challenge handling will continue "
                     "error_type=%s image=%s",
                     type(error).__name__,
-                    img_path if self._image_directory is not None else None,
+                    img_path,
                 )
                 logger.debug(
                     "PonyChart auto-answer error detail",
@@ -360,7 +399,7 @@ class PonyChart:
                         clicked,
                         xpath_error_type or "none",
                         selector_error_type or "none",
-                        img_path if self._image_directory is not None else None,
+                        img_path,
                     )
                     raise PonyChartResolutionError(
                         "PonyChart remained present after fallback submission"
@@ -386,5 +425,5 @@ class PonyChart:
 
             return isponychart
         finally:
-            if self._image_directory is None:
-                Path(img_path).unlink(missing_ok=True)
+            await self._retain_pony_chart_image(img_path)
+            Path(img_path).unlink(missing_ok=True)

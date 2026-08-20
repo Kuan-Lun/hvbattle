@@ -1,6 +1,7 @@
 """Stable contracts between battle sessions, runners, and client policies."""
 
 import math
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -184,8 +185,29 @@ type BattleStepResult = (
 )
 
 
+_DIAGNOSTIC_CODE_PATTERN = re.compile(r"[a-z0-9][a-z0-9_.:-]*\Z")
+_DIAGNOSTIC_CODE_MAX_LENGTH = 128
+
+
+def _validate_diagnostic_code(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _DIAGNOSTIC_CODE_MAX_LENGTH
+        or _DIAGNOSTIC_CODE_PATTERN.fullmatch(value) is None
+    ):
+        raise ValueError(
+            "diagnostic_code must be a bounded lowercase ASCII machine code"
+        )
+    return value
+
+
 class BattleInterruptedError(RuntimeError):
     """The page left battle without positive completion evidence."""
+
+    def __init__(self, message: str, *, diagnostic_code: str) -> None:
+        self.diagnostic_code = _validate_diagnostic_code(diagnostic_code)
+        super().__init__(message)
 
 
 class BattleRecoveryExhaustedError(BattleInterruptedError):

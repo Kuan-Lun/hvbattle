@@ -522,7 +522,8 @@ class PonyChart:
                 if is_browser_generation_error(error):
                     raise
                 raise BattleInterruptedError(
-                    "PonyChart label click outcome is unknown"
+                    "PonyChart label click outcome is unknown",
+                    diagnostic_code="battle.ponychart.label-click-outcome-unknown",
                 ) from error
         logger.debug(
             "PonyChart prediction labels=%s clicked_labels=%s",
@@ -622,7 +623,8 @@ class PonyChart:
                         if is_browser_generation_error(error):
                             raise
                         raise BattleInterruptedError(
-                            "PonyChart submit click outcome is unknown"
+                            "PonyChart submit click outcome is unknown",
+                            diagnostic_code="battle.ponychart.submit-outcome-unknown",
                         ) from error
                     clicked = True
 
@@ -652,7 +654,10 @@ class PonyChart:
                             if is_browser_generation_error(error):
                                 raise
                             raise BattleInterruptedError(
-                                "PonyChart submit click outcome is unknown"
+                                "PonyChart submit click outcome is unknown",
+                                diagnostic_code=(
+                                    "battle.ponychart.submit-outcome-unknown"
+                                ),
                             ) from error
                         clicked = True
 

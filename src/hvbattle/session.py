@@ -690,11 +690,13 @@ class BattleSession:
             if is_browser_generation_error(error):
                 raise
             raise BattleInterruptedError(
-                f"Target submission did not clear armed skill {skill_name!r}"
+                f"Target submission did not clear armed skill {skill_name!r}",
+                diagnostic_code="battle.skill-target-submission-unknown",
             ) from error
         if not acted:
             raise BattleInterruptedError(
-                f"Target disappeared while skill {skill_name!r} was armed"
+                f"Target disappeared while skill {skill_name!r} was armed",
+                diagnostic_code="battle.skill-target-disappeared",
             )
         return True
 

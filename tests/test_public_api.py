@@ -77,6 +77,37 @@ class PublicApiTests(unittest.TestCase):
 
         self.assertEqual(completed.stdout.strip(), "ok")
 
+    def test_battle_interruption_requires_valid_machine_diagnostic_code(self) -> None:
+        from hvbattle import BattleInterruptedError, BattleRecoveryExhaustedError
+
+        for error_type in (BattleInterruptedError, BattleRecoveryExhaustedError):
+            with self.subTest(error_type=error_type.__name__):
+                error = error_type(
+                    "Human-readable detail",
+                    diagnostic_code="battle.turn-timeout",
+                )
+
+                self.assertEqual(error.diagnostic_code, "battle.turn-timeout")
+                self.assertEqual(str(error), "Human-readable detail")
+                with self.assertRaises(TypeError):
+                    error_type("legacy constructor")  # type: ignore[call-arg]
+
+        invalid_codes = (
+            "",
+            "Battle.UPPERCASE",
+            "battle contains spaces",
+            "<html>secret</html>",
+            "battle.é",
+            "b" * 129,
+        )
+        for diagnostic_code in invalid_codes:
+            with self.subTest(diagnostic_code=diagnostic_code):
+                with self.assertRaisesRegex(ValueError, "diagnostic_code"):
+                    BattleInterruptedError(
+                        "detail",
+                        diagnostic_code=diagnostic_code,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

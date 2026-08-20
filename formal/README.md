@@ -11,15 +11,16 @@ It covers:
   recovery class and browser-observed request-age evidence for a stalled
   single-XHR turn;
 - same-browser reconciliation requiring a new, ready, stable same-realm
-  document and a fresh prepare/strategy decision rather than action replay;
+  document and a new prepare/strategy decision rather than action replay;
 - a consecutive-recovery budget reset only by confirmed `ACTED` or next-floor
   receipts;
 - final-completion acknowledgement with at most one click and a new, ready,
   same-realm out-of-battle document receipt;
 - fail-closed unknown outcomes;
 - manager/runner/browser-driver/application error-record obligations; and
-- the application's exit 2/3/4/5 terminal stops at both shell retry layers,
-  including checked-sink precedence over idle timeout.
+- Python-owned terminal application logging, zero-retry `main.sh` supervision,
+  and the outer launcher's terminal treatment of exits 2/3/4/5, including
+  checked-sink precedence over idle timeout.
 
 Run the checker from this directory:
 
@@ -37,19 +38,24 @@ implementation aligned with the model and to test those runtime boundaries.
 The exit policy models `main.py` and `main.sh` in the private battle workspace,
 plus `should_retry_battle` in the outer `battle.zsh` launcher. It proves that a
 configuration failure exits with 2, post-battle task failure exits with 3, and
-an uncertain battle exits with 4. With a healthy `tee`, the logging wrappers
-preserve every child status. If `tee` fails, they preserve only 2/3/4 and map
-all other child statuses, including 0 and 1, to dedicated logging-failure exit
-5. Neither supervisor may retry 2, 3, 4, or 5 for any retry counter or limit.
+an uncertain battle exits with 4 once the caller has chosen to stop. This is a
+terminal projection after any in-process worker/browser policy; the model does
+not require `AccountWorker` to exit immediately. Python owns the application
+log in direct and supervised launches: successful persistence preserves the
+intended exit, while any terminal application-log failure maps the result to
+dedicated logging-failure exit 5. `main.sh` owns only `supervisor.log` and never
+retries its Python child. If its decision append fails, it preserves an existing
+terminal 2/3/4/5 and maps success or an unclassified failure to 5. The separate
+outer launcher may apply a bounded policy to generic timeouts or crashes, but
+never retries 2, 3, 4, or 5 for any retry counter or limit.
 The checked-sink marker is proved to take precedence whenever it coincides with
 an idle-timeout observation. A replaced log-path identity is modeled as a sink
 failure and is therefore proved to stop before idle classification. Failure to
-append a supervisor decision uses the same fail-closed status matrix.
-For an unknown transition handled without an application fresh-reconciliation
-context, the application-level audit records are additionally proved to end
-with the exact ordered error-record suffix: manager, runner, then browser-driver
-context exit, then application. A shell supervisor may append its own later
-lifecycle record.
+append a supervisor decision uses its own fail-closed status matrix. For an
+unknown transition, the application-level audit records are additionally
+proved to end with the exact ordered error-record suffix: manager, runner, then
+browser-driver context exit, then application. The lifecycle wrapper may append
+its own later supervisor record.
 
 For a changed document or battle node, both `interactive` and `complete` are
 accepted only when the round has advanced or initialized and the new battle is
@@ -99,31 +105,32 @@ budget. Failed reconciliation of matching incident evidence is also typed
 exhaustion, while an unmatched first unknown is an ordinary terminal
 interruption.
 
-At the application boundary, only typed same-browser recovery exhaustion may
-open one fresh authenticated browser for current-battle reconciliation.
-Opening it consumes the application-level attempt but initializes the new
-browser's own same-browser recovery budget as unused. Unrelated interruptions
-and final-completion acknowledgement ambiguity never open it, and an ambiguity
-in that fresh browser cannot open a third browser. The model covers this
-decision and state threading; browser close/login mechanics remain outside the
-formal boundary and are exercised by runtime tests.
+At the reusable package boundary, same-browser recovery produces one of three
+typed resolutions: return to preparation, ordinary interruption, or recovery
+exhaustion. The two interruption kinds retain their stable diagnostic codes,
+`battle.action-outcome-unknown` and
+`battle.action-recovery-exhausted`. The model intentionally does not decide
+whether to open another browser, restart a worker, or how many restarts to
+allow. Those are calling-application policies; they may not weaken the modeled
+receipt guards or introduce cached-action replay.
 
 `ZendriverOperationTimeout` is classified before entering this model because
 its non-cancelled CDP operation remains live. Monitor-arm, monitor-cleanup, and
-session-parse occurrences become ordinary terminal interruptions: the model
-proves exit 4, no fresh reconciliation, and no supervisor retry, while runtime
-tests cover actual browser closure. A post-click occurrence is represented by
-an unobservable post-click document and is proved unable to match the recovery
+session-parse occurrences become ordinary runner interruptions; the private
+application's terminal projection proves exit 4 and no shell retry only after
+the caller has chosen to stop. Runtime tests cover actual browser retirement. A
+post-click occurrence is represented by an
+unobservable post-click document and is proved unable to match the recovery
 incident predicate. A recovery probe, reload, active parse, or recovery-cleanup
 occurrence is represented by failure of the stable coordinator guard; when
-incident evidence had already matched, this produces typed exhaustion and may
-enter the sole fresh-browser stage. Final-acknowledgement live ambiguity remains
-inside the separately proved terminal no-fresh path.
+incident evidence had already matched, this produces typed exhaustion and ends
+the reusable model. Any browser or worker restart remains external policy.
 
 Final completion is modeled separately from next-floor progression. The exact
 final control is revalidated in its original document before it may be clicked
 at most once. Success requires a changed document on the expected realm whose
 ready state is `interactive` or `complete`, with the battle, finish,
 next-floor, and PonyChart controls all absent. Missing or ambiguous evidence is
-a terminal interruption, is not eligible for fresh-browser reconciliation, and
-is never eligible for either supervisor retry.
+an interruption. After the caller chooses to stop, the private application's
+terminal projection proves exit 4; neither `main.sh` nor the outer launcher
+retries that emitted terminal status.

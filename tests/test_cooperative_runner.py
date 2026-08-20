@@ -341,6 +341,10 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleRecoveryExhaustedError) as raised:
             await runner.step()
 
+        self.assertEqual(
+            raised.exception.diagnostic_code,
+            "battle.action-recovery-exhausted",
+        )
         self.assertIs(raised.exception.__cause__, second_error)
         session.recover_unknown_action.assert_awaited_once_with(
             first_error,
@@ -402,8 +406,10 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(
             BattleInterruptedError,
             "Battle outcome is unknown after a turn timeout",
-        ):
+        ) as raised:
             await runner.step()
+
+        self.assertEqual(raised.exception.diagnostic_code, "battle.turn-timeout")
 
     async def test_unknown_exit_confirmation_yields_between_each_probe(self) -> None:
         session = _StepSession(

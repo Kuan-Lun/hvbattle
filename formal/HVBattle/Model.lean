@@ -800,6 +800,46 @@ def recoveryNextStep : UnknownActionResolution → RecoveryNextStep
   | .recoverToPrepare => .prepareAndRunStrategy
   | .recoveryExhausted | .interrupt => .stop
 
+/-!
+HVBattle exposes recovery exhaustion as a distinct typed interruption with its
+own stable diagnostic code. This model deliberately stops at that package
+boundary: opening another browser, restarting a worker, and bounding those
+restarts are policies supplied by the calling application.
+-/
+inductive UnknownActionInterruptionKind where
+  | outcomeUnknown
+  | recoveryExhausted
+  deriving DecidableEq, Repr
+
+def interruptionKindForResolution :
+    UnknownActionResolution → Option UnknownActionInterruptionKind
+  | .recoverToPrepare => none
+  | .interrupt => some .outcomeUnknown
+  | .recoveryExhausted => some .recoveryExhausted
+
+def diagnosticCodeForResolution : UnknownActionResolution → Option String
+  | .recoverToPrepare => none
+  | .interrupt => some "battle.action-outcome-unknown"
+  | .recoveryExhausted => some "battle.action-recovery-exhausted"
+
+theorem recoveryExhaustionRetainsTypedDiagnostic :
+    interruptionKindForResolution .recoveryExhausted =
+        some .recoveryExhausted ∧
+      diagnosticCodeForResolution .recoveryExhausted =
+        some "battle.action-recovery-exhausted" := by
+  native_decide
+
+theorem ordinaryUnknownRetainsTypedDiagnostic :
+    interruptionKindForResolution .interrupt = some .outcomeUnknown ∧
+      diagnosticCodeForResolution .interrupt =
+        some "battle.action-outcome-unknown" := by
+  native_decide
+
+theorem acceptedRecoveryHasNoInterruptionDiagnostic :
+    interruptionKindForResolution .recoverToPrepare = none ∧
+      diagnosticCodeForResolution .recoverToPrepare = none := by
+  native_decide
+
 theorem recoveryRequiresEveryGuard
     (expectedRealm : BattleRealm)
     (evidence : ActionRecoveryEvidence)
@@ -1381,206 +1421,13 @@ inductive TransitionManagerOutcome where
 inductive RunnerOutcome where
   | continueBattle
   | battleInterrupted
+  | battleRecoveryExhausted
   deriving DecidableEq, Repr
 
 inductive ApplicationOutcome where
   | running
   | exited (code : Nat)
   deriving DecidableEq, Repr
-
-/-!
-Only typed exhaustion raised after same-browser reconciliation fails, or after
-the current browser has consumed its recovery budget, may open one fresh
-authenticated browser. Final-completion acknowledgement ambiguity and
-unrelated interruptions never enter this path, and an ambiguity in the fresh
-browser cannot open a third browser.
--/
-inductive ApplicationInterruptionKind where
-  | recoveryExhausted
-  | finalCompletionAckUnknown
-  | otherBattleInterrupted
-  deriving DecidableEq, Repr
-
-inductive FreshReconcileDecision where
-  | openFreshCurrentBattle
-  | stop
-  deriving DecidableEq, Repr
-
-structure FreshReconcileResult where
-  decision : FreshReconcileDecision
-  usedAfter : Bool
-  deriving DecidableEq, Repr
-
-def advanceFreshReconcile
-    (kind : ApplicationInterruptionKind)
-    (usedBefore : Bool) : FreshReconcileResult :=
-  match kind with
-  | .recoveryExhausted =>
-      if usedBefore then
-        ⟨.stop, true⟩
-      else
-        ⟨.openFreshCurrentBattle, true⟩
-  | .finalCompletionAckUnknown | .otherBattleInterrupted =>
-      ⟨.stop, usedBefore⟩
-
-def freshReconcileDecision
-    (kind : ApplicationInterruptionKind)
-    (usedBefore : Bool) : FreshReconcileDecision :=
-  (advanceFreshReconcile kind usedBefore).decision
-
-inductive UnknownApplicationDirective where
-  | continueCurrentBrowser
-  | openFreshCurrentBattle
-  | terminalInterrupt
-  deriving DecidableEq, Repr
-
-structure UnknownApplicationDecision where
-  directive : UnknownApplicationDirective
-  resolution : UnknownActionResolution
-  recoveryBudgetAfter : RecoveryBudget
-  freshReconcileUsedAfter : Bool
-  deriving DecidableEq, Repr
-
-def freshBrowserInitialRecoveryBudget : RecoveryBudget := ⟨false⟩
-
-def decideUnknownApplication
-    (expectedRealm : BattleRealm)
-    (evidence : ActionRecoveryEvidence)
-    (observed : RecoveryObservation)
-    (budget : RecoveryBudget)
-    (freshReconcileUsedBefore : Bool) : UnknownApplicationDecision :=
-  let action := decideUnknownAction expectedRealm evidence observed budget
-  match action.resolution with
-  | .recoverToPrepare =>
-      ⟨.continueCurrentBrowser, .recoverToPrepare, action.budgetAfter,
-        freshReconcileUsedBefore⟩
-  | .interrupt =>
-      ⟨.terminalInterrupt, .interrupt, action.budgetAfter,
-        freshReconcileUsedBefore⟩
-  | .recoveryExhausted =>
-      let fresh := advanceFreshReconcile .recoveryExhausted
-        freshReconcileUsedBefore
-      match fresh.decision with
-      | .openFreshCurrentBattle =>
-          ⟨.openFreshCurrentBattle, .recoveryExhausted,
-            freshBrowserInitialRecoveryBudget, fresh.usedAfter⟩
-      | .stop =>
-          ⟨.terminalInterrupt, .recoveryExhausted, action.budgetAfter,
-            fresh.usedAfter⟩
-
-theorem onlyTypedRecoveryExhaustionStartsFreshReconcile
-    (kind : ApplicationInterruptionKind)
-    (freshReconcileAlreadyUsed : Bool)
-    (opened : freshReconcileDecision kind freshReconcileAlreadyUsed =
-      .openFreshCurrentBattle) :
-    kind = .recoveryExhausted ∧ freshReconcileAlreadyUsed = false := by
-  cases kind <;> cases freshReconcileAlreadyUsed <;>
-    simp_all [freshReconcileDecision, advanceFreshReconcile]
-
-theorem finalCompletionAckUnknownNeverStartsFreshReconcile
-    (freshReconcileAlreadyUsed : Bool) :
-    freshReconcileDecision .finalCompletionAckUnknown
-      freshReconcileAlreadyUsed = .stop := by
-  simp [freshReconcileDecision, advanceFreshReconcile]
-
-theorem finalCompletionAckUnknownPreservesFreshReconcileState
-    (freshReconcileUsedBefore : Bool) :
-    (advanceFreshReconcile .finalCompletionAckUnknown
-      freshReconcileUsedBefore).usedAfter = freshReconcileUsedBefore := by
-  simp [advanceFreshReconcile]
-
-theorem freshUnknownActionRequiresTypedExhaustionAndUnusedAttempt
-    (expectedRealm : BattleRealm)
-    (evidence : ActionRecoveryEvidence)
-    (observed : RecoveryObservation)
-    (budget : RecoveryBudget)
-    (freshReconcileUsedBefore : Bool)
-    (opened :
-      (decideUnknownApplication expectedRealm evidence observed budget
-        freshReconcileUsedBefore).directive = .openFreshCurrentBattle) :
-    resolveUnknownAction expectedRealm evidence observed budget =
-        .recoveryExhausted ∧
-      freshReconcileUsedBefore = false ∧
-      (decideUnknownApplication expectedRealm evidence observed budget
-        freshReconcileUsedBefore).freshReconcileUsedAfter = true := by
-  cases decisionCase : decideUnknownAction expectedRealm evidence observed budget with
-  | mk resolution budgetAfter =>
-      cases resolution <;> cases freshReconcileUsedBefore <;>
-        simp_all [decideUnknownApplication, resolveUnknownAction,
-          advanceFreshReconcile]
-
-theorem freshBrowserUnknownNeverStartsThirdBrowser
-    (expectedRealm : BattleRealm)
-    (evidence : ActionRecoveryEvidence)
-    (observed : RecoveryObservation)
-    (budget : RecoveryBudget) :
-    (decideUnknownApplication expectedRealm evidence observed budget true).directive ≠
-      .openFreshCurrentBattle := by
-  cases decisionCase : decideUnknownAction expectedRealm evidence observed budget with
-  | mk resolution budgetAfter =>
-      cases resolution <;>
-        simp [decideUnknownApplication, decisionCase, advanceFreshReconcile]
-
-theorem openedFreshBrowserStartsWithAvailableRecoveryBudget
-    (expectedRealm : BattleRealm)
-    (evidence : ActionRecoveryEvidence)
-    (observed : RecoveryObservation)
-    (budget : RecoveryBudget)
-    (opened :
-      (decideUnknownApplication expectedRealm evidence observed budget false).directive =
-        .openFreshCurrentBattle) :
-    (decideUnknownApplication expectedRealm evidence observed budget
-        false).recoveryBudgetAfter = freshBrowserInitialRecoveryBudget ∧
-      recoveryBudgetAvailable
-        (decideUnknownApplication expectedRealm evidence observed budget
-          false).recoveryBudgetAfter = true := by
-  cases decisionCase : decideUnknownAction expectedRealm evidence observed budget with
-  | mk resolution budgetAfter =>
-      cases resolution <;>
-        simp_all [decideUnknownApplication,
-          advanceFreshReconcile, freshBrowserInitialRecoveryBudget,
-          recoveryBudgetAvailable]
-
-theorem openedFreshReconcileThreadsUsedState
-    (expectedRealm : BattleRealm)
-    (firstEvidence nextEvidence : ActionRecoveryEvidence)
-    (firstObservation nextObservation : RecoveryObservation)
-    (budget : RecoveryBudget)
-    (opened :
-      (decideUnknownApplication expectedRealm firstEvidence firstObservation
-        budget false).directive = .openFreshCurrentBattle) :
-    (decideUnknownApplication expectedRealm nextEvidence nextObservation
-        (decideUnknownApplication expectedRealm firstEvidence firstObservation
-          budget false).recoveryBudgetAfter
-        (decideUnknownApplication expectedRealm firstEvidence firstObservation
-          budget false).freshReconcileUsedAfter).directive ≠
-      .openFreshCurrentBattle := by
-  have consumed := freshUnknownActionRequiresTypedExhaustionAndUnusedAttempt
-    expectedRealm firstEvidence firstObservation budget false opened
-  rw [consumed.2.2]
-  exact freshBrowserUnknownNeverStartsThirdBrowser expectedRealm nextEvidence
-    nextObservation
-    (decideUnknownApplication expectedRealm firstEvidence firstObservation
-      budget false).recoveryBudgetAfter
-
-theorem observedFreshBrowserCanRebaseOnceButCannotOpenThird :
-    let primary := decideUnknownApplication .persistent
-      observedStatusZeroEvidence
-      { observedStableRecovery with activeParsedAlive := false }
-      availableRecoveryBudget false
-    let freshRebase := decideUnknownApplication .persistent
-      observedStatusZeroEvidence observedStableRecovery
-      primary.recoveryBudgetAfter primary.freshReconcileUsedAfter
-    let nextUnknown := decideUnknownApplication .persistent
-      observedUnboundUnknownEvidence observedStableRecovery
-      freshRebase.recoveryBudgetAfter freshRebase.freshReconcileUsedAfter
-    primary.directive = .openFreshCurrentBattle ∧
-      primary.recoveryBudgetAfter = freshBrowserInitialRecoveryBudget ∧
-      freshRebase.directive = .continueCurrentBrowser ∧
-      freshRebase.freshReconcileUsedAfter = true ∧
-      nextUnknown.directive = .terminalInterrupt ∧
-      nextUnknown.directive ≠ .openFreshCurrentBattle := by
-  native_decide
 
 structure Audited (Outcome : Type) where
   outcome : Outcome
@@ -1616,7 +1463,11 @@ def runUnknownActionRecovery
   match resolveUnknownAction expectedRealm evidence observed budget with
   | .recoverToPrepare =>
       ⟨.continueBattle, [.actionRecoveryAccepted |> infoRecord]⟩
-  | .recoveryExhausted | .interrupt =>
+  | .recoveryExhausted =>
+      ⟨.battleRecoveryExhausted,
+        [.transitionOutcomeUnknown |> errorRecord,
+          .runnerCompletionUnconfirmed |> errorRecord]⟩
+  | .interrupt =>
       mapUnrecoveredManagerOutcomeToRunner
         ⟨.battleActionOutcomeUnknown,
           [.transitionOutcomeUnknown |> errorRecord]⟩
@@ -1679,19 +1530,15 @@ def battleInterruptedExitCode : Nat := 4
 def loggingFailureExitCode : Nat := 5
 
 /-!
-The foreground logging wrapper drains both pipeline processes. With a healthy
-`tee`, it preserves every child status. If `tee` fails, it preserves only the
-already-terminal configuration/safety exits 2, 3, and 4; every other child
-status maps to terminal logging-failure exit 5. This prevents missing logs from
-turning a possibly completed run into an automatic retry.
+Python owns the application log in both direct and supervised launches. A
+terminal record must be persisted before its intended status is published; a
+sink failure therefore replaces every intended status with terminal logging
+failure exit 5.
 -/
-def loggedCommandExitCode (childExitCode : Nat) (teeSucceeded : Bool) : Nat :=
-  if teeSucceeded then
-    childExitCode
-  else if childExitCode = configurationFailureExitCode ∨
-      childExitCode = postBattleFailureExitCode ∨
-      childExitCode = battleInterruptedExitCode then
-    childExitCode
+def applicationLoggedExitCode
+    (intendedExitCode : Nat) (applicationLogSucceeded : Bool) : Nat :=
+  if applicationLogSucceeded then
+    intendedExitCode
   else
     loggingFailureExitCode
 
@@ -1733,46 +1580,60 @@ def checkedWatchdogDecision
   watchdogDecision (sinkFailureMarked health) idleTimeoutReached
 
 /-!
-Appending the supervisor's own terminal decision uses the same fail-closed
-matrix as the checked command sink.
+`main.sh` owns only `supervisor.log`. If appending its post-child decision
+fails, an already-terminal 2/3/4/5 remains terminal; success or an unclassified
+child failure becomes logging-failure exit 5.
 -/
+def supervisorDecisionExitCode
+    (childExitCode : Nat) (decisionLogSucceeded : Bool) : Nat :=
+  if decisionLogSucceeded then
+    childExitCode
+  else if childExitCode = configurationFailureExitCode ∨
+      childExitCode = postBattleFailureExitCode ∨
+      childExitCode = battleInterruptedExitCode ∨
+      childExitCode = loggingFailureExitCode then
+    childExitCode
+  else
+    loggingFailureExitCode
+
 def exitAfterDecisionLog
     (childExitCode : Nat) (decisionLogSucceeded : Bool) : Nat :=
-  loggedCommandExitCode childExitCode decisionLogSucceeded
+  supervisorDecisionExitCode childExitCode decisionLogSucceeded
 
 /-!
-An interruption unwinds through `BattleSession` and HBrowser's `Driver`
-context before the private application's `main` handler logs the terminal
-exception. The record order below mirrors that runtime path.
+This is a terminal projection, not hvbattle restart policy. A caller may first
+consume an in-process worker/browser restart budget. Only after that caller has
+chosen to stop does the interruption unwind through `BattleSession` and the
+browser context before `main` records exit 4. Both typed interruption variants
+retain the same terminal record suffix at this outer boundary.
 -/
-
-def mapRunnerOutcomeToApplication
+def projectTerminalRunnerOutcomeToApplication
     (runner : Audited RunnerOutcome) : Audited ApplicationOutcome :=
   match runner.outcome with
   | .continueBattle => ⟨.running, runner.records⟩
-  | .battleInterrupted =>
+  | .battleInterrupted | .battleRecoveryExhausted =>
       ⟨.exited battleInterruptedExitCode,
         runner.records ++
           [.driverException |> errorRecord,
             .applicationBattleInterrupted |> errorRecord]⟩
 
-def runApplicationTransitionWithoutFreshReconcile
+def projectTerminalApplicationTransition
     (before current : BattleSnapshot)
     (retainedTransitionMonitor : Option ActionMonitor)
     (expectedRealm : BattleRealm)
     (recoveryEvidence : ActionRecoveryEvidence)
     (recoveryObservation : RecoveryObservation)
     (budget : RecoveryBudget) : Audited ApplicationOutcome :=
-  mapRunnerOutcomeToApplication
+  projectTerminalRunnerOutcomeToApplication
     (runTransition before current retainedTransitionMonitor expectedRealm
       recoveryEvidence recoveryObservation budget)
 
-def runApplicationUnknownActionWithoutFreshReconcile
+def projectTerminalApplicationUnknownAction
     (expectedRealm : BattleRealm)
     (evidence : ActionRecoveryEvidence)
     (observed : RecoveryObservation)
     (budget : RecoveryBudget) : Audited ApplicationOutcome :=
-  mapRunnerOutcomeToApplication
+  projectTerminalRunnerOutcomeToApplication
     (runUnknownActionRecovery expectedRealm evidence observed budget)
 
 def unknownTransitionErrorRecordSuffix : List LogRecord :=
@@ -1789,24 +1650,18 @@ def postBattleFailureReport : Audited ApplicationOutcome :=
     [.applicationPostBattleFailure |> errorRecord]⟩
 
 /-!
-The private application has two supervisor layers. `containerSupervisorShouldRetry`
-models `main.sh`; `launcherShouldRetry` models `battle.zsh`. Both classify exit
-2, 3, 4, and 5 as terminal stops.
+`main.sh` is a zero-retry lifecycle wrapper. `launcherShouldRetry` models the
+separate outer `battle.zsh` policy, which treats exits 2, 3, 4, and 5 as
+terminal stops.
 -/
 inductive LauncherFailureKind where
   | timeout
   | crash
   deriving DecidableEq, Repr
 
-def containerSupervisorShouldRetry
-    (childExitCode attempt maxAttempts : Nat) : Bool :=
-  if childExitCode = 0 ∨ childExitCode = configurationFailureExitCode ∨
-      childExitCode = postBattleFailureExitCode ∨
-      childExitCode = battleInterruptedExitCode ∨
-      childExitCode = loggingFailureExitCode then
-    false
-  else
-    decide (attempt < maxAttempts)
+def mainShellShouldRetry
+    (_childExitCode _attempt _maxAttempts : Nat) : Bool :=
+  false
 
 def launcherShouldRetry
     (failureKind : LauncherFailureKind)
@@ -1828,48 +1683,44 @@ theorem postBattleFailureMapsToExitThreeAndLogs :
         postBattleFailureReport.records := by
   native_decide
 
-theorem battleInterruptedMapsToExitFourAndLogs
+theorem terminalProjectionOfBattleInterruptionExitsFourAndLogs
     (records : List LogRecord) :
-    let result := mapRunnerOutcomeToApplication
+    let result := projectTerminalRunnerOutcomeToApplication
       (Audited.mk .battleInterrupted records)
     result.outcome = .exited 4 ∧
       errorRecord .driverException ∈ result.records ∧
       errorRecord .applicationBattleInterrupted ∈ result.records := by
-  simp [mapRunnerOutcomeToApplication, battleInterruptedExitCode]
+  simp [projectTerminalRunnerOutcomeToApplication, battleInterruptedExitCode]
+
+theorem terminalProjectionOfRecoveryExhaustionExitsFourAndLogs
+    (records : List LogRecord) :
+    let result := projectTerminalRunnerOutcomeToApplication
+      (Audited.mk .battleRecoveryExhausted records)
+    result.outcome = .exited 4 ∧
+      errorRecord .driverException ∈ result.records ∧
+      errorRecord .applicationBattleInterrupted ∈ result.records := by
+  simp [projectTerminalRunnerOutcomeToApplication, battleInterruptedExitCode]
 
 theorem healthyLoggingPreservesEveryChildStatus
     (childExitCode : Nat) :
-    loggedCommandExitCode childExitCode true = childExitCode := by
-  simp [loggedCommandExitCode]
+    applicationLoggedExitCode childExitCode true = childExitCode := by
+  simp [applicationLoggedExitCode]
 
-theorem failedLoggingPreservesOnlyTerminalChildStatuses
-    (childExitCode : Nat)
-    (terminal :
-      childExitCode = configurationFailureExitCode ∨
-        childExitCode = postBattleFailureExitCode ∨
-        childExitCode = battleInterruptedExitCode) :
-    loggedCommandExitCode childExitCode false = childExitCode := by
-  simp [loggedCommandExitCode, terminal]
+theorem failedApplicationLoggingAlwaysExitsFive
+    (childExitCode : Nat) :
+    applicationLoggedExitCode childExitCode false = 5 := by
+  simp [applicationLoggedExitCode, loggingFailureExitCode]
 
-theorem failedLoggingMapsEveryNonterminalChildToFive
-    (childExitCode : Nat)
-    (notConfiguration : childExitCode ≠ configurationFailureExitCode)
-    (notPostBattle : childExitCode ≠ postBattleFailureExitCode)
-    (notInterrupted : childExitCode ≠ battleInterruptedExitCode) :
-    loggedCommandExitCode childExitCode false = 5 := by
-  simp [loggedCommandExitCode, notConfiguration, notPostBattle,
-    notInterrupted, loggingFailureExitCode]
-
-theorem successfulChildAndTeeExitZero :
-    loggedCommandExitCode 0 true = 0 := by
+theorem successfulChildAndApplicationLogExitZero :
+    applicationLoggedExitCode 0 true = 0 := by
   native_decide
 
-theorem successfulChildWithFailedTeeExitsFive :
-    loggedCommandExitCode 0 false = 5 := by
+theorem successfulChildWithFailedApplicationLogExitsFive :
+    applicationLoggedExitCode 0 false = 5 := by
   native_decide
 
-theorem unclassifiedChildWithFailedTeeExitsFive :
-    loggedCommandExitCode 1 false = 5 := by
+theorem unclassifiedChildWithFailedApplicationLogExitsFive :
+    applicationLoggedExitCode 1 false = 5 := by
   native_decide
 
 theorem sinkFailureMarkerPrecedesIdleTimeout
@@ -1900,31 +1751,36 @@ theorem failedDecisionLogCannotPermitGenericRetry :
 
 theorem failedDecisionLogPreservesExistingSafetyStop
     (childExitCode : Nat)
-    (terminal : childExitCode = 2 ∨ childExitCode = 3 ∨ childExitCode = 4) :
+    (terminal :
+      childExitCode = 2 ∨ childExitCode = 3 ∨ childExitCode = 4 ∨
+        childExitCode = 5) :
     exitAfterDecisionLog childExitCode false = childExitCode := by
-  simp [exitAfterDecisionLog, loggedCommandExitCode,
-    configurationFailureExitCode, postBattleFailureExitCode,
-    battleInterruptedExitCode, terminal]
+  rcases terminal with terminal | terminal | terminal | terminal <;>
+    subst childExitCode <;> native_decide
 
-theorem containerNeverRetriesConfigurationFailure
-    (attempt maxAttempts : Nat) :
-    containerSupervisorShouldRetry 2 attempt maxAttempts = false := by
-  simp [containerSupervisorShouldRetry, configurationFailureExitCode]
+theorem failedDecisionLogPreservesExistingLoggingFailure :
+    exitAfterDecisionLog 5 false = 5 := by
+  native_decide
 
-theorem containerNeverRetriesPostBattleFailure
+theorem mainShellNeverRetriesConfigurationFailure
     (attempt maxAttempts : Nat) :
-    containerSupervisorShouldRetry 3 attempt maxAttempts = false := by
-  simp [containerSupervisorShouldRetry, postBattleFailureExitCode]
+    mainShellShouldRetry 2 attempt maxAttempts = false := by
+  simp [mainShellShouldRetry]
 
-theorem containerNeverRetriesBattleInterruption
+theorem mainShellNeverRetriesPostBattleFailure
     (attempt maxAttempts : Nat) :
-    containerSupervisorShouldRetry 4 attempt maxAttempts = false := by
-  simp [containerSupervisorShouldRetry, battleInterruptedExitCode]
+    mainShellShouldRetry 3 attempt maxAttempts = false := by
+  simp [mainShellShouldRetry]
 
-theorem containerNeverRetriesLoggingFailure
+theorem mainShellNeverRetriesBattleInterruption
     (attempt maxAttempts : Nat) :
-    containerSupervisorShouldRetry 5 attempt maxAttempts = false := by
-  simp [containerSupervisorShouldRetry, loggingFailureExitCode]
+    mainShellShouldRetry 4 attempt maxAttempts = false := by
+  simp [mainShellShouldRetry]
+
+theorem mainShellNeverRetriesLoggingFailure
+    (attempt maxAttempts : Nat) :
+    mainShellShouldRetry 5 attempt maxAttempts = false := by
+  simp [mainShellShouldRetry]
 
 theorem launcherNeverRetriesPostBattleFailure
     (failureKind : LauncherFailureKind)
@@ -1950,25 +1806,25 @@ theorem launcherNeverRetriesLoggingFailure
     launcherShouldRetry failureKind 5 retriesUsed maxRetries = false := by
   simp [launcherShouldRetry, loggingFailureExitCode]
 
-theorem failedTeeAfterSuccessfulChildIsTerminal
+theorem failedApplicationLogAfterSuccessfulChildIsTerminal
     (failureKind : LauncherFailureKind)
     (attempt maxAttempts retriesUsed maxRetries : Nat) :
-    loggedCommandExitCode 0 false = 5 ∧
-      containerSupervisorShouldRetry 5 attempt maxAttempts = false ∧
+    applicationLoggedExitCode 0 false = 5 ∧
+      mainShellShouldRetry 5 attempt maxAttempts = false ∧
       launcherShouldRetry failureKind 5 retriesUsed maxRetries = false := by
-  simp [loggedCommandExitCode, loggingFailureExitCode,
-    containerSupervisorShouldRetry, launcherShouldRetry,
+  simp [applicationLoggedExitCode, loggingFailureExitCode,
+    mainShellShouldRetry, launcherShouldRetry,
     configurationFailureExitCode, postBattleFailureExitCode,
     battleInterruptedExitCode]
 
-theorem failedTeeAfterUnclassifiedChildIsTerminal
+theorem failedApplicationLogAfterUnclassifiedChildIsTerminal
     (failureKind : LauncherFailureKind)
     (attempt maxAttempts retriesUsed maxRetries : Nat) :
-    loggedCommandExitCode 1 false = 5 ∧
-      containerSupervisorShouldRetry 5 attempt maxAttempts = false ∧
+    applicationLoggedExitCode 1 false = 5 ∧
+      mainShellShouldRetry 5 attempt maxAttempts = false ∧
       launcherShouldRetry failureKind 5 retriesUsed maxRetries = false := by
-  simp [loggedCommandExitCode, loggingFailureExitCode,
-    containerSupervisorShouldRetry, launcherShouldRetry,
+  simp [applicationLoggedExitCode, loggingFailureExitCode,
+    mainShellShouldRetry, launcherShouldRetry,
     configurationFailureExitCode, postBattleFailureExitCode,
     battleInterruptedExitCode]
 
@@ -1994,12 +1850,30 @@ theorem nonRecoveredUnknownMapsToRunnerInterruptionWithErrorRecords
       resolveUnknownAction expectedRealm evidence observed budget ≠
         .recoverToPrepare) :
     let result := runUnknownActionRecovery expectedRealm evidence observed budget
-    result.outcome = .battleInterrupted ∧
+    (result.outcome = .battleInterrupted ∨
+        result.outcome = .battleRecoveryExhausted) ∧
       errorRecord .transitionOutcomeUnknown ∈ result.records ∧
       errorRecord .runnerCompletionUnconfirmed ∈ result.records := by
   cases resolutionCase :
       resolveUnknownAction expectedRealm evidence observed budget <;>
     simp_all [runUnknownActionRecovery, mapUnrecoveredManagerOutcomeToRunner]
+
+theorem recoveryExhaustionMapsToTypedRunnerInterruption
+    (expectedRealm : BattleRealm)
+    (evidence : ActionRecoveryEvidence)
+    (observed : RecoveryObservation)
+    (budget : RecoveryBudget)
+    (exhausted :
+      resolveUnknownAction expectedRealm evidence observed budget =
+        .recoveryExhausted) :
+    let result := runUnknownActionRecovery expectedRealm evidence observed budget
+    result.outcome = .battleRecoveryExhausted ∧
+      errorRecord .transitionOutcomeUnknown ∈ result.records ∧
+      errorRecord .runnerCompletionUnconfirmed ∈ result.records ∧
+      diagnosticCodeForResolution
+        (resolveUnknownAction expectedRealm evidence observed budget) =
+          some "battle.action-recovery-exhausted" := by
+  simp [runUnknownActionRecovery, exhausted, diagnosticCodeForResolution]
 
 theorem recoverableUnknownContinuesOnlyThroughPrepare
     (expectedRealm : BattleRealm)
@@ -2018,11 +1892,12 @@ theorem recoverableUnknownContinuesOnlyThroughPrepare
   simp [runUnknownActionRecovery, recovered, recoveryNextStep]
 
 /-!
-Without an application fresh-reconciliation context, a transition with no
-positive evidence and no accepted same-browser recovery emits the manager and
-runner error records and is mapped to `BattleInterrupted`.
+A transition with no positive evidence and no accepted same-browser recovery
+emits the manager and runner error records. A separate terminal projection used
+below applies only after a caller has chosen to stop; it does not decide whether
+the caller should create a new browser or restart a worker first.
 -/
-theorem unknownTransitionWithoutFreshContextMapsToInterruptionWithErrorRecords
+theorem unknownTransitionMapsToInterruptionWithErrorRecords
     (before current : BattleSnapshot)
     (retainedTransitionMonitor : Option ActionMonitor)
     (expectedRealm : BattleRealm)
@@ -2038,7 +1913,8 @@ theorem unknownTransitionWithoutFreshContextMapsToInterruptionWithErrorRecords
         recoveryObservation budget ≠ .recoverToPrepare) :
     let result := runTransition before current retainedTransitionMonitor
       expectedRealm recoveryEvidence recoveryObservation budget
-    result.outcome = .battleInterrupted ∧
+    (result.outcome = .battleInterrupted ∨
+        result.outcome = .battleRecoveryExhausted) ∧
       errorRecord .transitionOutcomeUnknown ∈ result.records ∧
       errorRecord .runnerCompletionUnconfirmed ∈ result.records := by
   simpa [runTransition, unknown] using
@@ -2073,7 +1949,7 @@ theorem recoverableUnknownTransitionReturnsToFreshPrepare
   simp [runTransition, unknown, runUnknownActionRecovery,
     recovered, recoveryNextStep]
 
-theorem unknownTransitionWithoutFreshContextHasExactOrderedErrorRecordSuffix
+theorem terminalUnknownTransitionHasExactOrderedErrorRecordSuffix
     (before current : BattleSnapshot)
     (retainedTransitionMonitor : Option ActionMonitor)
     (expectedRealm : BattleRealm)
@@ -2088,7 +1964,7 @@ theorem unknownTransitionWithoutFreshContextHasExactOrderedErrorRecordSuffix
           retainedTransitionMonitor)
         recoveryObservation budget ≠ .recoverToPrepare) :
     hasExactSuffix
-      (runApplicationTransitionWithoutFreshReconcile before current
+      (projectTerminalApplicationTransition before current
         retainedTransitionMonitor expectedRealm recoveryEvidence
         recoveryObservation budget).records
       unknownTransitionErrorRecordSuffix := by
@@ -2097,16 +1973,17 @@ theorem unknownTransitionWithoutFreshContextHasExactOrderedErrorRecordSuffix
       (freezeTransitionRecoveryEvidence recoveryEvidence
         retainedTransitionMonitor)
       recoveryObservation budget <;>
-    simp_all [runApplicationTransitionWithoutFreshReconcile, runTransition,
+    simp_all [projectTerminalApplicationTransition, runTransition,
       runUnknownActionRecovery, mapUnrecoveredManagerOutcomeToRunner,
-      mapRunnerOutcomeToApplication, unknownTransitionErrorRecordSuffix]
+      projectTerminalRunnerOutcomeToApplication,
+      unknownTransitionErrorRecordSuffix]
 
 /-!
 This terminal theorem is intentionally limited to an ordinary `.interrupt`
-resolution. Typed recovery exhaustion is handled by the separate, stateful
-fresh-reconciliation policy below.
+resolution. A `.recoveryExhausted` result remains a distinct reusable hvbattle
+outcome; any browser-restart policy belongs to the calling application.
 -/
-theorem ordinaryUnknownTransitionWithoutFreshContextStopsWithoutRetry
+theorem ordinaryUnknownTransitionTerminalProjectionStopsWithoutShellRetry
     (before current : BattleSnapshot)
     (retainedTransitionMonitor : Option ActionMonitor)
     (expectedRealm : BattleRealm)
@@ -2121,9 +1998,9 @@ theorem ordinaryUnknownTransitionWithoutFreshContextStopsWithoutRetry
           retainedTransitionMonitor)
         recoveryObservation budget = .interrupt)
     (failureKind : LauncherFailureKind)
-    (teeSucceeded : Bool)
+    (applicationLogSucceeded : Bool)
     (attempt maxAttempts retriesUsed maxRetries : Nat) :
-    let result := runApplicationTransitionWithoutFreshReconcile before current
+    let result := projectTerminalApplicationTransition before current
       retainedTransitionMonitor expectedRealm recoveryEvidence
       recoveryObservation budget
     result.outcome = .exited 4 ∧
@@ -2131,46 +2008,54 @@ theorem ordinaryUnknownTransitionWithoutFreshContextStopsWithoutRetry
       errorRecord .runnerCompletionUnconfirmed ∈ result.records ∧
       errorRecord .driverException ∈ result.records ∧
       errorRecord .applicationBattleInterrupted ∈ result.records ∧
-      loggedCommandExitCode 4 teeSucceeded = 4 ∧
-      containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
-      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false := by
-  simp [runApplicationTransitionWithoutFreshReconcile, runTransition, unknown,
+      (applicationLoggedExitCode 4 applicationLogSucceeded =
+        if applicationLogSucceeded then 4 else 5) ∧
+      mainShellShouldRetry
+        (applicationLoggedExitCode 4 applicationLogSucceeded)
+        attempt maxAttempts = false ∧
+      launcherShouldRetry failureKind
+        (applicationLoggedExitCode 4 applicationLogSucceeded)
+        retriesUsed maxRetries = false := by
+  cases applicationLogSucceeded <;>
+    simp [projectTerminalApplicationTransition, runTransition, unknown,
     runUnknownActionRecovery, ordinary,
     mapUnrecoveredManagerOutcomeToRunner,
-    mapRunnerOutcomeToApplication, battleInterruptedExitCode,
-    loggedCommandExitCode, loggingFailureExitCode,
-    containerSupervisorShouldRetry, launcherShouldRetry,
+    projectTerminalRunnerOutcomeToApplication, battleInterruptedExitCode,
+    applicationLoggedExitCode, loggingFailureExitCode,
+    mainShellShouldRetry, launcherShouldRetry,
     configurationFailureExitCode, postBattleFailureExitCode]
 
 /-!
 Monitor-arm, monitor-cleanup, and session-parse live-operation timeouts are
-raised as ordinary `BattleInterruptedError` values before any recovery policy
-is entered. Browser-context closure is a runtime responsibility; the model
-observes its application consequence: exit 4, no fresh reconciliation, and no
-shell retry.
+raised as ordinary `BattleInterruptedError` values before same-browser recovery
+is entered. Browser-context closure and any later restart decision are caller
+responsibilities. If the caller then chooses the terminal projection, it
+observes exit 4 and no shell retry.
 -/
-theorem ordinaryLiveOperationTimeoutStopsWithoutFreshOrRetry
-    (freshReconcileUsed : Bool)
+theorem ordinaryLiveOperationTimeoutTerminalProjectionStopsWithoutShellRetry
     (failureKind : LauncherFailureKind)
-    (teeSucceeded : Bool)
+    (applicationLogSucceeded : Bool)
     (attempt maxAttempts retriesUsed maxRetries : Nat) :
-    let result := mapRunnerOutcomeToApplication
+    let result := projectTerminalRunnerOutcomeToApplication
       (Audited.mk .battleInterrupted [])
     result.outcome = .exited 4 ∧
       errorRecord .driverException ∈ result.records ∧
       errorRecord .applicationBattleInterrupted ∈ result.records ∧
-      freshReconcileDecision .otherBattleInterrupted
-        freshReconcileUsed = .stop ∧
-      loggedCommandExitCode 4 teeSucceeded = 4 ∧
-      containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
-      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false := by
-  simp [mapRunnerOutcomeToApplication, freshReconcileDecision,
-    advanceFreshReconcile, battleInterruptedExitCode,
-    loggedCommandExitCode, loggingFailureExitCode,
-    containerSupervisorShouldRetry, launcherShouldRetry,
+      (applicationLoggedExitCode 4 applicationLogSucceeded =
+        if applicationLogSucceeded then 4 else 5) ∧
+      mainShellShouldRetry
+        (applicationLoggedExitCode 4 applicationLogSucceeded)
+        attempt maxAttempts = false ∧
+      launcherShouldRetry failureKind
+        (applicationLoggedExitCode 4 applicationLogSucceeded)
+        retriesUsed maxRetries = false := by
+  cases applicationLogSucceeded <;>
+    simp [projectTerminalRunnerOutcomeToApplication, battleInterruptedExitCode,
+    applicationLoggedExitCode, loggingFailureExitCode,
+    mainShellShouldRetry, launcherShouldRetry,
     configurationFailureExitCode, postBattleFailureExitCode]
 
-theorem unmatchedUnknownActionStopsApplicationWithoutRetry
+theorem unmatchedUnknownActionTerminalProjectionStopsWithoutShellRetry
     (expectedRealm : BattleRealm)
     (evidence : ActionRecoveryEvidence)
     (observed : RecoveryObservation)
@@ -2179,152 +2064,60 @@ theorem unmatchedUnknownActionStopsApplicationWithoutRetry
     (available : recoveryBudgetAvailable budget = true)
     (unmatched : matchesReloadRecoveryIncident evidence = false)
     (failureKind : LauncherFailureKind)
-    (teeSucceeded : Bool)
+    (applicationLogSucceeded : Bool)
     (attempt maxAttempts retriesUsed maxRetries : Nat) :
-    let result := runApplicationUnknownActionWithoutFreshReconcile
+    let result := projectTerminalApplicationUnknownAction
       expectedRealm evidence observed budget
     result.outcome = .exited 4 ∧
       errorRecord .transitionOutcomeUnknown ∈ result.records ∧
       errorRecord .runnerCompletionUnconfirmed ∈ result.records ∧
       errorRecord .driverException ∈ result.records ∧
       errorRecord .applicationBattleInterrupted ∈ result.records ∧
-      loggedCommandExitCode 4 teeSucceeded = 4 ∧
-      containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
-      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false := by
+      (applicationLoggedExitCode 4 applicationLogSucceeded =
+        if applicationLogSucceeded then 4 else 5) ∧
+      mainShellShouldRetry
+        (applicationLoggedExitCode 4 applicationLogSucceeded)
+        attempt maxAttempts = false ∧
+      launcherShouldRetry failureKind
+        (applicationLoggedExitCode 4 applicationLogSucceeded)
+        retriesUsed maxRetries = false := by
   have ordinary := unmatchedUnknownInterrupts expectedRealm evidence observed
     budget validRealm available unmatched
-  simp [runApplicationUnknownActionWithoutFreshReconcile,
+  cases applicationLogSucceeded <;>
+    simp [projectTerminalApplicationUnknownAction,
     runUnknownActionRecovery, ordinary, mapUnrecoveredManagerOutcomeToRunner,
-    mapRunnerOutcomeToApplication, battleInterruptedExitCode,
-    loggedCommandExitCode, loggingFailureExitCode,
-    containerSupervisorShouldRetry, launcherShouldRetry,
+    projectTerminalRunnerOutcomeToApplication, battleInterruptedExitCode,
+    applicationLoggedExitCode, loggingFailureExitCode,
+    mainShellShouldRetry, launcherShouldRetry,
     configurationFailureExitCode, postBattleFailureExitCode]
 
-theorem typedRecoveryExhaustionOpensOneFreshReconcile
-    (expectedRealm : BattleRealm)
-    (evidence : ActionRecoveryEvidence)
-    (observed : RecoveryObservation)
-    (budget : RecoveryBudget)
-    (exhausted :
-      resolveUnknownAction expectedRealm evidence observed budget =
-        .recoveryExhausted) :
-    let result := decideUnknownApplication expectedRealm evidence observed budget
-      false
-    result.directive = .openFreshCurrentBattle ∧
-      result.resolution = .recoveryExhausted ∧
-      result.freshReconcileUsedAfter = true := by
-  have decisionResolution :
-      (decideUnknownAction expectedRealm evidence observed budget).resolution =
-        .recoveryExhausted := by
-    simpa [resolveUnknownAction] using exhausted
-  simp [decideUnknownApplication, decisionResolution, advanceFreshReconcile]
-
-/-!
-A live timeout during a recovery probe, manual reload, parser confirmation, or
-recovery cleanup is abstracted as failure to establish the stable coordinator
-guard. Because the immutable incident evidence already matched, that failure
-is typed exhaustion and may consume the sole application fresh-browser stage.
--/
-theorem failedMatchedCoordinatorRecoveryCanOpenOneFreshReconcile
-    (expectedRealm : BattleRealm)
-    (evidence : ActionRecoveryEvidence)
-    (observed : RecoveryObservation)
-    (budget : RecoveryBudget)
-    (validRealm : validExpectedRealm expectedRealm = true)
-    (available : recoveryBudgetAvailable budget = true)
-    (incident : matchesReloadRecoveryIncident evidence = true)
-    (failed :
-      stableSameRealmNewDocument expectedRealm evidence observed = false) :
-    let result := decideUnknownApplication expectedRealm evidence observed budget
-      false
-    result.directive = .openFreshCurrentBattle ∧
-      result.resolution = .recoveryExhausted ∧
-      result.freshReconcileUsedAfter = true := by
-  have exhausted := failedMatchedRecoveryIsTypedExhaustion expectedRealm evidence
-    observed budget validRealm available incident failed
-  exact typedRecoveryExhaustionOpensOneFreshReconcile expectedRealm evidence
-    observed budget exhausted
-
-theorem typedRecoveryExhaustionAfterFreshReconcileIsTerminal
-    (expectedRealm : BattleRealm)
-    (evidence : ActionRecoveryEvidence)
-    (observed : RecoveryObservation)
-    (budget : RecoveryBudget)
-    (exhausted :
-      resolveUnknownAction expectedRealm evidence observed budget =
-        .recoveryExhausted) :
-    let result := decideUnknownApplication expectedRealm evidence observed budget
-      true
-    result.directive = .terminalInterrupt ∧
-      result.freshReconcileUsedAfter = true := by
-  have decisionResolution :
-      (decideUnknownAction expectedRealm evidence observed budget).resolution =
-        .recoveryExhausted := by
-    simpa [resolveUnknownAction] using exhausted
-  simp [decideUnknownApplication, decisionResolution, advanceFreshReconcile]
-
-theorem typedRecoveryExhaustionAfterFreshReconcileExitsFourWithoutRetry
-    (expectedRealm : BattleRealm)
-    (evidence : ActionRecoveryEvidence)
-    (observed : RecoveryObservation)
-    (budget : RecoveryBudget)
-    (exhausted :
-      resolveUnknownAction expectedRealm evidence observed budget =
-        .recoveryExhausted)
-    (failureKind : LauncherFailureKind)
-    (teeSucceeded : Bool)
-    (attempt maxAttempts retriesUsed maxRetries : Nat) :
-    let policy := decideUnknownApplication expectedRealm evidence observed budget
-      true
-    let result := runApplicationUnknownActionWithoutFreshReconcile expectedRealm
-      evidence observed budget
-    policy.directive = .terminalInterrupt ∧
-      result.outcome = .exited 4 ∧
-      errorRecord .transitionOutcomeUnknown ∈ result.records ∧
-      errorRecord .runnerCompletionUnconfirmed ∈ result.records ∧
-      errorRecord .driverException ∈ result.records ∧
-      errorRecord .applicationBattleInterrupted ∈ result.records ∧
-      loggedCommandExitCode 4 teeSucceeded = 4 ∧
-      containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
-      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false := by
-  have decisionResolution :
-      (decideUnknownAction expectedRealm evidence observed budget).resolution =
-        .recoveryExhausted := by
-    simpa [resolveUnknownAction] using exhausted
-  simp [decideUnknownApplication, decisionResolution, advanceFreshReconcile,
-    runApplicationUnknownActionWithoutFreshReconcile,
-    runUnknownActionRecovery, exhausted, mapUnrecoveredManagerOutcomeToRunner,
-    mapRunnerOutcomeToApplication, battleInterruptedExitCode,
-    loggedCommandExitCode, loggingFailureExitCode,
-    containerSupervisorShouldRetry, launcherShouldRetry,
-    configurationFailureExitCode, postBattleFailureExitCode]
-
-theorem unknownCompletionAckStopsApplicationWithoutRetry
+theorem unknownCompletionAckTerminalProjectionStopsWithoutShellRetry
     (expectedRealm : BattleRealm)
     (observed : CompletionAckObservation)
     (unknown : completionAckOutcome expectedRealm observed = .outcomeUnknown)
-    (freshReconcileUsedBefore : Bool)
     (failureKind : LauncherFailureKind)
-    (teeSucceeded : Bool)
+    (applicationLogSucceeded : Bool)
     (attempt maxAttempts retriesUsed maxRetries : Nat) :
-    let result := mapRunnerOutcomeToApplication
+    let result := projectTerminalRunnerOutcomeToApplication
       (runCompletionAck expectedRealm observed)
     result.outcome = .exited 4 ∧
       errorRecord .completionAckOutcomeUnknown ∈ result.records ∧
       errorRecord .runnerCompletionAckUnconfirmed ∈ result.records ∧
       errorRecord .driverException ∈ result.records ∧
       errorRecord .applicationBattleInterrupted ∈ result.records ∧
-      loggedCommandExitCode 4 teeSucceeded = 4 ∧
-      containerSupervisorShouldRetry 4 attempt maxAttempts = false ∧
-      launcherShouldRetry failureKind 4 retriesUsed maxRetries = false ∧
-      freshReconcileDecision .finalCompletionAckUnknown
-        freshReconcileUsedBefore = .stop ∧
-      (advanceFreshReconcile .finalCompletionAckUnknown
-        freshReconcileUsedBefore).usedAfter = freshReconcileUsedBefore := by
-  simp [runCompletionAck, unknown, mapRunnerOutcomeToApplication,
-    battleInterruptedExitCode, loggedCommandExitCode, loggingFailureExitCode,
-    containerSupervisorShouldRetry, launcherShouldRetry,
-    configurationFailureExitCode, postBattleFailureExitCode,
-    freshReconcileDecision, advanceFreshReconcile]
+      (applicationLoggedExitCode 4 applicationLogSucceeded =
+        if applicationLogSucceeded then 4 else 5) ∧
+      mainShellShouldRetry
+        (applicationLoggedExitCode 4 applicationLogSucceeded)
+        attempt maxAttempts = false ∧
+      launcherShouldRetry failureKind
+        (applicationLoggedExitCode 4 applicationLogSucceeded)
+        retriesUsed maxRetries = false := by
+  cases applicationLogSucceeded <;>
+    simp [runCompletionAck, unknown,
+    projectTerminalRunnerOutcomeToApplication,
+    battleInterruptedExitCode, applicationLoggedExitCode, loggingFailureExitCode,
+    mainShellShouldRetry, launcherShouldRetry,
+    configurationFailureExitCode, postBattleFailureExitCode]
 
 end HVBattle

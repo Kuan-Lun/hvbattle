@@ -155,6 +155,7 @@ class BattleRecoveryCoordinator:
             logger.debug(
                 "Battle reload recovery probe failed error_type=%s",
                 type(error).__name__,
+                exc_info=True,
             )
             return _RecoveryProbe(_RecoveryProbeKind.ERROR)
         if state is None:
@@ -253,11 +254,16 @@ class BattleRecoveryCoordinator:
                                 "Reloaded active battle parse timed out; refusing "
                                 "another parse while the browser command may remain live"
                             )
+                            logger.debug(
+                                "Reloaded active battle parse timeout error detail",
+                                exc_info=True,
+                            )
                             return None
                         logger.debug(
                             "Reloaded active battle parse probe failed "
                             "error_type=%s",
                             type(error).__name__,
+                            exc_info=True,
                         )
                     else:
                         if self._time() >= deadline:
@@ -342,6 +348,10 @@ class BattleRecoveryCoordinator:
                     "Current-page battle reload failed error_type=%s",
                     type(reload_error).__name__,
                 )
+                logger.debug(
+                    "Current-page battle reload error detail",
+                    exc_info=True,
+                )
                 return False
 
         stable = await self._wait_for_stable_state(
@@ -367,6 +377,10 @@ class BattleRecoveryCoordinator:
             logger.error(
                 "Reloaded battle action state cleanup failed error_type=%s",
                 type(cleanup_error).__name__,
+            )
+            logger.debug(
+                "Reloaded battle action state cleanup error detail",
+                exc_info=True,
             )
             return False
         if cleanup_document_id != stable.document_id:

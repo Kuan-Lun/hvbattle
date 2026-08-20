@@ -109,7 +109,8 @@ class BattleRunner:
                 raise
             except Exception as error:
                 raise BattleInterruptedError(
-                    "Battle outcome is unknown after an active-session error"
+                    "Battle outcome is unknown after an active-session error",
+                    diagnostic_code="battle.active-session-error",
                 ) from error
 
     async def run_current(self) -> BattleCompleted | BattleStopped | None:
@@ -205,7 +206,8 @@ class BattleRunner:
                     if self._transition_checks_completed >= self.transition_checks:
                         raise BattleInterruptedError(
                             "Battle page disappeared without positive completion "
-                            "evidence"
+                            "evidence",
+                            diagnostic_code="battle.completion-evidence-missing",
                         )
                     return BattleStepIdle(
                         retry_after=self.idle_delay,
@@ -270,7 +272,8 @@ class BattleRunner:
                     exc_info=True,
                 )
                 raise BattleInterruptedError(
-                    "Battle browser operation remains in flight after timeout"
+                    "Battle browser operation remains in flight after timeout",
+                    diagnostic_code="battle.browser-operation-timeout",
                 ) from error
             except TimeoutError as error:
                 self._retry_count += 1
@@ -283,7 +286,8 @@ class BattleRunner:
                         type(error).__name__,
                     )
                     raise BattleInterruptedError(
-                        "Battle outcome is unknown after a turn timeout"
+                        "Battle outcome is unknown after a turn timeout",
+                        diagnostic_code="battle.turn-timeout",
                     ) from error
                 logger.warning(
                     "Battle turn timed out; retrying (%d/%d) error_type=%s",
@@ -364,6 +368,7 @@ class BattleRunner:
                     logger.debug(
                         "Battle action reload recovery failed error_type=%s",
                         type(recovery_error).__name__,
+                        exc_info=True,
                     )
         if recovered:
             self._recovery_pending_receipt = True
@@ -385,7 +390,12 @@ class BattleRunner:
         )
         raise interruption_type(
             "Battle outcome is unknown because the submitted action did not "
-            "produce completion evidence"
+            "produce completion evidence",
+            diagnostic_code=(
+                "battle.action-recovery-exhausted"
+                if recovery_eligible or self._recovery_pending_receipt
+                else "battle.action-outcome-unknown"
+            ),
         ) from error
 
     async def _acknowledge_completion(self) -> BattleCompleted:
@@ -408,7 +418,8 @@ class BattleRunner:
             )
             raise BattleInterruptedError(
                 "Battle outcome is unknown because the final completion "
-                "acknowledgement did not produce positive exit evidence"
+                "acknowledgement did not produce positive exit evidence",
+                diagnostic_code="battle.completion-acknowledgement-unknown",
             ) from error
 
         self._completed = result

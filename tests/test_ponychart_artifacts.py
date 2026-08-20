@@ -557,6 +557,10 @@ class PonyChartLoggingTests(unittest.IsolatedAsyncioTestCase):
         ):
             await challenge._auto_answer("challenge.png")
 
+        self.assertEqual(
+            raised.exception.diagnostic_code,
+            "battle.ponychart.label-click-outcome-unknown",
+        )
         self.assertIs(raised.exception.__cause__, click_error)
         applejack.click.assert_awaited_once_with()
         twilight.click.assert_not_awaited()
@@ -745,6 +749,10 @@ class PonyChartLoggingTests(unittest.IsolatedAsyncioTestCase):
             ):
                 await challenge.check()
 
+            self.assertEqual(
+                raised.exception.diagnostic_code,
+                "battle.ponychart.submit-outcome-unknown",
+            )
             self.assertIs(raised.exception.__cause__, click_error)
             submit.click.assert_awaited_once_with()
             driver.page.select.assert_not_awaited()

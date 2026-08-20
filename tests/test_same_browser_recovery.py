@@ -814,6 +814,10 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
                 "imperil",
             )
 
+        self.assertEqual(
+            raised.exception.diagnostic_code,
+            "battle.skill-target-submission-unknown",
+        )
         self.assertIs(raised.exception.__cause__, timeout)
 
     async def test_selected_skill_target_preserves_recovery_error(self) -> None:
@@ -1190,23 +1194,63 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         coordinator, actions, state_store = self._coordinator()
-        actions.read_recovery_state.side_effect = TimeoutError("navigation in flight")
+        probe_error = TimeoutError("secret navigation detail")
+        actions.read_recovery_state.side_effect = probe_error
 
-        recovered = await coordinator.recover(
-            _recovery_evidence(),
-            expected_realm="persistent",
-            auto_reload_checks=2,
-            recovery_timeout=10,
-            stable_checks=2,
-            check_interval=1e-9,
-            probe_timeout=1,
-        )
+        with patch("hvbattle.recovery.logger") as recovery_logger:
+            recovered = await coordinator.recover(
+                _recovery_evidence(),
+                expected_realm="persistent",
+                auto_reload_checks=2,
+                recovery_timeout=10,
+                stable_checks=2,
+                check_interval=1e-9,
+                probe_timeout=1,
+            )
 
         self.assertFalse(recovered)
         self.assertEqual(actions.read_recovery_state.await_count, 1)
         actions.reload_current_page.assert_not_awaited()
         actions.clear_page_action_state.assert_not_awaited()
         state_store.reset.assert_not_called()
+        recovery_logger.debug.assert_called_once_with(
+            "Battle reload recovery probe failed error_type=%s",
+            "TimeoutError",
+            exc_info=True,
+        )
+        self.assertNotIn(str(probe_error), repr(recovery_logger.error.call_args_list))
+
+    async def test_manual_reload_failure_records_private_debug_detail(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        old = _recovery_state(document_id="document-before")
+        actions.read_recovery_state.return_value = old
+        reload_error = RuntimeError("secret reload detail")
+        actions.reload_current_page.side_effect = reload_error
+
+        with patch("hvbattle.recovery.logger") as recovery_logger:
+            recovered = await coordinator.recover(
+                _recovery_evidence(),
+                expected_realm="persistent",
+                auto_reload_checks=1,
+                recovery_timeout=10,
+                stable_checks=2,
+                check_interval=1e-9,
+                probe_timeout=1,
+            )
+
+        self.assertFalse(recovered)
+        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
+        actions.clear_page_action_state.assert_not_awaited()
+        state_store.reset.assert_not_called()
+        recovery_logger.error.assert_called_once_with(
+            "Current-page battle reload failed error_type=%s",
+            "RuntimeError",
+        )
+        recovery_logger.debug.assert_called_once_with(
+            "Current-page battle reload error detail",
+            exc_info=True,
+        )
+        self.assertNotIn(str(reload_error), repr(recovery_logger.error.call_args_list))
 
     async def test_stable_ponychart_document_rebases_for_runner_resolution(
         self,
@@ -1371,21 +1415,87 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator, actions, state_store = self._coordinator()
         fresh = _recovery_state()
         actions.read_recovery_state.return_value = fresh
-        state_store.inspect.side_effect = TimeoutError("parser command still live")
+        parse_error = TimeoutError("secret parser command detail")
+        state_store.inspect.side_effect = parse_error
 
-        recovered = await coordinator.recover(
-            _recovery_evidence(),
-            expected_realm="persistent",
-            auto_reload_checks=1,
-            recovery_timeout=10,
-            stable_checks=2,
-            check_interval=1e-9,
-            probe_timeout=1,
-        )
+        with patch("hvbattle.recovery.logger") as recovery_logger:
+            recovered = await coordinator.recover(
+                _recovery_evidence(),
+                expected_realm="persistent",
+                auto_reload_checks=1,
+                recovery_timeout=10,
+                stable_checks=2,
+                check_interval=1e-9,
+                probe_timeout=1,
+            )
 
         self.assertFalse(recovered)
         self.assertEqual(state_store.inspect.await_count, 1)
         state_store.reset.assert_not_called()
+        recovery_logger.debug.assert_called_once_with(
+            "Reloaded active battle parse timeout error detail",
+            exc_info=True,
+        )
+        self.assertNotIn(str(parse_error), repr(recovery_logger.error.call_args_list))
+
+    async def test_active_parse_error_records_private_debug_detail(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        fresh = _recovery_state()
+        actions.read_recovery_state.return_value = fresh
+        parse_error = RuntimeError("secret parser detail")
+        state_store.inspect.side_effect = parse_error
+
+        with patch("hvbattle.recovery.logger") as recovery_logger:
+            recovered = await coordinator.recover(
+                _recovery_evidence(),
+                expected_realm="persistent",
+                auto_reload_checks=1,
+                recovery_timeout=0.5,
+                stable_checks=2,
+                check_interval=0.25,
+                probe_timeout=1,
+            )
+
+        self.assertFalse(recovered)
+        state_store.inspect.assert_awaited_once()
+        state_store.reset.assert_not_called()
+        recovery_logger.debug.assert_called_once_with(
+            "Reloaded active battle parse probe failed error_type=%s",
+            "RuntimeError",
+            exc_info=True,
+        )
+        self.assertNotIn(str(parse_error), repr(recovery_logger.error.call_args_list))
+
+    async def test_cleanup_failure_records_private_debug_detail(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        fresh = _recovery_state()
+        actions.read_recovery_state.return_value = fresh
+        cleanup_error = RuntimeError("secret cleanup detail")
+        actions.clear_page_action_state.side_effect = cleanup_error
+
+        with patch("hvbattle.recovery.logger") as recovery_logger:
+            recovered = await coordinator.recover(
+                _recovery_evidence(),
+                expected_realm="persistent",
+                auto_reload_checks=1,
+                recovery_timeout=10,
+                stable_checks=2,
+                check_interval=1e-9,
+                probe_timeout=1,
+            )
+
+        self.assertFalse(recovered)
+        actions.clear_page_action_state.assert_awaited_once_with(probe_timeout=1)
+        state_store.reset.assert_not_called()
+        recovery_logger.error.assert_called_once_with(
+            "Reloaded battle action state cleanup failed error_type=%s",
+            "RuntimeError",
+        )
+        recovery_logger.debug.assert_called_once_with(
+            "Reloaded battle action state cleanup error detail",
+            exc_info=True,
+        )
+        self.assertNotIn(str(cleanup_error), repr(recovery_logger.error.call_args_list))
 
 
 class BattleSessionRecoveryCompositionTests(unittest.IsolatedAsyncioTestCase):
@@ -1567,6 +1677,35 @@ class BattleRunnerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ).run_current()
 
         self.assertIs(raised.exception.__cause__, error)
+
+    async def test_recovery_callback_error_records_private_debug_detail(self) -> None:
+        session = _RunnerSession()
+        recovery_error = RuntimeError("secret recovery callback detail")
+        session.recover_unknown_action.side_effect = recovery_error
+        strategy = Mock()
+        action_error = _recoverable_error()
+        strategy.take_turn = AsyncMock(side_effect=action_error)
+
+        with (
+            patch("hvbattle.runner.logger") as runner_logger,
+            self.assertRaises(BattleRecoveryExhaustedError) as raised,
+        ):
+            await BattleRunner(
+                session,  # type: ignore[arg-type]
+                strategy,
+                sleep=AsyncMock(),
+            ).run_current()
+
+        self.assertIs(raised.exception.__cause__, action_error)
+        runner_logger.debug.assert_called_once_with(
+            "Battle action reload recovery failed error_type=%s",
+            "RuntimeError",
+            exc_info=True,
+        )
+        self.assertNotIn(
+            str(recovery_error),
+            repr(runner_logger.error.call_args_list),
+        )
 
     async def test_confirmed_acted_decision_resets_consecutive_recovery_budget(
         self,

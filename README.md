@@ -17,15 +17,20 @@ is `session.hentaiverse.browser`; non-battle operations remain grouped under
 the other `session.hentaiverse` services instead of leaking into the
 battle-domain surface.
 
-Version 0.2.7 restores the game's final completion acknowledgement as a
-runner-owned safety step. `BattleRunner` captures the immutable completion and
-round summary before clicking the exact `finishbattle.png` control at most
-once, revalidating that the selected control still belongs to the observed
-completion document first. It returns `BattleCompleted` only after a new,
-ready document on the same realm has no battle, finish, next-floor, or
-PonyChart controls. A click or navigation error is reconciled through read-only
-state probes and is never resent; missing positive exit evidence raises
-`BattleInterruptedError`.
+Every `BattleInterruptedError`, including each subclass, requires a keyword-only
+`diagnostic_code`. The code is a validated 1–128 character lowercase ASCII
+machine identifier matching `[a-z0-9][a-z0-9_.:-]*`; durable records and public
+failure classification should use it. The exception message remains private,
+human-oriented diagnostic detail.
+
+The game's final completion acknowledgement is a runner-owned safety step.
+`BattleRunner` captures the immutable completion and round summary before
+clicking the exact `finishbattle.png` control at most once, revalidating that
+the selected control still belongs to the observed completion document first.
+It returns `BattleCompleted` only after a new, ready document on the same realm
+has no battle, finish, next-floor, or PonyChart controls. A click or navigation
+error is reconciled through read-only state probes and is never resent; missing
+positive exit evidence raises `BattleInterruptedError`.
 
 Turn preparation uses `BattleTurnState` and `BattleTurnPhase` to distinguish an
 active turn, next-floor transition, PonyChart challenge, positive completion,
@@ -53,26 +58,31 @@ For the stalled-XHR class, the coordinator reads the document once more to
 avoid racing an automatic navigation, then reloads the current page at most
 once if that document is still unchanged. After that reload it polls for at
 most ten seconds, ending the polling window immediately once the required
-stable state is present rather than sleeping for the full duration. Recovery never replays the
-cached action. It accepts only a new, ready document on the expected
+stable state is present rather than sleeping for the full duration. Recovery
+never replays the cached action. It accepts only a new, ready document on the expected
 persistent/Isekai realm after at least two stable state signatures. Complete
 and next-floor controls take priority over PonyChart; an active phase
 additionally needs its log/action-control markers and must parse with a live
 monster. The runner then returns to turn preparation and asks strategy for a
 fresh decision. A second ambiguity before a confirmed `ACTED` or next-floor
-receipt exhausts that browser's recovery budget. Only this typed exhaustion
-may open one fresh authenticated browser, whose own same-browser budget starts
-unused; it can never open a third browser. Final-completion acknowledgement
-ambiguity never enters that fresh-browser path.
+receipt exhausts that browser's recovery budget and raises
+`BattleRecoveryExhaustedError` with diagnostic code
+`battle.action-recovery-exhausted`. An unmatched action ambiguity raises
+`BattleInterruptedError` with `battle.action-outcome-unknown`. HVBattle does
+not open a replacement browser or choose a worker-restart budget; the calling
+application owns that policy and must continue to honor the no-replay receipt
+guards.
 
 A `ZendriverOperationTimeout` is not treated like an ordinary retryable
 `TimeoutError`, because its CDP command deliberately remains live. A live
 timeout while arming or cleaning an action monitor, or while parsing session
-state, interrupts and closes the current browser without retry. After a click,
-it leaves the post-click document unobservable, so that unknown action is not
-eligible for first-use recovery. If it occurs inside recovery after incident
-evidence was already established, the failed old-browser reconciliation is
-typed exhaustion and may use only the one fresh-browser stage described above.
+state interrupts the runner. The calling application must retire that browser
+generation instead of retrying the still-live operation in place. After a
+click, the timeout leaves the post-click document unobservable, so that unknown
+action is not eligible for first-use recovery. If it occurs inside recovery
+after incident evidence was already established, the failed old-browser
+reconciliation is reported as typed recovery exhaustion. Any subsequent
+browser replacement or worker restart remains a calling-application decision.
 
 `BattleSession` preloads the PonyChart classifier and ONNX model before opening
 the browser, so a timed challenge never pays the first-load cost. The runner

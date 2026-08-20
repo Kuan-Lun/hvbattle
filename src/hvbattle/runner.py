@@ -5,9 +5,12 @@ import inspect
 import math
 from collections.abc import Awaitable, Callable
 
-from hvbrowser.runtime import setup_logger
+from hvbrowser.runtime import (
+    ZendriverOperationTimeout,
+    is_browser_generation_error,
+    setup_logger,
+)
 
-from ._zendriver import ZendriverOperationTimeout
 from .contracts import (
     BattleAbsent,
     BattleActionOutcomeUnknownError,
@@ -356,6 +359,8 @@ class BattleRunner:
                         )
                     )
                 except Exception as recovery_error:
+                    if is_browser_generation_error(recovery_error):
+                        raise
                     logger.debug(
                         "Battle action reload recovery failed error_type=%s",
                         type(recovery_error).__name__,

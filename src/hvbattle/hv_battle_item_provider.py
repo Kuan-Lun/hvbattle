@@ -2,12 +2,13 @@ from typing import Any
 
 from hv_bie.types import BattleSnapshot
 from hvbrowser import HVDriver
+from hvbrowser.runtime import wait_for_zendriver
 
-from ._zendriver import wait_for_zendriver
 from .battle_state import BattleStateStore
 from .hv_battle_action_manager import ElementActionManager
 
 GEM_ITEMS = {"mystic gem", "health gem", "mana gem", "spirit gem"}
+_SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS = 2.0
 
 
 class ItemProvider:
@@ -33,7 +34,9 @@ class ItemProvider:
 
     async def _get_items_menu_element(self) -> Any:
         return await wait_for_zendriver(
-            self.hvdriver.page.select("#ckey_items"), timeout=2.0
+            self.page.select("#ckey_items", timeout=2.0),
+            timeout=2.0 + _SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS,
+            owner=self.page,
         )
 
     async def click_items_menu(self) -> None:
@@ -44,7 +47,9 @@ class ItemProvider:
         """Check if the items menu is open."""
         items_menu = await self._get_items_menu_element()
         items_src = await wait_for_zendriver(
-            items_menu.apply("(el) => el.src || ''"), timeout=3.0
+            items_menu.apply("(el) => el.src || ''"),
+            timeout=3.0,
+            owner=items_menu,
         )
         return "items_s.png" in items_src
 
@@ -64,7 +69,9 @@ class ItemProvider:
             await self.click_items_menu()
             # Wait for items pane to become visible
             await wait_for_zendriver(
-                self.hvdriver.page.select("#pane_item", timeout=2), timeout=2.0
+                self.page.select("#pane_item", timeout=2),
+                timeout=2.0 + _SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS,
+                owner=self.page,
             )
 
         await self.element_action_manager.click_and_wait_log_locator(

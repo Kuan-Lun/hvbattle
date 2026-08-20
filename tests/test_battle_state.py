@@ -61,13 +61,16 @@ class BattleStateStoreTests(unittest.IsolatedAsyncioTestCase):
         driver.page.get_content = Mock(return_value=object())
         store = BattleStateStore(driver)
         observed_timeouts: list[float] = []
+        observed_owners: list[object] = []
 
         async def bounded_content_read(
             _content: object,
             *,
             timeout: float,
+            owner: object,
         ) -> str:
             observed_timeouts.append(timeout)
+            observed_owners.append(owner)
             if len(observed_timeouts) == 1:
                 await asyncio.sleep(0.01)
                 raise state_module.ProtocolException("duplicate id")
@@ -84,6 +87,7 @@ class BattleStateStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed_timeouts[0], 1)
         self.assertGreater(observed_timeouts[1], 0)
         self.assertLess(observed_timeouts[1], 1)
+        self.assertEqual(observed_owners, [driver.page, driver.page])
 
     def test_reset_replaces_all_battle_scoped_state(self) -> None:
         store = BattleStateStore(Mock())

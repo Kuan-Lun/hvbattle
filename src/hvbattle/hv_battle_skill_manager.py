@@ -3,10 +3,12 @@ from typing import Any
 
 from hv_bie.types import BattleSnapshot
 from hvbrowser import HVDriver
+from hvbrowser.runtime import wait_for_zendriver
 
-from ._zendriver import wait_for_zendriver
 from .battle_state import BattleStateStore
 from .hv_battle_action_manager import ElementActionManager
+
+_SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS = 2.0
 
 
 class SkillManager:
@@ -32,7 +34,11 @@ class SkillManager:
         return snapshot
 
     async def _select_pane_control(self, selector: str) -> Any:
-        return await wait_for_zendriver(self.page.select(selector), timeout=2.0)
+        return await wait_for_zendriver(
+            self.page.select(selector, timeout=2.0),
+            timeout=2.0 + _SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS,
+            owner=self.page,
+        )
 
     async def _is_pane_visible(self, pane_id: str) -> bool:
         element = await self._select_pane_control(f"#{pane_id}")

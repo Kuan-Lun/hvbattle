@@ -11,10 +11,11 @@ itself via asyncio.wait() regardless of what zendriver is doing internally.
 import asyncio
 import unittest
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
+
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 from hvbattle import ArenaOption, GrindfestOption
-from hvbattle._zendriver import ZendriverOperationTimeout
 from hvbattle.battle_launcher import BattleLauncher
 from hvbattle.hv_battle_item_provider import ItemProvider
 from hvbattle.hv_battle_ponychart import PonyChart
@@ -248,9 +249,15 @@ class BattleLauncherHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         launcher = BattleLauncher(client, Mock())
         launcher._path_prefix = AsyncMock(return_value="")
 
-        with self.assertRaises(ZendriverOperationTimeout):
+        with (
+            patch(
+                "hvbattle.battle_launcher._NAVIGATION_READ_TIMEOUT_SECONDS",
+                0.02,
+            ),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
             await asyncio.wait_for(
-                launcher.start_grindfest(GrindfestOption(battle_id=1)), timeout=10
+                launcher.start_grindfest(GrindfestOption(battle_id=1)), timeout=1
             )
 
     async def test_start_arena_submission_times_out_instead_of_hanging_forever(
@@ -265,10 +272,16 @@ class BattleLauncherHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         launcher = BattleLauncher(client, Mock())
         launcher._path_prefix = AsyncMock(return_value="")
 
-        with self.assertRaises(ZendriverOperationTimeout):
+        with (
+            patch(
+                "hvbattle.battle_launcher._NAVIGATION_MUTATION_TIMEOUT_SECONDS",
+                0.02,
+            ),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
             await asyncio.wait_for(
                 launcher.start_arena(ArenaOption(battle_id=1, token=None)),
-                timeout=10,
+                timeout=1,
             )
 
 

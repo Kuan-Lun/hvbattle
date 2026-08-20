@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
-from hvbrowser.runtime import setup_logger
+from hvbrowser.runtime import is_browser_generation_error, setup_logger
 
 from .contracts import BattleActionRecoveryEvidence, BattleTurnPhase
 
@@ -70,7 +70,7 @@ class _RecoveryActions(Protocol):
         self, *, probe_timeout: float
     ) -> BattleRecoveryState | None: ...
 
-    async def reload_current_page(self, *, probe_timeout: float) -> None: ...
+    async def reload_current_page(self, *, operation_timeout: float) -> None: ...
 
     async def clear_page_action_state(self, *, probe_timeout: float) -> str | None: ...
 
@@ -150,6 +150,8 @@ class BattleRecoveryCoordinator:
         try:
             state = await self._actions.read_recovery_state(probe_timeout=probe_timeout)
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             logger.debug(
                 "Battle reload recovery probe failed error_type=%s",
                 type(error).__name__,
@@ -243,13 +245,15 @@ class BattleRecoveryCoordinator:
                         return None
                     try:
                         snapshot = await self._state_store.inspect(timeout=remaining)
-                    except TimeoutError:
-                        logger.error(
-                            "Reloaded active battle parse timed out; refusing "
-                            "another parse while the browser command may remain live"
-                        )
-                        return None
                     except Exception as error:
+                        if is_browser_generation_error(error):
+                            raise
+                        if isinstance(error, TimeoutError):
+                            logger.error(
+                                "Reloaded active battle parse timed out; refusing "
+                                "another parse while the browser command may remain live"
+                            )
+                            return None
                         logger.debug(
                             "Reloaded active battle parse probe failed "
                             "error_type=%s",
@@ -279,6 +283,7 @@ class BattleRecoveryCoordinator:
         stable_checks: int = 2,
         check_interval: float = 0.25,
         probe_timeout: float = 2.0,
+        reload_timeout: float = 15.0,
     ) -> bool:
         """Accept only a verified new state; never replay the submitted action."""
         if expected_realm not in {"persistent", "isekai"}:
@@ -287,7 +292,12 @@ class BattleRecoveryCoordinator:
             raise ValueError("auto_reload_checks must be positive")
         if stable_checks < 2:
             raise ValueError("stable_checks must be at least 2")
-        if recovery_timeout <= 0 or check_interval <= 0 or probe_timeout <= 0:
+        if (
+            recovery_timeout <= 0
+            or check_interval <= 0
+            or probe_timeout <= 0
+            or reload_timeout <= 0
+        ):
             raise ValueError("battle recovery timeouts must be positive")
         if not evidence.allows_same_browser_recovery:
             return False
@@ -322,8 +332,12 @@ class BattleRecoveryCoordinator:
                 ),
             )
             try:
-                await self._actions.reload_current_page(probe_timeout=probe_timeout)
+                await self._actions.reload_current_page(
+                    operation_timeout=reload_timeout
+                )
             except Exception as reload_error:
+                if is_browser_generation_error(reload_error):
+                    raise
                 logger.error(
                     "Current-page battle reload failed error_type=%s",
                     type(reload_error).__name__,
@@ -348,6 +362,8 @@ class BattleRecoveryCoordinator:
                 probe_timeout=probe_timeout
             )
         except Exception as cleanup_error:
+            if is_browser_generation_error(cleanup_error):
+                raise
             logger.error(
                 "Reloaded battle action state cleanup failed error_type=%s",
                 type(cleanup_error).__name__,

@@ -8,9 +8,8 @@ from dataclasses import dataclass, field
 from hv_bie import parse_snapshot
 from hv_bie.types import BattleSnapshot
 from hvbrowser import HVDriver
+from hvbrowser.runtime import wait_for_zendriver
 from zendriver.core.connection import ProtocolException
-
-from ._zendriver import ZendriverOperationTimeout, wait_for_zendriver
 
 
 @dataclass(slots=True)
@@ -91,16 +90,22 @@ class BattleStateStore:
         deadline = asyncio.get_running_loop().time() + timeout
         try:
             return await wait_for_zendriver(
-                self._driver.page.get_content(), timeout=timeout
+                self._driver.page.get_content(),
+                timeout=timeout,
+                owner=self._driver.page,
             )
         except ProtocolException as error:
             if "duplicate" not in str(error).casefold():
                 raise
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                raise ZendriverOperationTimeout from error
+                raise TimeoutError(
+                    "Battle content retry budget was exhausted"
+                ) from error
             return await wait_for_zendriver(
-                self._driver.page.get_content(), timeout=remaining
+                self._driver.page.get_content(),
+                timeout=remaining,
+                owner=self._driver.page,
             )
 
     async def inspect(self, *, timeout: float = 10.0) -> BattleSnapshot:

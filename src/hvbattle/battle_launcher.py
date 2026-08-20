@@ -14,9 +14,12 @@ from hvbrowser import (
     classify_maintenance_navigation_blocker,
     realm_from_url,
 )
-from hvbrowser.runtime import setup_logger
+from hvbrowser.runtime import (
+    is_browser_generation_error,
+    setup_logger,
+    wait_for_zendriver,
+)
 
-from ._zendriver import wait_for_zendriver
 from .contracts import (
     ArenaOption,
     GrindfestOption,
@@ -70,6 +73,8 @@ _BATTLE_ROUTE_READY_SCRIPTS = {
     "gr": "Boolean(document.getElementById('grindfest'))",
 }
 _NAVIGATION_READ_TIMEOUT_SECONDS = 5.0
+_NAVIGATION_MUTATION_TIMEOUT_SECONDS = 15.0
+_SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS = 2.0
 
 
 class _BattleMenuPageError(RuntimeError):
@@ -165,10 +170,18 @@ class BattleLauncher:
         await self._ensure_battle_navigation_is_safe("before opening Battle menu")
         try:
             battle_menu = await wait_for_zendriver(
-                self.page.select("#parent_Battle"),
-                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                self.page.select(
+                    "#parent_Battle", timeout=_NAVIGATION_READ_TIMEOUT_SECONDS
+                ),
+                timeout=(
+                    _NAVIGATION_READ_TIMEOUT_SECONDS
+                    + _SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS
+                ),
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _BattleMenuPageError("Battle menu is missing") from error
         if battle_menu is None:
             raise _BattleMenuPageError("Battle menu is missing")
@@ -183,9 +196,15 @@ class BattleLauncher:
         try:
             target_elements = await wait_for_zendriver(
                 self.page.xpath(menu_xpath, timeout=5),
-                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                timeout=(
+                    _NAVIGATION_READ_TIMEOUT_SECONDS
+                    + _SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS
+                ),
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _BattleMenuPageError(
                 f"Unable to find {_BATTLE_MENU_LABELS[route]} in the Battle menu"
             ) from error
@@ -194,26 +213,37 @@ class BattleLauncher:
                 f"Unable to find {_BATTLE_MENU_LABELS[route]} in the Battle menu"
             )
 
+        target = target_elements[0]
         try:
-            await battle_menu.mouse_move()
-            await target_elements[0].mouse_move()
-            await self.browser.wait(
-                target_elements[0].mouse_click,
-                ischangeurl=True,
+            await wait_for_zendriver(
+                battle_menu.mouse_move(),
+                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                owner=battle_menu,
+            )
+            await wait_for_zendriver(
+                target.mouse_move(),
+                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                owner=target,
             )
         except Exception as error:
-            try:
-                await self._verify_battle_route_destination(realm, route)
-            except MaintenanceNavigationBlockedError as blocked:
-                raise blocked from error
-            except _BattleMenuNavigationSafetyError as safety_error:
-                raise safety_error from error
-            except _BattleMenuPageError:
-                pass
-            else:
-                return
+            if is_browser_generation_error(error):
+                raise
             raise _BattleMenuPageError(
-                f"Unable to open {_BATTLE_MENU_LABELS[route]}"
+                f"Unable to prepare {_BATTLE_MENU_LABELS[route]} navigation"
+            ) from error
+
+        try:
+            await self.browser.wait(
+                target.mouse_click,
+                ischangeurl=True,
+                owner=target,
+                operation_timeout=_NAVIGATION_MUTATION_TIMEOUT_SECONDS,
+            )
+        except Exception as error:
+            if is_browser_generation_error(error):
+                raise
+            raise _BattleMenuNavigationSafetyError(
+                f"The {_BATTLE_MENU_LABELS[route]} click outcome is unknown"
             ) from error
 
         await self._verify_battle_route_destination(realm, route)
@@ -228,16 +258,11 @@ class BattleLauncher:
         try:
             await self.browser.get(direct_url)
         except Exception as error:
-            try:
-                await self._ensure_battle_navigation_is_safe(
-                    "after direct Battle navigation"
-                )
-            except MaintenanceNavigationBlockedError as blocked:
-                raise blocked from error
-            except _BattleMenuNavigationSafetyError as safety_error:
-                raise safety_error from error
-            raise _BattleMenuPageError(
-                f"Unable to open {_BATTLE_MENU_LABELS[route]} through its direct URL"
+            if is_browser_generation_error(error):
+                raise
+            raise _BattleMenuNavigationSafetyError(
+                f"The direct {_BATTLE_MENU_LABELS[route]} navigation outcome is "
+                "unknown"
             ) from error
 
         await self._verify_battle_route_destination(realm, route)
@@ -246,6 +271,8 @@ class BattleLauncher:
         try:
             realm = await self.realm.current()
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _BattleMenuNavigationSafetyError(
                 "Unable to determine the current Battle navigation realm"
             ) from error
@@ -257,6 +284,8 @@ class BattleLauncher:
         try:
             blocker = await classify_maintenance_navigation_blocker(self.page)
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _BattleMenuNavigationSafetyError(
                 f"Unable to verify battle state {context}"
             ) from error
@@ -280,9 +309,12 @@ class BattleLauncher:
             current_url = await wait_for_zendriver(
                 self.page.evaluate("window.location.href"),
                 timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                owner=self.page,
             )
             landed_realm = realm_from_url(current_url)
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _BattleMenuNavigationSafetyError(
                 f"Unable to verify the {_BATTLE_MENU_LABELS[route]} URL"
             ) from error
@@ -311,8 +343,11 @@ class BattleLauncher:
             route_ready = await wait_for_zendriver(
                 self.page.evaluate(_BATTLE_ROUTE_READY_SCRIPTS[route]),
                 timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _BattleMenuPageError(
                 f"Unable to inspect {_BATTLE_MENU_LABELS[route]} page structure"
             ) from error
@@ -366,6 +401,7 @@ class BattleLauncher:
             })()
             """),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         options: list[ArenaOption] = []
         for payload in row_payloads or ():
@@ -455,6 +491,7 @@ class BattleLauncher:
             })()
             """),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         if not isinstance(payload, dict):
             raise _ring_inspection_error(
@@ -596,6 +633,7 @@ class BattleLauncher:
         current_url = await wait_for_zendriver(
             self.page.evaluate("window.location.href"),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         if current_url != ring_url:
             logger.debug(
@@ -674,7 +712,8 @@ class BattleLauncher:
                     return 'submitted';
                 }})()
                 """),
-                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                timeout=_NAVIGATION_MUTATION_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
             logger.error(
@@ -712,6 +751,7 @@ class BattleLauncher:
         current_url = await wait_for_zendriver(
             self.page.evaluate("window.location.href"),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         if current_url != arena_url:
             logger.debug(
@@ -741,7 +781,8 @@ class BattleLauncher:
                     return true;
                 }})()
                 """),
-                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                timeout=_NAVIGATION_MUTATION_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
             logger.error(
@@ -775,6 +816,7 @@ class BattleLauncher:
             })()
             """),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         options: list[GrindfestOption] = []
         for onclick in onclick_list or ():
@@ -796,6 +838,7 @@ class BattleLauncher:
         current_url = await wait_for_zendriver(
             self.page.evaluate("window.location.href"),
             timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+            owner=self.page,
         )
         if current_url != grindfest_url:
             logger.debug(
@@ -819,7 +862,8 @@ class BattleLauncher:
                     return true;
                 }})()
                 """),
-                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
+                timeout=_NAVIGATION_MUTATION_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
             logger.error(

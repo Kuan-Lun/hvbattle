@@ -928,7 +928,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(recovered)
-        actions.reload_current_page.assert_awaited_once_with(probe_timeout=1)
+        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
         state_store.inspect.assert_not_awaited()
 
     async def test_stalled_single_xhr_reloads_after_one_race_probe_and_rebases(
@@ -953,7 +953,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(self.clock.now, 10)
         self.assertAlmostEqual(self.clock.now, 1e-9)
         self.assertEqual(actions.read_recovery_state.await_count, 4)
-        actions.reload_current_page.assert_awaited_once_with(probe_timeout=1)
+        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
         actions.clear_page_action_state.assert_awaited_once_with(probe_timeout=1)
         state_store.inspect.assert_awaited_once()
         state_store.reset.assert_called_once_with()
@@ -1008,7 +1008,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(recovered)
-        actions.reload_current_page.assert_awaited_once_with(probe_timeout=1)
+        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
 
     async def test_reloaded_shell_can_become_stable_just_before_deadline(self) -> None:
         coordinator, actions, state_store = self._coordinator()
@@ -1042,7 +1042,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(recovered)
         self.assertEqual(self.clock.now, 9.75)
-        actions.reload_current_page.assert_awaited_once_with(probe_timeout=2)
+        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
         state_store.inspect.assert_awaited_once()
         self.assertEqual(
             state_store.inspect.await_args.kwargs["timeout"],
@@ -1081,7 +1081,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(recovered)
         self.assertEqual(self.clock.now, 10)
-        actions.reload_current_page.assert_awaited_once_with(probe_timeout=2)
+        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
         actions.clear_page_action_state.assert_not_awaited()
         state_store.inspect.assert_not_awaited()
 
@@ -1263,6 +1263,16 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 _recovery_evidence(),
                 expected_realm="persistent",
                 stable_checks=1,
+            )
+
+    async def test_reload_timeout_must_be_positive(self) -> None:
+        coordinator, _actions, _state_store = self._coordinator()
+
+        with self.assertRaisesRegex(ValueError, "timeouts"):
+            await coordinator.recover(
+                _recovery_evidence(),
+                expected_realm="persistent",
+                reload_timeout=0,
             )
 
     async def test_changed_but_untrusted_document_fails_without_second_reload(

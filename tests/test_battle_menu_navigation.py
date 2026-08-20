@@ -8,6 +8,7 @@ from hvbrowser import (
     Realm,
     RealmNavigator,
 )
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 from hvbattle.battle_launcher import BattleLauncher
 
@@ -43,7 +44,8 @@ class _Page:
         self.route_ready = {"ar": True, "rb": True, "gr": True}
         self.route_ready_scripts: list[str] = []
 
-    async def select(self, selector: str) -> _Element | None:
+    async def select(self, selector: str, timeout: float = 10.0) -> _Element | None:
+        del timeout
         self.select_calls.append(selector)
         if selector != "#parent_Battle":
             raise AssertionError(f"Unexpected selector: {selector}")
@@ -83,16 +85,20 @@ class _Browser:
         self.direct_destination: str | None = None
         self.direct_ready_route: str | None = None
         self.wait_error: Exception | None = None
+        self.get_error: Exception | None = None
         self.get_calls: list[str] = []
-        self.wait_calls: list[tuple[bool, int]] = []
+        self.wait_calls: list[tuple[bool, int, object, float]] = []
 
     async def wait(
         self,
         fun: object,
         ischangeurl: bool,
         sleeptime: int = 1,
+        *,
+        owner: object,
+        operation_timeout: float,
     ) -> None:
-        self.wait_calls.append((ischangeurl, sleeptime))
+        self.wait_calls.append((ischangeurl, sleeptime, owner, operation_timeout))
         await fun()  # type: ignore[operator]
         if self.click_destination is not None:
             self.page.current_url = self.click_destination
@@ -101,6 +107,8 @@ class _Browser:
 
     async def get(self, url: str) -> None:
         self.get_calls.append(url)
+        if self.get_error is not None:
+            raise self.get_error
         self.page.current_url = self.direct_destination or url
         if self.direct_ready_route is not None:
             self.page.route_ready[self.direct_ready_route] = True
@@ -153,7 +161,10 @@ class BattleMenuNavigationTests(unittest.IsolatedAsyncioTestCase):
                 page.battle_menu.mouse_move.assert_awaited_once_with()
                 page.route_element.mouse_move.assert_awaited_once_with()
                 page.route_element.mouse_click.assert_awaited_once_with()
-                self.assertEqual(browser.wait_calls, [(True, 1)])
+                self.assertEqual(
+                    browser.wait_calls,
+                    [(True, 1, page.route_element, 15.0)],
+                )
                 self.assertEqual(browser.get_calls, [])
                 self.assertEqual(len(page.route_ready_scripts), 1)
                 self.assertIn(
@@ -234,15 +245,46 @@ class BattleMenuNavigationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(browser.get_calls, [])
 
-    async def test_wait_error_after_wrong_realm_click_still_fails_closed(self) -> None:
-        launcher, browser, _page = _launcher()
+    async def test_click_wait_error_never_probes_or_retries_navigation(self) -> None:
+        launcher, browser, page = _launcher()
         browser.click_destination = "https://hentaiverse.org/isekai/?s=Battle&ss=rb"
         browser.wait_error = TimeoutError("URL transition wait failed")
 
-        with self.assertRaisesRegex(RuntimeError, "wrong realm"):
+        with self.assertRaisesRegex(RuntimeError, "click outcome is unknown"):
             await launcher.goto_ring_of_blood()
 
         self.assertEqual(browser.get_calls, [])
+        self.assertEqual(page.route_ready_scripts, [])
+
+    async def test_live_click_timeout_propagates_without_probe_or_retry(self) -> None:
+        launcher, browser, page = _launcher()
+        timeout = ZendriverOperationTimeout(timeout_seconds=15.0)
+        browser.wait_error = timeout
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await launcher.goto_ring_of_blood()
+
+        self.assertIs(raised.exception, timeout)
+        self.assertEqual(browser.get_calls, [])
+        self.assertEqual(page.route_ready_scripts, [])
+
+    async def test_live_direct_navigation_timeout_propagates_without_probe(
+        self,
+    ) -> None:
+        launcher, browser, page = _launcher()
+        page.has_battle_menu = False
+        timeout = ZendriverOperationTimeout(timeout_seconds=15.0)
+        browser.get_error = timeout
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await launcher.goto_arena()
+
+        self.assertIs(raised.exception, timeout)
+        self.assertEqual(
+            browser.get_calls,
+            ["https://hentaiverse.org/?s=Battle&ss=ar"],
+        )
+        self.assertEqual(page.route_ready_scripts, [])
 
     async def test_unexpected_path_after_menu_click_fails_without_direct_retry(
         self,

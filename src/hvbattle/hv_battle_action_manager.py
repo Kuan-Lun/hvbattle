@@ -10,14 +10,17 @@ from typing import Any
 from uuid import uuid4
 
 from hvbrowser import HVDriver
-from hvbrowser.runtime import ElementAction, setup_logger
+from hvbrowser.runtime import (
+    ElementAction,
+    is_browser_generation_error,
+    setup_logger,
+    wait_for_zendriver,
+)
 
-from ._zendriver import ZendriverOperationTimeout, wait_for_zendriver
 from .contracts import (
     BattleActionKind,
     BattleActionOutcomeUnknownError,
     BattleActionRecoveryEvidence,
-    BattleInterruptedError,
     BattleTurnPhase,
 )
 from .recovery import BattleRecoveryState
@@ -25,6 +28,8 @@ from .recovery import BattleRecoveryState
 logger = setup_logger(__name__)
 
 _STALLED_XHR_MINIMUM_AGE_MS = 5_000.0
+_BATTLE_MUTATION_TIMEOUT_SECONDS = 15.0
+_SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS = 2.0
 
 
 # HentaiVerse submits a turn through one JSON XHR, then mutates battle panes and
@@ -918,7 +923,10 @@ class ElementActionManager:
         return self.hvdriver.page
 
     async def _click(self, element: Any) -> None:
-        await self._action.click(element)
+        await self._action.click(
+            element,
+            operation_timeout=_BATTLE_MUTATION_TIMEOUT_SECONDS,
+        )
 
     def _begin_submitted_action(self, action_id: str) -> None:
         begin = getattr(self, "_begin_dialog_observation", None)
@@ -939,7 +947,12 @@ class ElementActionManager:
         delay: float = 0.1,
     ) -> None:
         """Click a local UI control with retries; never use for a turn action."""
-        await self._action.click_resilient(get_element, retries=retries, delay=delay)
+        await self._action.click_resilient(
+            get_element,
+            retries=retries,
+            delay=delay,
+            operation_timeout=_BATTLE_MUTATION_TIMEOUT_SECONDS,
+        )
 
     async def click_until(
         self,
@@ -956,6 +969,7 @@ class ElementActionManager:
             max_attempts=max_attempts,
             delay=delay,
             timeout=timeout,
+            operation_timeout=_BATTLE_MUTATION_TIMEOUT_SECONDS,
         )
 
     async def click_locator(
@@ -967,7 +981,11 @@ class ElementActionManager:
     ) -> None:
         """Click a local UI control that does not submit a battle turn."""
         await self._action.click_locator(
-            selector, retries=retries, wait_timeout=wait_timeout, delay=delay
+            selector,
+            retries=retries,
+            wait_timeout=wait_timeout,
+            delay=delay,
+            operation_timeout=_BATTLE_MUTATION_TIMEOUT_SECONDS,
         )
 
     @staticmethod
@@ -986,6 +1004,7 @@ class ElementActionManager:
         raw = await wait_for_zendriver(
             self.page.evaluate(self._state_script(monitor_id, arm_monitor=arm_monitor)),
             timeout=probe_timeout,
+            owner=self.page,
         )
         return _BattleActionState.from_raw(raw)
 
@@ -995,6 +1014,7 @@ class ElementActionManager:
         raw = await wait_for_zendriver(
             self.page.evaluate(_BATTLE_EXIT_STATE_JS),
             timeout=probe_timeout,
+            owner=self.page,
         )
         return _BattleExitState.from_raw(raw)
 
@@ -1010,15 +1030,16 @@ class ElementActionManager:
         )
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
-            raise ZendriverOperationTimeout
+            raise TimeoutError("Battle recovery probe budget was exhausted")
         exit_state = await self._read_battle_exit_state(probe_timeout=remaining)
         return _reconcile_recovery_state(action, exit_state)
 
-    async def reload_current_page(self, *, probe_timeout: float = 3.0) -> None:
+    async def reload_current_page(self, *, operation_timeout: float) -> None:
         """Reload the tab's current URL once without creating a browser session."""
         await wait_for_zendriver(
             self.page.reload(),
-            timeout=probe_timeout,
+            timeout=operation_timeout,
+            owner=self.page,
         )
 
     async def clear_page_action_state(
@@ -1028,6 +1049,7 @@ class ElementActionManager:
         document_id = await wait_for_zendriver(
             self.page.evaluate(_CLEAR_PAGE_ACTION_STATE_JS),
             timeout=probe_timeout,
+            owner=self.page,
         )
         return document_id if isinstance(document_id, str) and document_id else None
 
@@ -1041,16 +1063,11 @@ class ElementActionManager:
             await wait_for_zendriver(
                 self.page.evaluate(script),
                 timeout=probe_timeout,
+                owner=self.page,
             )
-        except ZendriverOperationTimeout as error:
-            logger.error(
-                "Battle action monitor cleanup timed out with a live browser "
-                "operation"
-            )
-            raise BattleInterruptedError(
-                "Battle action monitor cleanup left a browser operation in flight"
-            ) from error
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             logger.debug(
                 "Unable to clean up battle action monitor %s: %r",
                 monitor_id[:8],
@@ -1072,9 +1089,12 @@ class ElementActionManager:
             try:
                 return await wait_for_zendriver(
                     self.page.select(selector, timeout=wait_timeout),
-                    timeout=wait_timeout,
+                    timeout=wait_timeout + _SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS,
+                    owner=self.page,
                 )
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 last_error = error
                 if attempt + 1 < retries:
                     await asyncio.sleep(delay)
@@ -1098,6 +1118,8 @@ class ElementActionManager:
                 None,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             return fallback, error
 
     async def _final_battle_exit_probe(
@@ -1112,13 +1134,15 @@ class ElementActionManager:
                 None,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             return fallback, error
 
     async def click_and_wait_log_locator(
         self,
         selector: str,
         stale_retries: int = 3,
-        timeout: float = 5.0,
+        timeout: float = 15.0,
         check_interval: float = 0.2,
         probe_timeout: float = 3.0,
     ) -> None:
@@ -1146,11 +1170,10 @@ class ElementActionManager:
                         arm_monitor=True,
                         probe_timeout=probe_timeout,
                     )
-                except ZendriverOperationTimeout as error:
-                    monitor_cleanup_safe = False
-                    raise BattleInterruptedError(
-                        "Battle action monitor arm left a browser operation in flight"
-                    ) from error
+                except Exception as error:
+                    if is_browser_generation_error(error):
+                        monitor_cleanup_safe = False
+                    raise
                 last = before
                 click_started = False
                 click_error: Exception | None = None
@@ -1165,6 +1188,12 @@ class ElementActionManager:
                 try:
                     await self._click(element)
                 except Exception as error:
+                    if is_browser_generation_error(error):
+                        # A generation failure makes the click outcome
+                        # unobservable.  Never issue a follow-up probe or
+                        # cleanup transaction on that generation.
+                        monitor_cleanup_safe = False
+                        raise
                     click_error = error
 
                 # A slow CDP click must not consume the XHR's receipt window.
@@ -1183,13 +1212,14 @@ class ElementActionManager:
                             # cancellation corrupts Zendriver's response mapper.
                             probe_timeout=remaining,
                         )
-                    except TimeoutError as error:
-                        probe_error = error
-                        probe_timed_out = True
-                        monitor_cleanup_safe = False
-                        break
                     except Exception as error:
+                        if is_browser_generation_error(error):
+                            monitor_cleanup_safe = False
+                            raise
                         probe_error = error
+                        if isinstance(error, TimeoutError):
+                            probe_timed_out = True
+                            break
                     else:
                         last = current
                         if current.monitor is not None:
@@ -1248,11 +1278,16 @@ class ElementActionManager:
                         await asyncio.sleep(min(check_interval, remaining))
 
                 if not probe_timed_out:
-                    last, final_error = await self._final_action_probe(
-                        monitor_id,
-                        probe_timeout=probe_timeout,
-                        fallback=last,
-                    )
+                    try:
+                        last, final_error = await self._final_action_probe(
+                            monitor_id,
+                            probe_timeout=probe_timeout,
+                            fallback=last,
+                        )
+                    except Exception as error:
+                        if is_browser_generation_error(error):
+                            monitor_cleanup_safe = False
+                        raise
                     if final_error is not None:
                         probe_error = final_error
                         if isinstance(final_error, TimeoutError):
@@ -1281,6 +1316,7 @@ class ElementActionManager:
 
                 if (
                     click_started
+                    and click_error is None
                     and post_click_probe_succeeded
                     and last.document_id == before.document_id
                     and last.monitor is not None
@@ -1324,6 +1360,9 @@ class ElementActionManager:
                 if cause is not None:
                     raise unknown from cause
                 raise unknown
+            except asyncio.CancelledError:
+                monitor_cleanup_safe = False
+                raise
             finally:
                 if monitor_cleanup_safe:
                     await self._cleanup_action_monitor(
@@ -1359,12 +1398,10 @@ class ElementActionManager:
                         arm_monitor=True,
                         probe_timeout=probe_timeout,
                     )
-                except ZendriverOperationTimeout as error:
-                    monitor_cleanup_safe = False
-                    raise BattleInterruptedError(
-                        "Battle transition monitor arm left a browser operation "
-                        "in flight"
-                    ) from error
+                except Exception as error:
+                    if is_browser_generation_error(error):
+                        monitor_cleanup_safe = False
+                    raise
                 started = asyncio.get_running_loop().time()
                 click_error: Exception | None = None
                 probe_error: Exception | None = None
@@ -1376,6 +1413,9 @@ class ElementActionManager:
                 try:
                     await self._click(element)
                 except Exception as error:
+                    if is_browser_generation_error(error):
+                        monitor_cleanup_safe = False
+                        raise
                     click_error = error
 
                 # A slow CDP click must not consume the transition observation
@@ -1394,13 +1434,14 @@ class ElementActionManager:
                             # stacking cancellable probes every few seconds.
                             probe_timeout=remaining,
                         )
-                    except TimeoutError as error:
-                        probe_error = error
-                        probe_timed_out = True
-                        monitor_cleanup_safe = False
-                        break
                     except Exception as error:
+                        if is_browser_generation_error(error):
+                            monitor_cleanup_safe = False
+                            raise
                         probe_error = error
+                        if isinstance(error, TimeoutError):
+                            probe_timed_out = True
+                            break
                     else:
                         last = current
                         post_click_probe_succeeded = True
@@ -1446,12 +1487,13 @@ class ElementActionManager:
                             state_id,
                             probe_timeout=probe_timeout,
                         )
-                    except TimeoutError as error:
-                        probe_error = error
-                        probe_timed_out = True
-                        monitor_cleanup_safe = False
                     except Exception as error:
+                        if is_browser_generation_error(error):
+                            monitor_cleanup_safe = False
+                            raise
                         probe_error = error
+                        if isinstance(error, TimeoutError):
+                            probe_timed_out = True
                     else:
                         post_click_probe_succeeded = True
                         if last.monitor is not None:
@@ -1503,6 +1545,9 @@ class ElementActionManager:
                 if cause is not None:
                     raise unknown from cause
                 raise unknown
+            except asyncio.CancelledError:
+                monitor_cleanup_safe = False
+                raise
             finally:
                 if monitor_cleanup_safe:
                     await self._cleanup_action_monitor(
@@ -1529,6 +1574,8 @@ class ElementActionManager:
             try:
                 before = await self._read_battle_exit_state(probe_timeout=probe_timeout)
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 raise BattleActionOutcomeUnknownError(
                     "Final battle completion acknowledgement could not establish "
                     "its pre-click state"
@@ -1554,6 +1601,8 @@ class ElementActionManager:
                     delay=0.1,
                 )
             except Exception as select_error:
+                if is_browser_generation_error(select_error):
+                    raise
                 last, _ = await self._final_battle_exit_probe(
                     probe_timeout=probe_timeout,
                     fallback=before,
@@ -1589,12 +1638,9 @@ class ElementActionManager:
                 selected_state = await self._read_battle_exit_state(
                     probe_timeout=probe_timeout
                 )
-            except ZendriverOperationTimeout as selection_probe_error:
-                raise BattleActionOutcomeUnknownError(
-                    "Final completion control state timed out before its single "
-                    "click while the browser operation remained in flight"
-                ) from selection_probe_error
             except Exception as selection_probe_error:
+                if is_browser_generation_error(selection_probe_error):
+                    raise
                 last, _ = await self._final_battle_exit_probe(
                     probe_timeout=probe_timeout,
                     fallback=before,
@@ -1658,6 +1704,8 @@ class ElementActionManager:
             try:
                 await self._click(element)
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 click_error = error
 
             deadline = started + timeout
@@ -1669,12 +1717,13 @@ class ElementActionManager:
                     current = await self._read_battle_exit_state(
                         probe_timeout=remaining
                     )
-                except TimeoutError as error:
-                    probe_error = error
-                    probe_timed_out = True
-                    break
                 except Exception as error:
+                    if is_browser_generation_error(error):
+                        raise
                     probe_error = error
+                    if isinstance(error, TimeoutError):
+                        probe_timed_out = True
+                        break
                 else:
                     last = current
                     evidence = _confirmed_battle_exit_evidence(

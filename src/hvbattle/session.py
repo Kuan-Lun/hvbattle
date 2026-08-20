@@ -7,10 +7,13 @@ from typing import Any, Self
 
 from hv_bie.types import BattleSnapshot
 from hvbrowser import HentaiVerseSession, Realm
-from hvbrowser.runtime import is_connection_error, setup_logger
+from hvbrowser.runtime import (
+    is_browser_generation_error,
+    setup_logger,
+    wait_for_zendriver,
+)
 from zendriver import cdp
 
-from ._zendriver import ZendriverOperationTimeout, wait_for_zendriver
 from .battle_launcher import BattleLauncher
 from .battle_state import BattleStateStore
 from .contracts import (
@@ -38,6 +41,7 @@ _BATTLE_PHASE_ACTIVE = "active"
 _BATTLE_PHASE_COMPLETE = "complete"
 _BATTLE_PHASE_NEXT_FLOOR = "next-floor"
 _FINAL_COMPLETION_SELECTOR = '#pane_completion img[src*="finishbattle.png"]'
+_DIALOG_MUTATION_TIMEOUT_SECONDS = 15.0
 _BATTLE_PHASE_JS = r"""
 (() => {
     const pane = document.getElementById("pane_completion");
@@ -320,6 +324,8 @@ class BattleSession:
         self.battle_recovery = BattleRecoveryCoordinator(actions, state_store)
 
     async def _setup_alert_handler(self) -> None:
+        page = self.page
+
         async def dialog_handler(
             event: cdp.page.JavascriptDialogOpening,
         ) -> None:
@@ -337,9 +343,13 @@ class BattleSession:
                 category,
                 len(message),
             )
-            await self.page.send(cdp.page.handle_java_script_dialog(accept=True))
+            await wait_for_zendriver(
+                page.send(cdp.page.handle_java_script_dialog(accept=True)),
+                timeout=_DIALOG_MUTATION_TIMEOUT_SECONDS,
+                owner=page,
+            )
 
-        self.page.add_handler(cdp.page.JavascriptDialogOpening, dialog_handler)
+        page.add_handler(cdp.page.JavascriptDialogOpening, dialog_handler)
 
     def _state(self) -> BattleStateStore:
         if self.battle_state is None:
@@ -415,6 +425,7 @@ class BattleSession:
         stable_checks: int = 2,
         check_interval: float = 0.25,
         probe_timeout: float = 2.0,
+        reload_timeout: float = 15.0,
     ) -> bool:
         """Delegate reload reconciliation, then clear only session-owned caches."""
         if not isinstance(error, BattleActionOutcomeUnknownError):
@@ -434,6 +445,7 @@ class BattleSession:
             stable_checks=stable_checks,
             check_interval=check_interval,
             probe_timeout=probe_timeout,
+            reload_timeout=reload_timeout,
         )
         if not recovered:
             return False
@@ -469,9 +481,7 @@ class BattleSession:
         try:
             await self._state().update()
         except Exception as error:
-            if isinstance(error, ZendriverOperationTimeout):
-                raise
-            if is_connection_error(error):
+            if is_browser_generation_error(error):
                 raise
             if await self.is_ponychart_present():
                 return BattleTurnState(BattleTurnPhase.CHALLENGE)
@@ -564,7 +574,9 @@ class BattleSession:
     async def _read_battle_phase(self) -> str:
         """Read final and next-floor controls atomically, with final priority."""
         phase = await wait_for_zendriver(
-            self.page.evaluate(_BATTLE_PHASE_JS), timeout=8.0
+            self.page.evaluate(_BATTLE_PHASE_JS),
+            timeout=8.0,
+            owner=self.page,
         )
         if phase not in {
             _BATTLE_PHASE_ACTIVE,
@@ -595,6 +607,7 @@ class BattleSession:
             await wait_for_zendriver(
                 self.page.evaluate("Boolean(document.getElementById('battle_main'))"),
                 timeout=5.0,
+                owner=self.page,
             )
         )
 
@@ -648,7 +661,9 @@ class BattleSession:
     async def attack_monster(self, slot: int) -> bool:
         selector = f'[id="mkey_{slot}"]'
         elements = await wait_for_zendriver(
-            self.page.query_selector_all(selector), timeout=3.0
+            self.page.query_selector_all(selector),
+            timeout=3.0,
+            owner=self.page,
         )
         if not elements:
             return False
@@ -672,6 +687,8 @@ class BattleSession:
             # Recovery can only be authorized later from the immutable evidence.
             raise
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise BattleInterruptedError(
                 f"Target submission did not clear armed skill {skill_name!r}"
             ) from error
@@ -700,7 +717,9 @@ class BattleSession:
 
     async def go_next_floor(self) -> bool:
         elements = await wait_for_zendriver(
-            self.page.query_selector_all("#btcp"), timeout=3.0
+            self.page.query_selector_all("#btcp"),
+            timeout=3.0,
+            owner=self.page,
         )
         if not elements:
             return False
@@ -783,9 +802,7 @@ class BattleSession:
                     "or completion evidence; parser warnings=" + warnings
                 )
             except Exception as error:
-                if isinstance(error, ZendriverOperationTimeout):
-                    raise
-                if is_connection_error(error):
+                if is_browser_generation_error(error):
                     raise
                 last_error = error
                 if await self.is_ponychart_present():
@@ -812,7 +829,9 @@ class BattleSession:
                         exc_info=True,
                     )
                     await wait_for_zendriver(
-                        self.page.wait(retry_delay), timeout=retry_delay + 2.0
+                        self.page.wait(retry_delay),
+                        timeout=retry_delay + 2.0,
+                        owner=self.page,
                     )
 
         phase = await self._read_battle_phase()

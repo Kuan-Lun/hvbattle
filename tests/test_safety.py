@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
 from hvbrowser import Realm
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 import hvbattle.hv_battle_ponychart as ponychart_module
 import hvbattle.session as session_module
@@ -37,7 +38,6 @@ from hvbattle import (
     RingOfBloodStartOutcome,
     TurnDecision,
 )
-from hvbattle._zendriver import ZendriverOperationTimeout
 from hvbattle.battle_launcher import BattleLauncher
 from hvbattle.battle_state import BattleStateStore, CombatLogTracker
 from hvbattle.hv_battle_buff_manager import BuffManager
@@ -123,6 +123,21 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(BattleInterruptedError, "Target disappeared"):
             await BattleSession.attack_monster_by_skill(session, 3, "imperil")
 
+    async def test_armed_skill_generation_timeout_propagates_unchanged(self) -> None:
+        session = object.__new__(BattleSession)
+        timeout = ZendriverOperationTimeout(timeout_seconds=15.0)
+        session.attack_monster = AsyncMock(side_effect=timeout)
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await BattleSession.submit_selected_skill_target(
+                session,
+                3,
+                "imperil",
+            )
+
+        self.assertIs(raised.exception, timeout)
+        session.attack_monster.assert_awaited_once_with(3)
+
     async def test_challenge_presence_is_checked_before_state_parse(self) -> None:
         session = object.__new__(BattleSession)
         session.is_ponychart_present = AsyncMock(return_value=True)
@@ -143,7 +158,7 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_live_zendriver_timeout_does_not_probe_after_prepare_parse(
         self,
     ) -> None:
-        operation_timeout = ZendriverOperationTimeout("content command still live")
+        operation_timeout = ZendriverOperationTimeout(timeout_seconds=10.0)
         session = object.__new__(BattleSession)
         session._completion_observed = False
         session._has_battle_marker = AsyncMock(return_value=True)
@@ -747,7 +762,7 @@ console.log(JSON.stringify({
     async def test_live_zendriver_timeout_does_not_probe_after_battle_inspect(
         self,
     ) -> None:
-        operation_timeout = ZendriverOperationTimeout("content command still live")
+        operation_timeout = ZendriverOperationTimeout(timeout_seconds=10.0)
         session = object.__new__(BattleSession)
         session._completion_observed = False
         session.is_ponychart_present = AsyncMock(return_value=False)
@@ -1067,7 +1082,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_zendriver_timeout_is_never_retried(self) -> None:
         session = _FakeSession(active=True)
-        operation_timeout = ZendriverOperationTimeout("content command still live")
+        operation_timeout = ZendriverOperationTimeout(timeout_seconds=10.0)
         session.prepare_turn_state = AsyncMock(side_effect=operation_timeout)
         strategy = Mock()
         strategy.take_turn = AsyncMock()
@@ -1883,6 +1898,103 @@ class ArchitectureTests(unittest.TestCase):
                 for name in imported_modules
             )
         )
+
+    def test_every_production_zendriver_wait_has_an_explicit_owner(self) -> None:
+        source_root = Path(__file__).parents[1] / "src" / "hvbattle"
+        violations: list[str] = []
+
+        for source_file in source_root.glob("*.py"):
+            tree = ast.parse(source_file.read_text(), filename=str(source_file))
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "wait_for_zendriver"
+                ):
+                    continue
+                owner = next(
+                    (
+                        keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg == "owner"
+                    ),
+                    None,
+                )
+                if owner is None or (
+                    isinstance(owner, ast.Constant) and owner.value is None
+                ):
+                    violations.append(f"{source_file.name}:{node.lineno}")
+
+        self.assertEqual(violations, [])
+
+    def test_production_never_awaits_zendriver_protocol_methods_directly(
+        self,
+    ) -> None:
+        source_root = Path(__file__).parents[1] / "src" / "hvbattle"
+        protocol_methods = {
+            "activate",
+            "apply",
+            "click",
+            "evaluate",
+            "get",
+            "get_content",
+            "get_position",
+            "mouse_click",
+            "mouse_move",
+            "query_selector",
+            "query_selector_all",
+            "reload",
+            "save_screenshot",
+            "select",
+            "select_all",
+            "send",
+            "send_keys",
+            "set_value",
+            "update_targets",
+            "wait",
+            "xpath",
+        }
+        formal_high_level_calls = {
+            ("self._action", "click"),
+            ("self.browser", "get"),
+            ("self.browser", "wait"),
+        }
+        violations: list[str] = []
+
+        for source_file in source_root.glob("*.py"):
+            tree = ast.parse(source_file.read_text(), filename=str(source_file))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Await):
+                    continue
+                call = node.value
+                if not (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in protocol_methods
+                ):
+                    continue
+                if (
+                    ast.unparse(call.func.value),
+                    call.func.attr,
+                ) in formal_high_level_calls:
+                    continue
+                violations.append(f"{source_file.name}:{node.lineno}:{call.func.attr}")
+
+        self.assertEqual(violations, [])
+
+    def test_removed_connection_classifier_is_not_reintroduced(self) -> None:
+        source_root = Path(__file__).parents[1] / "src" / "hvbattle"
+        violations: list[str] = []
+
+        for source_file in source_root.glob("*.py"):
+            tree = ast.parse(source_file.read_text(), filename=str(source_file))
+            if any(
+                isinstance(node, ast.Name) and node.id == "is_connection_error"
+                for node in ast.walk(tree)
+            ):
+                violations.append(source_file.name)
+
+        self.assertEqual(violations, [])
 
     def test_session_has_no_campaign_or_flee_operations(self) -> None:
         forbidden = {

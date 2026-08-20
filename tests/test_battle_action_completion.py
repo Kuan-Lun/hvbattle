@@ -4,15 +4,15 @@ import json
 import shutil
 import subprocess
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
+
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 from hvbattle import (
     BattleActionKind,
     BattleActionOutcomeUnknownError,
     BattleActionRecoveryEvidence,
-    BattleInterruptedError,
 )
-from hvbattle._zendriver import ZendriverOperationTimeout
 from hvbattle.hv_battle_action_manager import (
     _BATTLE_EXIT_STATE_JS,
     _CLEANUP_ACTION_MONITOR_JS,
@@ -1084,12 +1084,76 @@ class BattleActionEvidenceTests(unittest.TestCase):
 
 
 class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
-    def test_turn_action_receipt_deadline_defaults_to_five_seconds(self) -> None:
+    def test_turn_action_receipt_deadline_defaults_to_fifteen_seconds(self) -> None:
         timeout = inspect.signature(
             ElementActionManager.click_and_wait_log_locator
         ).parameters["timeout"]
 
-        self.assertEqual(timeout.default, 5.0)
+        self.assertEqual(timeout.default, 15.0)
+
+    async def test_default_receipt_window_observes_six_second_xhr_once(self) -> None:
+        manager = _manager()
+        before = _state(monitor=_pending_monitor())
+        clock = Mock()
+        clock.now = 0.0
+        clock.time.side_effect = lambda: clock.now
+
+        async def read_state(
+            _monitor_id: str,
+            *,
+            arm_monitor: bool = False,
+            probe_timeout: float = 3.0,
+        ) -> _BattleActionState:
+            del probe_timeout
+            if arm_monitor:
+                return before
+            if clock.now >= 6.0:
+                return _state(
+                    log_revision="log-2",
+                    monitor=_monitor(request_age_ms=6_000.0),
+                )
+            return _state(
+                monitor=_monitor(
+                    request_age_ms=clock.now * 1_000.0,
+                    completed=False,
+                    status=None,
+                    outcome=None,
+                    log_mutations=0,
+                    response_parse_ok=None,
+                    response_has_textlog=False,
+                )
+            )
+
+        async def advance_clock(delay: float) -> None:
+            clock.now += delay
+
+        manager._read_action_state = AsyncMock(side_effect=read_state)
+
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.get_running_loop",
+                return_value=clock,
+            ),
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.sleep",
+                side_effect=advance_clock,
+            ) as sleep,
+        ):
+            await manager.click_and_wait_log_locator(
+                "#mkey_1",
+                check_interval=1.0,
+            )
+
+        self.assertEqual(clock.now, 6.0)
+        manager._click.assert_awaited_once()
+        self.assertEqual(sleep.await_count, 6)
+        self.assertEqual(manager._read_action_state.await_count, 8)
+        manager._read_action_state.assert_any_await(
+            ANY,
+            arm_monitor=True,
+            probe_timeout=3.0,
+        )
+        manager._cleanup_action_monitor.assert_awaited_once()
 
     async def test_select_for_single_click_times_out_instead_of_hanging_forever(
         self,
@@ -1117,7 +1181,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
                 "#mkey_1", retries=2, wait_timeout=0.02, delay=0
             )
 
-        self.assertEqual(select_calls, 2)
+        self.assertEqual(select_calls, 1)
 
     async def test_select_for_single_click_succeeds_when_element_found(
         self,
@@ -1251,35 +1315,77 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_monitor_arm_timeout_does_not_stack_cleanup_or_click(self) -> None:
         manager = _manager()
-        arm_error = ZendriverOperationTimeout(
-            "arm probe failed after possible injection"
-        )
+        arm_error = ZendriverOperationTimeout(timeout_seconds=3.0)
         manager._read_action_state = AsyncMock(side_effect=arm_error)
 
-        with self.assertRaises(BattleInterruptedError) as raised:
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
             await manager.click_and_wait_log_locator("#mkey_1", timeout=1)
 
-        self.assertIs(raised.exception.__cause__, arm_error)
+        self.assertIs(raised.exception, arm_error)
         manager._select_for_single_click.assert_awaited_once()
         manager._click.assert_not_awaited()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
+    async def test_turn_cancellation_never_issues_monitor_cleanup(self) -> None:
+        before = _state(monitor=_pending_monitor())
+
+        for phase in ("arm", "click", "probe"):
+            with self.subTest(phase=phase):
+                manager = _manager()
+                if phase == "arm":
+                    manager._read_action_state = AsyncMock(
+                        side_effect=asyncio.CancelledError()
+                    )
+                elif phase == "click":
+                    manager._read_action_state = AsyncMock(return_value=before)
+                    manager._click = AsyncMock(side_effect=asyncio.CancelledError())
+                else:
+                    manager._read_action_state = AsyncMock(
+                        side_effect=[before, asyncio.CancelledError()]
+                    )
+
+                with self.assertRaises(asyncio.CancelledError):
+                    await manager.click_and_wait_log_locator(
+                        "#mkey_1",
+                        timeout=1,
+                    )
+
+                manager._cleanup_action_monitor.assert_not_awaited()
+
+    async def test_transition_cancellation_never_issues_monitor_cleanup(
+        self,
+    ) -> None:
+        manager = _manager()
+        manager._read_action_state = AsyncMock(
+            return_value=_state(
+                next_floor_present=True,
+                action_controls=0,
+                monitor=_pending_monitor(),
+            )
+        )
+        manager._click = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with self.assertRaises(asyncio.CancelledError):
+            await manager.click_and_wait_transition_locator("#btcp", timeout=1)
+
         manager._cleanup_action_monitor.assert_not_awaited()
 
     async def test_monitor_cleanup_live_timeout_interrupts_browser(self) -> None:
         manager = object.__new__(ElementActionManager)
         manager.hvdriver = Mock()
         manager.hvdriver.page.evaluate = Mock()
-        cleanup_timeout = ZendriverOperationTimeout("cleanup command still live")
+        cleanup_timeout = ZendriverOperationTimeout(timeout_seconds=1.0)
 
         with (
             patch(
                 "hvbattle.hv_battle_action_manager.wait_for_zendriver",
                 new=AsyncMock(side_effect=cleanup_timeout),
             ),
-            self.assertRaises(BattleInterruptedError) as raised,
+            self.assertRaises(ZendriverOperationTimeout) as raised,
         ):
             await manager._cleanup_action_monitor("action-1", probe_timeout=1)
 
-        self.assertIs(raised.exception.__cause__, cleanup_timeout)
+        self.assertIs(raised.exception, cleanup_timeout)
 
     async def test_normal_xhr_and_log_mutation_complete_without_sleep(self) -> None:
         manager = _manager()
@@ -1381,6 +1487,31 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         manager._click.assert_awaited_once()
         manager._cleanup_action_monitor.assert_awaited_once()
 
+    async def test_click_error_is_terminal_even_when_monitor_saw_no_dispatch(
+        self,
+    ) -> None:
+        manager = _manager()
+        click_error = RuntimeError("click transport returned an error")
+        manager._click = AsyncMock(side_effect=click_error)
+        before = _state(monitor=_pending_monitor())
+        manager._read_action_state = AsyncMock(return_value=before)
+
+        with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
+            await manager.click_and_wait_log_locator(
+                "#mkey_1",
+                timeout=1e-9,
+                check_interval=1e-9,
+            )
+
+        self.assertIs(raised.exception.__cause__, click_error)
+        self.assertIsNotNone(raised.exception.recovery_evidence)
+        assert raised.exception.recovery_evidence is not None
+        self.assertFalse(
+            raised.exception.recovery_evidence.allows_same_browser_recovery
+        )
+        manager._click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
     async def test_sent_action_without_commit_is_unknown(self) -> None:
         manager = _manager()
         before = _state(monitor=_pending_monitor())
@@ -1441,41 +1572,56 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         manager._select_for_single_click.assert_awaited_once()
         manager._cleanup_action_monitor.assert_not_awaited()
 
-    async def test_click_timeout_is_never_retried(self) -> None:
-        """A hung click (hbrowser's ElementAction.click bounded by
-        wait_for_zendriver) raises a plain TimeoutError, which must flow
-        through the same never-retry reconciliation path as any other click
-        exception rather than hanging the action lock indefinitely."""
-
+    async def test_live_click_timeout_taints_browser_without_probe_or_cleanup(
+        self,
+    ) -> None:
         manager = _manager()
-        click_error = TimeoutError("click did not complete before deadline")
+        click_error = ZendriverOperationTimeout(timeout_seconds=3.0)
         manager._click = AsyncMock(side_effect=click_error)
         before = _state(monitor=_pending_monitor())
-        sent_without_commit = _state(
-            monitor=_monitor(log_mutations=0),
-        )
+        manager._read_action_state = AsyncMock(return_value=before)
+        manager._final_action_probe = AsyncMock()
 
-        async def read_state(
-            _monitor_id: str,
-            *,
-            arm_monitor: bool = False,
-            probe_timeout: float = 3,
-        ) -> _BattleActionState:
-            del probe_timeout
-            return before if arm_monitor else sent_without_commit
-
-        manager._read_action_state = AsyncMock(side_effect=read_state)
-
-        with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
             await manager.click_and_wait_log_locator(
                 "#mkey_1",
-                timeout=1e-9,
-                check_interval=1e-9,
+                timeout=1,
             )
 
-        self.assertIs(raised.exception.__cause__, click_error)
+        self.assertIs(raised.exception, click_error)
         manager._click.assert_awaited_once()
         manager._select_for_single_click.assert_awaited_once()
+        manager._read_action_state.assert_awaited_once_with(
+            ANY,
+            arm_monitor=True,
+            probe_timeout=3.0,
+        )
+        manager._final_action_probe.assert_not_awaited()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
+    async def test_transition_live_click_timeout_never_probes_or_cleans_up(
+        self,
+    ) -> None:
+        manager = _manager()
+        click_error = ZendriverOperationTimeout(timeout_seconds=3.0)
+        manager._click = AsyncMock(side_effect=click_error)
+        before = _state(
+            round_text="Initializing arena (Round 1 / 10)",
+            next_floor_present=True,
+            action_controls=0,
+        )
+        manager._read_action_state = AsyncMock(return_value=before)
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await manager.click_and_wait_transition_locator("#btcp", timeout=1)
+
+        self.assertIs(raised.exception, click_error)
+        manager._click.assert_awaited_once()
+        manager._read_action_state.assert_awaited_once_with(
+            ANY,
+            arm_monitor=True,
+            probe_timeout=3.0,
+        )
         manager._cleanup_action_monitor.assert_not_awaited()
 
     async def test_click_exception_without_post_click_probe_is_unknown(self) -> None:
@@ -1749,7 +1895,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         late_probe: asyncio.Future[dict[str, object]] = loop.create_future()
         driver.page.evaluate = Mock(side_effect=[initial_probe, late_probe])
 
-        with self.assertRaises(BattleActionOutcomeUnknownError):
+        with self.assertRaises(ZendriverOperationTimeout):
             await manager.click_and_wait_transition_locator(
                 "#btcp",
                 timeout=0.001,
@@ -1911,6 +2057,26 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         manager._select_for_single_click.assert_awaited_once()
         manager._click.assert_awaited_once()
 
+    async def test_final_completion_live_click_timeout_never_probes(self) -> None:
+        manager = _manager()
+        click_error = ZendriverOperationTimeout(timeout_seconds=3.0)
+        manager._click = AsyncMock(side_effect=click_error)
+        before = _exit_state()
+        manager._read_battle_exit_state = AsyncMock(side_effect=[before, before])
+        manager._final_battle_exit_probe = AsyncMock()
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+            )
+
+        self.assertIs(raised.exception, click_error)
+        manager._click.assert_awaited_once()
+        self.assertEqual(manager._read_battle_exit_state.await_count, 2)
+        manager._final_battle_exit_probe.assert_not_awaited()
+
     async def test_same_document_dom_clear_never_confirms_final_exit(self) -> None:
         manager = _manager()
         before = _exit_state()
@@ -1997,22 +2163,20 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_selection_live_timeout_never_stacks_final_probe(self) -> None:
         manager = _manager()
         before = _exit_state()
-        selection_timeout = ZendriverOperationTimeout(
-            "selection probe command still live"
-        )
+        selection_timeout = ZendriverOperationTimeout(timeout_seconds=3.0)
         manager._read_battle_exit_state = AsyncMock(
             side_effect=[before, selection_timeout]
         )
         manager._final_battle_exit_probe = AsyncMock()
 
-        with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
             await manager.click_and_wait_battle_exit_locator(
                 '#pane_completion img[src*="finishbattle.png"]',
                 expected_is_isekai=False,
                 timeout=1,
             )
 
-        self.assertIs(raised.exception.__cause__, selection_timeout)
+        self.assertIs(raised.exception, selection_timeout)
         manager._final_battle_exit_probe.assert_not_awaited()
         manager._click.assert_not_awaited()
 

@@ -44,17 +44,24 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
                 detected = await challenge.check()
 
             self.assertTrue(detected)
-            self.assertTrue(image.exists())
+            # The scratch capture is local-only; retention persists a copy
+            # under the configured directory after answering, then the
+            # scratch file is removed.
+            self.assertFalse(image.exists())
+            retained = list(images.iterdir())
+            self.assertEqual(len(retained), 1)
+            self.assertTrue(retained[0].name.startswith("pony_chart_"))
+            self.assertEqual(retained[0].suffix, ".png")
+            self.assertEqual(retained[0].read_bytes(), b"challenge")
 
     async def test_configured_directory_retains_image_after_prediction_failure(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            images = root / "pony_chart"
-            image = images / "pony_chart_20260806_120000_000000_unique.png"
-            images.mkdir()
+            image = root / "challenge.png"
             image.write_bytes(b"challenge")
+            images = root / "pony_chart"
             driver = Mock(headless=True)
             challenge = PonyChart(driver, image_directory=images)
             challenge._check = AsyncMock(side_effect=[True, False])
@@ -69,9 +76,10 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
                 detected = await challenge.check()
 
             self.assertTrue(detected)
-            self.assertTrue(image.exists())
-            self.assertEqual(image.read_bytes(), b"challenge")
-            self.assertEqual(tuple(images.iterdir()), (image,))
+            self.assertFalse(image.exists())
+            retained = list(images.iterdir())
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0].read_bytes(), b"challenge")
             ponychart_logger.warning.assert_called_once_with(
                 "PonyChart auto-answer failed; challenge handling will continue "
                 "error_type=%s image=%s",
@@ -85,7 +93,9 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
             ponychart_logger.error.assert_not_called()
             ponychart_logger.info.assert_not_called()
 
-    async def test_configured_capture_creates_directory_and_unique_images(self) -> None:
+    async def test_capture_uses_local_scratch_file_not_retention_directory(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             image_directory = Path(directory) / "nested" / "pony_chart"
             driver = Mock(headless=True)
@@ -107,18 +117,110 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
 
             first = Path(await challenge._save_pony_chart_image())
             second = Path(await challenge._save_pony_chart_image())
+            try:
+                # Capture must never touch the (possibly slow or unavailable)
+                # retention directory: the bounded CDP screenshot call always
+                # targets local scratch storage. With no explicit
+                # scratch_directory, that falls back to the process default.
+                self.assertFalse(image_directory.exists())
+                self.assertNotEqual(first.parent, image_directory)
+                self.assertEqual(first.parent, Path(tempfile.gettempdir()))
+                self.assertNotEqual(first, second)
+                self.assertTrue(first.name.startswith("hvbattle-ponychart-"))
+                self.assertTrue(second.name.startswith("hvbattle-ponychart-"))
+                self.assertEqual(first.suffix, ".png")
+                self.assertEqual(second.suffix, ".png")
+                self.assertEqual(first.read_bytes(), b"challenge")
+                self.assertEqual(second.read_bytes(), b"challenge")
+            finally:
+                first.unlink(missing_ok=True)
+                second.unlink(missing_ok=True)
 
-            self.assertEqual(first.parent, image_directory)
-            self.assertEqual(second.parent, image_directory)
-            self.assertNotEqual(first, second)
-            self.assertTrue(first.name.startswith("pony_chart_"))
-            self.assertTrue(second.name.startswith("pony_chart_"))
-            self.assertEqual(first.suffix, ".png")
-            self.assertEqual(second.suffix, ".png")
-            self.assertEqual(first.read_bytes(), b"challenge")
-            self.assertEqual(second.read_bytes(), b"challenge")
+    async def test_capture_honors_explicit_scratch_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            scratch_directory = Path(directory) / "scratch"
+            scratch_directory.mkdir()
+            driver = Mock(headless=True)
+            driver.page = Mock()
+            container = Mock()
+            image_element = Mock()
 
-    async def test_capture_failure_removes_partial_persistent_file(self) -> None:
+            async def capture(path: str) -> None:
+                Path(path).write_bytes(b"challenge")
+
+            image_element.apply = AsyncMock(
+                return_value="https://example.test/pony.png"
+            )
+            image_element.save_screenshot = AsyncMock(side_effect=capture)
+            container.query_selector = AsyncMock(return_value=image_element)
+            driver.page.select = AsyncMock(return_value=container)
+            challenge = PonyChart(driver, scratch_directory=scratch_directory)
+            challenge._wait_for_image_loaded = AsyncMock()
+
+            captured = Path(await challenge._save_pony_chart_image())
+
+            # A deployment that cannot trust the process default temp
+            # directory (e.g. its TMPDIR happens to point somewhere slow or
+            # remote) can redirect capture explicitly instead.
+            self.assertEqual(captured.parent, scratch_directory)
+            self.assertNotEqual(captured.parent, Path(tempfile.gettempdir()))
+            self.assertEqual(captured.read_bytes(), b"challenge")
+
+    async def test_retain_pony_chart_image_creates_directory_and_unique_copies(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.png"
+            source.write_bytes(b"challenge")
+            image_directory = root / "nested" / "pony_chart"
+            driver = Mock(headless=True)
+            challenge = PonyChart(driver, image_directory=image_directory)
+
+            await challenge._retain_pony_chart_image(str(source))
+            await challenge._retain_pony_chart_image(str(source))
+
+            retained = sorted(image_directory.iterdir())
+            self.assertEqual(len(retained), 2)
+            self.assertNotEqual(retained[0], retained[1])
+            for path in retained:
+                self.assertTrue(path.name.startswith("pony_chart_"))
+                self.assertEqual(path.suffix, ".png")
+                self.assertEqual(path.read_bytes(), b"challenge")
+            # Retention copies the source; it never deletes it (deletion of
+            # the scratch capture is ``check()``'s responsibility).
+            self.assertTrue(source.exists())
+
+    async def test_retain_pony_chart_image_without_directory_is_noop(
+        self,
+    ) -> None:
+        driver = Mock(headless=True)
+        challenge = PonyChart(driver)
+
+        await challenge._retain_pony_chart_image("/nonexistent/does-not-matter.png")
+
+    async def test_retain_pony_chart_image_swallows_copy_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.png"
+            source.write_bytes(b"challenge")
+            image_directory = root / "pony_chart"
+            driver = Mock(headless=True)
+            challenge = PonyChart(driver, image_directory=image_directory)
+            copy_error = OSError("NAS unreachable")
+
+            with (
+                patch.object(ponychart_module.shutil, "copy2", side_effect=copy_error),
+                patch.object(ponychart_module, "logger") as ponychart_logger,
+            ):
+                await challenge._retain_pony_chart_image(str(source))
+
+            ponychart_logger.warning.assert_called_once_with(
+                "PonyChart image retention copy failed error_type=%s",
+                "OSError",
+            )
+
+    async def test_capture_failure_removes_partial_scratch_file(self) -> None:
         driver = Mock(headless=True)
         driver.page = Mock()
         container = Mock()

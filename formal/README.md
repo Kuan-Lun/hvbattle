@@ -11,6 +11,8 @@ It covers:
   same identity but not the listing query; marker-free absence additionally
   requires the exact Battle route query and route DOM;
 - next-round transition evidence and document readiness;
+- the separation between positive battle presence, turn readiness, and
+  strategy authorization, including fail-closed readiness exhaustion;
 - authoritative XHR/action receipts;
 - immutable action/dialog-token evidence for the exact communication-failure
   recovery class and browser-observed request-age evidence for a stalled

@@ -499,6 +499,14 @@ class BattleSession:
         if phase == _BATTLE_PHASE_NEXT_FLOOR:
             return self._prepare_round_transition()
         parser_warnings = tuple(self.snapshot.warnings)
+        if not self.alive_monster_ids:
+            logger.debug(
+                "Battle document is present but turn state is not ready "
+                "parser_warning_count=%d first=%s",
+                len(parser_warnings),
+                ", ".join(parser_warnings[:5]) or "none",
+            )
+            return BattleTurnState(BattleTurnPhase.NOT_READY)
         if parser_warnings:
             displayed_warnings = parser_warnings[:5]
             warning_signature = (len(parser_warnings), displayed_warnings)
@@ -516,11 +524,6 @@ class BattleSession:
             self._last_parser_warning_signature = warning_signature
         else:
             self._last_parser_warning_signature = None
-        if not self.alive_monster_ids:
-            raise TimeoutError(
-                "Battle DOM has no monsters, round transition, or final "
-                "completion marker"
-            )
         current_round = self.current_round
         total_rounds = self.total_rounds
         progress_key = (
@@ -762,6 +765,10 @@ class BattleSession:
     async def start_grindfest(self, option: GrindfestOption) -> bool:
         return await self._launcher.start_grindfest(option)
 
+    async def save_page_diagnostic(self, kind: str) -> Path | None:
+        """Persist one bounded, redacted diagnostic through the browser owner."""
+        return await self.hentaiverse.browser.save_page_diagnostic(kind)
+
     async def inspect_battle_presence(self) -> BattlePresence:
         """Inspect battle evidence in the current document only.
 
@@ -778,81 +785,10 @@ class BattleSession:
             return BattlePresence.COMPLETION
         if phase == _BATTLE_PHASE_NEXT_FLOOR:
             return BattlePresence.ACTIVE
-        if not await self._has_battle_marker():
-            if await self.is_ponychart_present():
-                return BattlePresence.ACTIVE
-            logger.debug("No active battle detected.")
-            return BattlePresence.ABSENT
-
-        last_error: Exception | None = None
-        parse_attempts = 2
-        retry_delay = 1.0
-        for attempt in range(parse_attempts):
-            try:
-                snapshot = await self._state().inspect()
-                if any(monster.alive for monster in snapshot.monsters.values()):
-                    return BattlePresence.ACTIVE
-                if await self.is_ponychart_present():
-                    return BattlePresence.ACTIVE
-                phase = await self._read_battle_phase()
-                if phase == _BATTLE_PHASE_COMPLETE:
-                    self._completion_observed = True
-                    return BattlePresence.COMPLETION
-                if phase == _BATTLE_PHASE_NEXT_FLOOR:
-                    return BattlePresence.ACTIVE
-                warnings = ", ".join(snapshot.warnings[:5]) or "none"
-                raise RuntimeError(
-                    "Battle marker is present without monsters, a transition, "
-                    "or completion evidence; parser warnings=" + warnings
-                )
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                last_error = error
-                if await self.is_ponychart_present():
-                    return BattlePresence.ACTIVE
-                phase = await self._read_battle_phase()
-                if phase == _BATTLE_PHASE_COMPLETE:
-                    self._completion_observed = True
-                    return BattlePresence.COMPLETION
-                if phase == _BATTLE_PHASE_NEXT_FLOOR:
-                    return BattlePresence.ACTIVE
-                if isinstance(error, TimeoutError):
-                    raise
-                if attempt + 1 < parse_attempts:
-                    logger.warning(
-                        "Battle state parse failed; retrying next_attempt=%d/%d "
-                        "delay=%.1fs error_type=%s",
-                        attempt + 2,
-                        parse_attempts,
-                        retry_delay,
-                        type(error).__name__,
-                    )
-                    logger.debug(
-                        "Battle state parse retry error detail",
-                        exc_info=True,
-                    )
-                    await wait_for_zendriver(
-                        self.page.wait(retry_delay),
-                        timeout=retry_delay + 2.0,
-                        owner=self.page,
-                    )
-
-        phase = await self._read_battle_phase()
-        if phase == _BATTLE_PHASE_COMPLETE:
-            self._completion_observed = True
-            return BattlePresence.COMPLETION
-        if phase == _BATTLE_PHASE_NEXT_FLOOR:
-            return BattlePresence.ACTIVE
         if await self._has_battle_marker():
-            logger.error(
-                "Battle state parse failed after %d attempts on an active battle "
-                "page; refusing to report no battle: error_type=%s",
-                parse_attempts,
-                type(last_error).__name__,
-            )
-            assert last_error is not None
-            raise last_error
+            return BattlePresence.ACTIVE
+        if await self.is_ponychart_present():
+            return BattlePresence.ACTIVE
 
         logger.debug("No active battle detected.")
         return BattlePresence.ABSENT

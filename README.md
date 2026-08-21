@@ -32,10 +32,17 @@ has no battle, finish, next-floor, or PonyChart controls. A click or navigation
 error is reconciled through read-only state probes and is never resent; missing
 positive exit evidence raises `BattleInterruptedError`.
 
-Turn preparation uses `BattleTurnState` and `BattleTurnPhase` to distinguish an
-active turn, next-floor transition, PonyChart challenge, positive completion,
-and an absent battle page. `BattleRunner` consumes this typed state directly
-via `prepare_turn_state()`.
+Battle presence and turn readiness are separate safety boundaries.
+`BattlePresence.ACTIVE` means positive evidence forbids another navigation or
+submission; a `#battle_main` shell is sufficient and is never parsed merely to
+prove presence. Turn preparation then uses `BattleTurnState` and
+`BattleTurnPhase` to distinguish `NOT_READY`, an actionable active turn,
+next-floor transition, PonyChart challenge, positive completion, and an absent
+battle page. `BattleRunner` defers a `NOT_READY` document without invoking
+client lifecycle or strategy code. If it remains unready through the bounded
+deadline, the runner saves one bounded, redacted `battle_state_not_ready` page
+diagnostic and raises `BattleStateReadinessError` rather than reporting the
+battle absent or resubmitting it.
 
 Next-floor transition DOM is never accepted over a retained duplicate XHR
 receipt: a matching monitor must be either unsent with count zero or sent once
@@ -208,7 +215,7 @@ ordinary log. The exact listing query remains mandatory when no blocker exists.
 `ABSENT` is accepted only after the deadline observer reaches the validated
 realm-scoped route with its Arena DOM and no blocker.
 
-This atomic observation contract is the `hvbattle` 0.9 / `hvbrowser` 0.6
+This atomic observation contract is the `hvbattle` 0.10 / `hvbrowser` 0.7
 package line; the dependency range intentionally rejects older or newer minor
 lines with different navigation contracts.
 

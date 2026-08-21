@@ -20,6 +20,60 @@ inductive BattlePresence where
   | completion
   deriving DecidableEq, Repr
 
+inductive BattleTurnPhase where
+  | absent
+  | challenge
+  | notReady
+  | active
+  | nextFloor
+  | complete
+  deriving DecidableEq, Repr
+
+inductive ReadinessBudgetOutcome where
+  | defer
+  | failClosed
+  deriving DecidableEq, Repr
+
+/-!
+Presence protects navigation and submission; turn readiness protects strategy
+execution. A marker-only battle shell is therefore positive active presence but
+does not authorize policy code. Readiness-budget exhaustion has no transition
+to absence or resubmission: it can only fail closed.
+-/
+def inspectCurrentBattlePresence
+    (challenge completion nextFloor battleMarker : Bool) : BattlePresence :=
+  if completion then .completion
+  else if challenge || nextFloor || battleMarker then .active
+  else .absent
+
+def strategyAuthorized : BattleTurnPhase → Bool
+  | .active => true
+  | _ => false
+
+def readinessBudgetOutcome
+    (elapsedSeconds deadlineSeconds : Nat) : ReadinessBudgetOutcome :=
+  if elapsedSeconds < deadlineSeconds then .defer else .failClosed
+
+theorem markerOnlyProvesActivePresence :
+    inspectCurrentBattlePresence false false false true = .active := by
+  native_decide
+
+theorem markerOnlyReadinessCannotAuthorizeStrategy :
+    strategyAuthorized .notReady = false := by
+  rfl
+
+theorem onlyParsedActiveStateAuthorizesStrategy
+    (phase : BattleTurnPhase)
+    (authorized : strategyAuthorized phase = true) :
+    phase = .active := by
+  cases phase <;> simp_all [strategyAuthorized]
+
+theorem readinessDeadlineExhaustionFailsClosed
+    (elapsedSeconds deadlineSeconds : Nat)
+    (exhausted : deadlineSeconds ≤ elapsedSeconds) :
+    readinessBudgetOutcome elapsedSeconds deadlineSeconds = .failClosed := by
+  simp [readinessBudgetOutcome, Nat.not_lt.mpr exhausted]
+
 inductive StartupNavigationBlocker where
   | challenge
   | completion

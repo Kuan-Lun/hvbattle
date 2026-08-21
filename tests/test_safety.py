@@ -420,9 +420,7 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(session._last_reported_round_progress)
         session.battle_state.reset.assert_called_once_with()
 
-    async def test_final_round_numbers_without_dom_marker_are_invalid(
-        self,
-    ) -> None:
+    async def test_marker_without_monsters_is_explicitly_not_ready(self) -> None:
         session = object.__new__(BattleSession)
         session.turn = 0
         session.round = 1
@@ -437,9 +435,11 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.battle_state.log_entries.current_round = 5
         session.battle_state.log_entries.total_round = 5
 
-        with self.assertRaisesRegex(TimeoutError, "no monsters"):
-            await BattleSession.prepare_turn_state(session)
+        state = await BattleSession.prepare_turn_state(session)
 
+        self.assertIs(state.phase, BattleTurnPhase.NOT_READY)
+        self.assertFalse(state.actionable)
+        self.assertFalse(state.strategy_actionable)
         self.assertFalse(session.battle_completion_observed)
         self.assertEqual(session.turn, 0)
 
@@ -519,6 +519,24 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         debug.assert_called_once_with(
             "Final battle completion control appeared while parsing."
         )
+
+    async def test_parser_error_on_active_document_is_not_not_ready(self) -> None:
+        parser_error = ValueError("unexpected parser failure")
+        session = object.__new__(BattleSession)
+        session.turn = 2
+        session.round = 1
+        session._completion_observed = False
+        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_phase = AsyncMock(return_value="active")
+        session.is_ponychart_present = AsyncMock(return_value=False)
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock(side_effect=parser_error)
+
+        with self.assertRaises(ValueError) as raised:
+            await BattleSession.prepare_turn_state(session)
+
+        self.assertIs(raised.exception, parser_error)
+        session.battle_state.update.assert_awaited_once_with()
 
     async def test_completion_after_parse_is_debug_detail(self) -> None:
         session = object.__new__(BattleSession)
@@ -649,46 +667,21 @@ console.log(JSON.stringify({
         info.assert_not_called()
         debug.assert_called_once_with("No active battle detected.")
 
-    async def test_battle_parse_retry_and_terminal_error_have_context(self) -> None:
-        first_error = ValueError("first parse failure")
-        last_error = ValueError("second parse failure")
+    async def test_presence_marker_never_runs_the_snapshot_parser(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
         session.is_ponychart_present = AsyncMock(return_value=False)
         session._read_battle_phase = AsyncMock(return_value="active")
         session._has_battle_marker = AsyncMock(return_value=True)
-        session.page = Mock()
-        session.page.wait = AsyncMock()
         session.battle_state = Mock()
-        session.battle_state.inspect = AsyncMock(side_effect=[first_error, last_error])
+        session.battle_state.inspect = AsyncMock(
+            side_effect=AssertionError("presence must not parse turn state")
+        )
 
-        with (
-            patch.object(session_module.logger, "warning") as warning,
-            patch.object(session_module.logger, "debug") as debug,
-            patch.object(session_module.logger, "error") as error,
-            self.assertRaisesRegex(ValueError, "second parse failure"),
-        ):
-            await BattleSession.is_in_battle(session)
+        presence = await BattleSession.inspect_battle_presence(session)
 
-        warning.assert_called_once_with(
-            "Battle state parse failed; retrying next_attempt=%d/%d "
-            "delay=%.1fs error_type=%s",
-            2,
-            2,
-            1.0,
-            "ValueError",
-        )
-        debug.assert_called_once_with(
-            "Battle state parse retry error detail",
-            exc_info=True,
-        )
-        session.page.wait.assert_awaited_once_with(1.0)
-        error.assert_called_once_with(
-            "Battle state parse failed after %d attempts on an active battle "
-            "page; refusing to report no battle: error_type=%s",
-            2,
-            "ValueError",
-        )
+        self.assertIs(presence, BattlePresence.ACTIVE)
+        session.battle_state.inspect.assert_not_awaited()
 
     async def test_final_completion_ack_uses_dedicated_exact_selector(
         self,
@@ -726,40 +719,40 @@ console.log(JSON.stringify({
             session.element_action_manager.click_and_wait_battle_exit_locator
         ).assert_not_awaited()
 
-    async def test_inspect_error_reconciles_completion_phase(self) -> None:
+    async def test_completion_phase_wins_without_snapshot_parsing(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
         session.is_ponychart_present = AsyncMock(return_value=False)
-        session._read_battle_phase = AsyncMock(side_effect=["active", "complete"])
+        session._read_battle_phase = AsyncMock(return_value="complete")
         session._has_battle_marker = AsyncMock(return_value=True)
         session.battle_state = Mock()
         session.battle_state.inspect = AsyncMock(
             side_effect=ValueError("monsters disappeared during inspect")
         )
 
-        active = await BattleSession.is_in_battle(session)
+        presence = await BattleSession.inspect_battle_presence(session)
 
-        self.assertFalse(active)
+        self.assertIs(presence, BattlePresence.COMPLETION)
         self.assertTrue(session.battle_completion_observed)
-        session.battle_state.inspect.assert_awaited_once()
+        session.battle_state.inspect.assert_not_awaited()
 
-    async def test_inspect_timeout_reconciles_next_floor_phase(self) -> None:
+    async def test_next_floor_phase_wins_without_snapshot_parsing(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
         session.is_ponychart_present = AsyncMock(return_value=False)
-        session._read_battle_phase = AsyncMock(side_effect=["active", "next-floor"])
+        session._read_battle_phase = AsyncMock(return_value="next-floor")
         session._has_battle_marker = AsyncMock(return_value=True)
         session.battle_state = Mock()
         session.battle_state.inspect = AsyncMock(
             side_effect=TimeoutError("inspect raced with transition")
         )
 
-        active = await BattleSession.is_in_battle(session)
+        presence = await BattleSession.inspect_battle_presence(session)
 
-        self.assertTrue(active)
-        session.battle_state.inspect.assert_awaited_once()
+        self.assertIs(presence, BattlePresence.ACTIVE)
+        session.battle_state.inspect.assert_not_awaited()
 
-    async def test_live_zendriver_timeout_does_not_probe_after_battle_inspect(
+    async def test_live_zendriver_timeout_during_marker_probe_propagates(
         self,
     ) -> None:
         operation_timeout = ZendriverOperationTimeout(timeout_seconds=10.0)
@@ -767,7 +760,7 @@ console.log(JSON.stringify({
         session._completion_observed = False
         session.is_ponychart_present = AsyncMock(return_value=False)
         session._read_battle_phase = AsyncMock(return_value="active")
-        session._has_battle_marker = AsyncMock(return_value=True)
+        session._has_battle_marker = AsyncMock(side_effect=operation_timeout)
         session.battle_state = Mock()
         session.battle_state.inspect = AsyncMock(side_effect=operation_timeout)
 
@@ -775,9 +768,23 @@ console.log(JSON.stringify({
             await BattleSession.is_in_battle(session)
 
         self.assertIs(raised.exception, operation_timeout)
-        session.battle_state.inspect.assert_awaited_once_with()
+        session.battle_state.inspect.assert_not_awaited()
         session.is_ponychart_present.assert_awaited_once_with()
         session._read_battle_phase.assert_awaited_once_with()
+
+    async def test_page_diagnostic_is_delegated_to_browser_owner(self) -> None:
+        path = Path("diagnostics/battle_state_not_ready_1.html")
+        browser = SimpleNamespace(save_page_diagnostic=AsyncMock(return_value=path))
+        session = object.__new__(BattleSession)
+        session.hentaiverse = SimpleNamespace(browser=browser)
+
+        result = await BattleSession.save_page_diagnostic(
+            session,
+            "battle_state_not_ready",
+        )
+
+        self.assertEqual(result, path)
+        browser.save_page_diagnostic.assert_awaited_once_with("battle_state_not_ready")
 
     async def test_skill_buff_action_never_uses_an_implicit_mystic_gem(self) -> None:
         manager = object.__new__(BuffManager)

@@ -27,6 +27,7 @@ from hvbrowser.runtime import (
     wait_for_zendriver,
 )
 
+from ._failure_safety import contains_log_persistence_error
 from .contracts import (
     ArenaOption,
     GrindfestOption,
@@ -84,28 +85,6 @@ _NAVIGATION_MUTATION_TIMEOUT_SECONDS = 15.0
 _BATTLE_ROUTE_READINESS_DEADLINE_SECONDS = 10.0
 _BATTLE_ROUTE_READINESS_POLL_SECONDS = 0.2
 _BATTLE_ROUTE_DIAGNOSTIC_KIND = "battle_route_not_ready"
-
-
-def _contains_log_persistence_error(error: BaseException) -> bool:
-    """Find a durable-log failure in one bounded exception graph."""
-
-    pending: list[BaseException] = [error]
-    visited: set[int] = set()
-    while pending and len(visited) < 64:
-        candidate = pending.pop()
-        identity = id(candidate)
-        if identity in visited:
-            continue
-        visited.add(identity)
-        if isinstance(candidate, LogPersistenceError):
-            return True
-        if isinstance(candidate, BaseExceptionGroup):
-            pending.extend(reversed(candidate.exceptions))
-        if candidate.__context__ is not None:
-            pending.append(candidate.__context__)
-        if candidate.__cause__ is not None:
-            pending.append(candidate.__cause__)
-    return False
 
 
 class BattleRouteReadinessError(RuntimeError):
@@ -329,7 +308,7 @@ class BattleLauncher:
         try:
             await self.browser.get(direct_url)
         except Exception as error:
-            if _contains_log_persistence_error(error) or is_browser_generation_error(
+            if contains_log_persistence_error(error) or is_browser_generation_error(
                 error
             ):
                 raise
@@ -345,7 +324,7 @@ class BattleLauncher:
         try:
             return await observe_maintenance_navigation(self.page)
         except Exception as error:
-            if _contains_log_persistence_error(error) or is_browser_generation_error(
+            if contains_log_persistence_error(error) or is_browser_generation_error(
                 error
             ):
                 raise
@@ -451,7 +430,7 @@ class BattleLauncher:
         except LogPersistenceError:
             raise
         except Exception as error:
-            if _contains_log_persistence_error(error) or is_browser_generation_error(
+            if contains_log_persistence_error(error) or is_browser_generation_error(
                 error
             ):
                 raise
@@ -491,7 +470,7 @@ class BattleLauncher:
                     ),
                 )
             except Exception as observation_error:
-                if _contains_log_persistence_error(
+                if contains_log_persistence_error(
                     observation_error
                 ) or is_browser_generation_error(observation_error):
                     raise

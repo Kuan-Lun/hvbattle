@@ -14,8 +14,8 @@ class PublicApiTests(unittest.TestCase):
         with project_path.open("rb") as project_file:
             project = tomllib.load(project_file)["project"]
 
-        self.assertEqual(project["version"], "0.9.0")
-        self.assertIn("hvbrowser>=0.6.0,<0.7", project["dependencies"])
+        self.assertEqual(project["version"], "0.10.0")
+        self.assertIn("hvbrowser>=0.7.0,<0.8", project["dependencies"])
 
     def test_import_does_not_require_credentials(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -39,6 +39,7 @@ class PublicApiTests(unittest.TestCase):
         self.assertTrue(hasattr(hvbattle, "BattleStepProgressKind"))
         self.assertTrue(hasattr(hvbattle, "BattleStepResult"))
         self.assertTrue(hasattr(hvbattle, "BattleInterruptedError"))
+        self.assertTrue(hasattr(hvbattle, "BattleStateReadinessError"))
         self.assertTrue(hasattr(hvbattle, "BattleActionOutcomeUnknownError"))
         self.assertTrue(hasattr(hvbattle, "BattleRouteReadinessError"))
         self.assertTrue(hasattr(hvbattle, "TurnDecision"))
@@ -118,6 +119,45 @@ class PublicApiTests(unittest.TestCase):
                         "detail",
                         diagnostic_code=diagnostic_code,
                     )
+
+    def test_state_readiness_error_has_fixed_safe_diagnostic(self) -> None:
+        from hvbattle import BattleStateReadinessError
+
+        error = BattleStateReadinessError(
+            observation_count=4,
+            diagnostic_path="diagnostics/battle_state_not_ready_1.html",
+            diagnostic_error_type=None,
+        )
+
+        self.assertEqual(
+            error.diagnostic_code,
+            "battle.state-readiness-exhausted",
+        )
+        self.assertEqual(error.observation_count, 4)
+        self.assertEqual(
+            error.diagnostic_path,
+            "diagnostics/battle_state_not_ready_1.html",
+        )
+        self.assertIsNone(error.diagnostic_error_type)
+        self.assertNotIn("diagnostics", str(error))
+
+        for invalid_count in (0, -1, True, 1.5):
+            with (
+                self.subTest(observation_count=invalid_count),
+                self.assertRaisesRegex(ValueError, "observation_count"),
+            ):
+                BattleStateReadinessError(
+                    observation_count=invalid_count,  # type: ignore[arg-type]
+                    diagnostic_path=None,
+                    diagnostic_error_type=None,
+                )
+
+        with self.assertRaisesRegex(TypeError, "diagnostic_error_type"):
+            BattleStateReadinessError(
+                observation_count=1,
+                diagnostic_path=None,
+                diagnostic_error_type=123,  # type: ignore[arg-type]
+            )
 
 
 if __name__ == "__main__":

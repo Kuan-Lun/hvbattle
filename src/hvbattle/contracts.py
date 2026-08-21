@@ -160,6 +160,7 @@ class BattleStepIdleReason(StrEnum):
     PAUSED = "paused"
     POLICY = "policy"
     RETRYABLE_TIMEOUT = "retryable-timeout"
+    STATE_NOT_READY = "state-not-ready"
     TRANSITION_CONFIRMATION = "transition-confirmation"
 
 
@@ -203,11 +204,43 @@ def _validate_diagnostic_code(value: object) -> str:
 
 
 class BattleInterruptedError(RuntimeError):
-    """The page left battle without positive completion evidence."""
+    """The battle cannot continue without violating a safety boundary."""
 
     def __init__(self, message: str, *, diagnostic_code: str) -> None:
         self.diagnostic_code = _validate_diagnostic_code(diagnostic_code)
         super().__init__(message)
+
+
+class BattleStateReadinessError(BattleInterruptedError):
+    """An active battle document never became safe for turn policy."""
+
+    def __init__(
+        self,
+        *,
+        observation_count: int,
+        diagnostic_path: str | None,
+        diagnostic_error_type: str | None,
+    ) -> None:
+        if (
+            not isinstance(observation_count, int)
+            or isinstance(observation_count, bool)
+            or observation_count < 1
+        ):
+            raise ValueError("observation_count must be a positive integer")
+        if diagnostic_path is not None and not isinstance(diagnostic_path, str):
+            raise TypeError("diagnostic_path must be str or None")
+        if diagnostic_error_type is not None and not isinstance(
+            diagnostic_error_type, str
+        ):
+            raise TypeError("diagnostic_error_type must be str or None")
+        self.observation_count = observation_count
+        self.diagnostic_path = diagnostic_path
+        self.diagnostic_error_type = diagnostic_error_type
+        super().__init__(
+            "Battle state did not become ready before the bounded readiness "
+            "deadline",
+            diagnostic_code="battle.state-readiness-exhausted",
+        )
 
 
 class BattleRecoveryExhaustedError(BattleInterruptedError):
@@ -333,6 +366,7 @@ class BattleTurnPhase(StrEnum):
 
     ABSENT = "absent"
     CHALLENGE = "challenge"
+    NOT_READY = "not-ready"
     ACTIVE = "active"
     NEXT_FLOOR = "next-floor"
     COMPLETE = "complete"

@@ -59,7 +59,15 @@ jobs:
         if: steps.version.outputs.bumped == 'true'
         run: |
           python -m pip install --upgrade build
-          python -m pip install --editable ".[dev]"
+          for attempt in 1 2 3 4 5; do
+            if python -m pip install --no-cache-dir --editable ".[dev]"; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              exit 1
+            fi
+            sleep 30
+          done
           black --check src/hvbattle tests
           ruff check src/hvbattle tests
           mypy src/hvbattle

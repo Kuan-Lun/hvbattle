@@ -14,8 +14,8 @@ class PublicApiTests(unittest.TestCase):
         with project_path.open("rb") as project_file:
             project = tomllib.load(project_file)["project"]
 
-        self.assertEqual(project["version"], "0.10.1")
-        self.assertIn("hvbrowser>=0.7.0,<0.8", project["dependencies"])
+        self.assertEqual(project["version"], "0.10.2")
+        self.assertIn("hvbrowser>=0.7.2,<0.8", project["dependencies"])
 
     def test_import_does_not_require_credentials(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

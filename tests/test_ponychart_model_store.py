@@ -186,7 +186,7 @@ class _Candidate:
             raise RuntimeError("candidate rejected")
         self.loaded = True
 
-    def predict(self, _path: str) -> object:
+    def predict_bytes(self, _image: bytes) -> object:
         if not self.loaded:
             raise AssertionError("candidate was not prewarmed")
         return SimpleNamespace(labels=frozenset({self.model_path.read_text()}))
@@ -1088,7 +1088,7 @@ class PonyChartPublicationTests(unittest.IsolatedAsyncioTestCase):
         old_started = threading.Event()
         release_old = threading.Event()
 
-        def predict_old(_path: str) -> object:
+        def predict_old(_image: bytes) -> object:
             old_started.set()
             if not release_old.wait(timeout=2):
                 raise TimeoutError("old prediction was not released")
@@ -1114,7 +1114,7 @@ class PonyChartPublicationTests(unittest.IsolatedAsyncioTestCase):
         driver.page.select_all = AsyncMock(return_value=[old_label, new_label])
         challenge = PonyChart(driver)
 
-        old_answer = asyncio.create_task(challenge._auto_answer("old.png"))
+        old_answer = asyncio.create_task(challenge._auto_answer(b"old"))
         self.assertTrue(await asyncio.to_thread(old_started.wait, 1))
         outcome = await asyncio.to_thread(ponychart_module.refresh_ponychart_classifier)
         release_old.set()
@@ -1122,7 +1122,7 @@ class PonyChartPublicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, PonyChartRefreshOutcome.UPDATED)
         self.assertEqual(await old_answer, frozenset({"Old Snapshot"}))
         self.assertEqual(
-            await challenge._auto_answer("new.png"),
+            await challenge._auto_answer(b"new"),
             frozenset({"New Snapshot"}),
         )
         old_label.click.assert_awaited_once_with()

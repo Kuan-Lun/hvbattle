@@ -21,12 +21,10 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         browser = HVDriver(headless=True)
         hentaiverse = HentaiVerseSession(browser=browser)
         image_directory = Path("artifacts/pony_chart")
-        scratch_directory = Path("artifacts/scratch")
 
         session = BattleSession(
             hentaiverse=hentaiverse,
             ponychart_image_directory=str(image_directory),
-            ponychart_scratch_directory=str(scratch_directory),
         )
 
         actions = session.element_action_manager
@@ -46,7 +44,6 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(session._launcher.realm, hentaiverse.realm)
         self.assertIs(session._ponychart.hvdriver, browser)
         self.assertEqual(session._ponychart._image_directory, image_directory)
-        self.assertEqual(session._ponychart._scratch_directory, scratch_directory)
         self.assertIs(actions.hvdriver, browser)
         self.assertIs(items.state_store, session.battle_state)
         self.assertIs(skills.state_store, session.battle_state)

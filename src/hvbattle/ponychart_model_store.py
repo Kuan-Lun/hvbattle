@@ -58,12 +58,12 @@ class _PredictionResult(Protocol):
 class _ClassifierCandidate(Protocol):
     def load(self) -> None: ...
 
-    def predict(self, img_path: str) -> _PredictionResult: ...
+    def predict_bytes(self, image: bytes) -> _PredictionResult: ...
 
 
 type _CandidateFactory = Callable[[Path, Path], _ClassifierCandidate]
 type _UrlOpen = Callable[..., AbstractContextManager[Any]]
-type Predictor = Callable[[str], _PredictionResult]
+type Predictor = Callable[[bytes], _PredictionResult]
 
 
 @dataclass(frozen=True, slots=True)
@@ -711,7 +711,7 @@ class PonyChartGenerationStore:
         candidate.load()
         return LoadedPonyChartGeneration(
             generation=prepared.generation,
-            predictor=candidate.predict,
+            predictor=candidate.predict_bytes,
         )
 
     def _load_pointer(self, pointer: _CurrentPointer) -> LoadedPonyChartGeneration:
@@ -722,7 +722,7 @@ class PonyChartGenerationStore:
             generation_path / _THRESHOLDS_FILENAME,
         )
         candidate.load()
-        return LoadedPonyChartGeneration(pointer.generation, candidate.predict)
+        return LoadedPonyChartGeneration(pointer.generation, candidate.predict_bytes)
 
     def _validate_generation(self, path: Path, expected_generation: str) -> None:
         if not path.is_dir():

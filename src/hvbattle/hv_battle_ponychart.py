@@ -2,7 +2,6 @@ import asyncio
 import base64
 import binascii
 import math
-import shutil
 import struct
 import tempfile
 import threading
@@ -191,7 +190,7 @@ class _PredictionResult(Protocol):
     def labels(self) -> frozenset[str]: ...
 
 
-_predict: Callable[[str], _PredictionResult] | None = None
+_predict: Callable[[bytes], _PredictionResult] | None = None
 _generation_id: str | None = None
 _publication_lock = threading.Lock()
 _lifecycle_lock = threading.Lock()
@@ -212,7 +211,7 @@ def _get_model_store() -> PonyChartGenerationStore:
 
 
 def _published_snapshot() -> tuple[
-    Callable[[str], _PredictionResult] | None,
+    Callable[[bytes], _PredictionResult] | None,
     str | None,
 ]:
     with _publication_lock:
@@ -220,7 +219,7 @@ def _published_snapshot() -> tuple[
 
 
 def _publish(
-    predictor: Callable[[str], _PredictionResult],
+    predictor: Callable[[bytes], _PredictionResult],
     generation: str,
 ) -> None:
     global _generation_id, _predict
@@ -272,11 +271,9 @@ class PonyChart:
         driver: HVDriver,
         *,
         image_directory: Path | None = None,
-        scratch_directory: Path | None = None,
     ) -> None:
         self.hvdriver = driver
         self._image_directory = image_directory
-        self._scratch_directory = scratch_directory
 
     @property
     def page(self) -> Any:
@@ -342,21 +339,8 @@ class PonyChart:
             await asyncio.sleep(0.1)
         raise TimeoutError("PonyChart image did not finish loading in time")
 
-    async def _save_pony_chart_image(self) -> str:
-        """Capture one challenge into a local scratch file for classification.
-
-        The scratch file lives under ``scratch_directory`` (or, when that is
-        left unset, whatever ``tempfile.gettempdir()`` resolves to for this
-        process). That default is a convention, not a guarantee: it is
-        expected to be local, fast storage in every environment this class
-        has been deployed to so far, but a deployment that redirects
-        ``TMPDIR``/``TEMP``/``TMP`` (or the platform default) at something
-        slow or remote would silently reintroduce the exact NAS-latency
-        problem this scratch step exists to avoid. Callers that cannot rely
-        on the process default should pass an explicit ``scratch_directory``.
-        Retention, if configured, is persisted separately by
-        ``_retain_pony_chart_image`` after the challenge has been answered.
-        """
+    async def _capture_pony_chart_image(self) -> bytes:
+        """Capture and validate one challenge entirely in memory."""
         await self._wait_for_image_loaded()
 
         canvas_result = await wait_for_zendriver(
@@ -382,13 +366,7 @@ class PonyChart:
             error_name = canvas_result.get("errorName")
             raise ValueError(f"PonyChart canvas capture failed: {error_name!r}")
 
-        return str(
-            await asyncio.to_thread(
-                self._write_scratch_capture,
-                image,
-                self._scratch_directory,
-            )
-        )
+        return image
 
     async def _capture_pony_chart_screenshot(self) -> bytes:
         """Fallback for a canvas tainted synchronously by cross-origin pixels."""
@@ -426,37 +404,25 @@ class PonyChart:
         return image
 
     @staticmethod
-    def _write_scratch_capture(image: bytes, directory: Path | None) -> Path:
-        filepath: Path | None = None
+    def _write_retained_capture(image: bytes, directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        destination: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
-                prefix="hvbattle-ponychart-",
+                prefix=f"pony_chart_{timestamp}_",
                 suffix=".png",
                 dir=directory,
                 delete=False,
             ) as temporary:
-                filepath = Path(temporary.name)
+                destination = Path(temporary.name)
                 temporary.write(image)
         except BaseException:
-            if filepath is not None:
-                filepath.unlink(missing_ok=True)
+            if destination is not None:
+                destination.unlink(missing_ok=True)
             raise
-        return filepath
 
-    @staticmethod
-    def _copy_pony_chart_image(img_path: str, directory: Path) -> None:
-        directory.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        with tempfile.NamedTemporaryFile(
-            prefix=f"pony_chart_{timestamp}_",
-            suffix=".png",
-            dir=directory,
-            delete=False,
-        ) as temporary:
-            destination = Path(temporary.name)
-        shutil.copy2(img_path, destination)
-
-    async def _retain_pony_chart_image(self, img_path: str) -> None:
+    async def _retain_pony_chart_image(self, image: bytes) -> None:
         """Best-effort, non-blocking persistence of the captured challenge.
 
         Runs after answering so a slow or unavailable retention directory
@@ -467,21 +433,21 @@ class PonyChart:
         if directory is None:
             return
         try:
-            await asyncio.to_thread(self._copy_pony_chart_image, img_path, directory)
+            await asyncio.to_thread(self._write_retained_capture, image, directory)
         except OSError as error:
             logger.warning(
-                "PonyChart image retention copy failed error_type=%s",
+                "PonyChart image retention write failed error_type=%s",
                 type(error).__name__,
             )
 
-    async def _auto_answer(self, img_path: str) -> frozenset[str] | None:
+    async def _auto_answer(self, image: bytes) -> frozenset[str] | None:
         """模型推論後依角色名稱比對 label 文字並點擊。"""
         predictor, _ = _published_snapshot()
         if predictor is None:
             raise RuntimeError(
                 "PonyChart classifier was not preloaded before battle startup"
             )
-        result = await asyncio.to_thread(predictor, img_path)
+        result = await asyncio.to_thread(predictor, image)
         labels: frozenset[str] = result.labels
         ordered_labels = tuple(
             sorted(labels, key=lambda label: (label.casefold(), label))
@@ -549,14 +515,14 @@ class PonyChart:
         if not isponychart:
             return isponychart
 
-        img_path = await self._save_pony_chart_image()
+        image = await self._capture_pony_chart_image()
 
         try:
             if not self.hvdriver.headless:
                 notify("PonyChart", "PonyChart detected")
 
             try:
-                await self._auto_answer(img_path)
+                await self._auto_answer(image)
             except BattleInterruptedError:
                 raise
             except ZendriverOperationTimeout:
@@ -568,9 +534,9 @@ class PonyChart:
                     raise
                 logger.warning(
                     "PonyChart auto-answer failed; challenge handling will continue "
-                    "error_type=%s image=%s",
+                    "error_type=%s image_bytes=%d",
                     type(error).__name__,
-                    img_path,
+                    len(image),
                 )
                 logger.debug(
                     "PonyChart auto-answer error detail",
@@ -666,11 +632,11 @@ class PonyChart:
                     logger.warning(
                         "PonyChart remained present after fallback submission "
                         "attempt clicked=%s xpath_error_type=%s "
-                        "selector_error_type=%s image=%s",
+                        "selector_error_type=%s image_bytes=%d",
                         clicked,
                         xpath_error_type or "none",
                         selector_error_type or "none",
-                        img_path,
+                        len(image),
                     )
                     raise PonyChartResolutionError(
                         "PonyChart remained present after fallback submission"
@@ -696,5 +662,4 @@ class PonyChart:
 
             return isponychart
         finally:
-            await self._retain_pony_chart_image(img_path)
-            Path(img_path).unlink(missing_ok=True)
+            await self._retain_pony_chart_image(image)

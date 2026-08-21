@@ -1830,7 +1830,7 @@ class PonyChartResolutionTests(unittest.IsolatedAsyncioTestCase):
         driver.page.select = AsyncMock(side_effect=LookupError("no fallback"))
         challenge = PonyChart(driver)
         challenge._check = AsyncMock(return_value=True)
-        challenge._save_pony_chart_image = AsyncMock(return_value="pony.png")
+        challenge._capture_pony_chart_image = AsyncMock(return_value=b"pony")
         challenge._auto_answer = AsyncMock()
 
         with (

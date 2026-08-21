@@ -103,71 +103,66 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
             "wait_for_zendriver",
             side_effect=observe_owner,
         ):
-            captured = Path(await challenge._save_pony_chart_image())
+            captured = await challenge._capture_pony_chart_image()
 
-        try:
-            self.assertEqual(observed_owners, [driver.page])
-        finally:
-            captured.unlink(missing_ok=True)
+        self.assertEqual(captured, image)
+        self.assertEqual(observed_owners, [driver.page])
 
-    async def test_unconfigured_successful_resolution_removes_classifier_input(
+    async def test_unconfigured_successful_resolution_stays_in_memory(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            image = Path(directory) / "challenge.png"
-            image.write_bytes(b"challenge")
-            driver = Mock(headless=True)
-            challenge = PonyChart(driver)
-            challenge._check = AsyncMock(side_effect=[True, False])
-            challenge._save_pony_chart_image = AsyncMock(return_value=str(image))
-            challenge._auto_answer = AsyncMock(return_value=frozenset({"Twilight"}))
+        image = b"challenge"
+        driver = Mock(headless=True)
+        challenge = PonyChart(driver)
+        challenge._check = AsyncMock(side_effect=[True, False])
+        challenge._capture_pony_chart_image = AsyncMock(return_value=image)
+        challenge._auto_answer = AsyncMock(return_value=frozenset({"Twilight"}))
 
-            with patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()):
-                detected = await challenge.check()
+        with (
+            patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
+            patch.object(ponychart_module.tempfile, "NamedTemporaryFile") as temporary,
+        ):
+            detected = await challenge.check()
 
-            self.assertTrue(detected)
-            self.assertFalse(image.exists())
+        self.assertTrue(detected)
+        challenge._auto_answer.assert_awaited_once_with(image)
+        temporary.assert_not_called()
 
     async def test_configured_directory_retains_successful_classifier_input(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            image = root / "challenge.png"
-            image.write_bytes(b"challenge")
+            image = b"challenge"
             images = root / "pony_chart"
             driver = Mock(headless=True)
             challenge = PonyChart(driver, image_directory=images)
             challenge._check = AsyncMock(side_effect=[True, False])
-            challenge._save_pony_chart_image = AsyncMock(return_value=str(image))
+            challenge._capture_pony_chart_image = AsyncMock(return_value=image)
             challenge._auto_answer = AsyncMock(return_value=frozenset({"Twilight"}))
 
             with patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()):
                 detected = await challenge.check()
 
             self.assertTrue(detected)
-            # The scratch capture is local-only; retention persists a copy
-            # under the configured directory after answering, then the
-            # scratch file is removed.
-            self.assertFalse(image.exists())
+            challenge._auto_answer.assert_awaited_once_with(image)
             retained = list(images.iterdir())
             self.assertEqual(len(retained), 1)
             self.assertTrue(retained[0].name.startswith("pony_chart_"))
             self.assertEqual(retained[0].suffix, ".png")
-            self.assertEqual(retained[0].read_bytes(), b"challenge")
+            self.assertEqual(retained[0].read_bytes(), image)
 
     async def test_configured_directory_retains_image_after_prediction_failure(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            image = root / "challenge.png"
-            image.write_bytes(b"challenge")
+            image = b"challenge"
             images = root / "pony_chart"
             driver = Mock(headless=True)
             challenge = PonyChart(driver, image_directory=images)
             challenge._check = AsyncMock(side_effect=[True, False])
-            challenge._save_pony_chart_image = AsyncMock(return_value=str(image))
+            challenge._capture_pony_chart_image = AsyncMock(return_value=image)
             answer_error = ValueError("bad model")
             challenge._auto_answer = AsyncMock(side_effect=answer_error)
 
@@ -178,15 +173,14 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
                 detected = await challenge.check()
 
             self.assertTrue(detected)
-            self.assertFalse(image.exists())
             retained = list(images.iterdir())
             self.assertEqual(len(retained), 1)
-            self.assertEqual(retained[0].read_bytes(), b"challenge")
+            self.assertEqual(retained[0].read_bytes(), image)
             ponychart_logger.warning.assert_called_once_with(
                 "PonyChart auto-answer failed; challenge handling will continue "
-                "error_type=%s image=%s",
+                "error_type=%s image_bytes=%d",
                 "ValueError",
-                str(image),
+                len(image),
             )
             ponychart_logger.debug.assert_called_once_with(
                 "PonyChart auto-answer error detail",
@@ -195,7 +189,7 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
             ponychart_logger.error.assert_not_called()
             ponychart_logger.info.assert_not_called()
 
-    async def test_capture_uses_local_scratch_file_not_retention_directory(
+    async def test_capture_returns_bytes_without_touching_retention_directory(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -208,64 +202,32 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
             challenge = PonyChart(driver, image_directory=image_directory)
             challenge._wait_for_image_loaded = AsyncMock()
 
-            first = Path(await challenge._save_pony_chart_image())
-            second = Path(await challenge._save_pony_chart_image())
-            try:
-                # Capture must never touch the (possibly slow or unavailable)
-                # retention directory. Browser bytes are validated first and
-                # only then written to local scratch storage. With no explicit
-                # scratch_directory, that falls back to the process default.
-                self.assertFalse(image_directory.exists())
-                self.assertNotEqual(first.parent, image_directory)
-                self.assertEqual(first.parent, Path(tempfile.gettempdir()))
-                self.assertNotEqual(first, second)
-                self.assertTrue(first.name.startswith("hvbattle-ponychart-"))
-                self.assertTrue(second.name.startswith("hvbattle-ponychart-"))
-                self.assertEqual(first.suffix, ".png")
-                self.assertEqual(second.suffix, ".png")
-                self.assertEqual(first.read_bytes(), image)
-                self.assertEqual(second.read_bytes(), image)
-                self.assertEqual(driver.page.evaluate.await_count, 2)
-                driver.page.send.assert_not_awaited()
-            finally:
-                first.unlink(missing_ok=True)
-                second.unlink(missing_ok=True)
+            with patch.object(
+                ponychart_module.tempfile,
+                "NamedTemporaryFile",
+            ) as temporary:
+                first = await challenge._capture_pony_chart_image()
+                second = await challenge._capture_pony_chart_image()
 
-    async def test_capture_honors_explicit_scratch_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            scratch_directory = Path(directory) / "scratch"
-            scratch_directory.mkdir()
-            image = _png_bytes(2, 19)
-            driver = Mock(headless=True)
-            driver.page = Mock()
-            driver.page.evaluate = AsyncMock(return_value=_canvas_payload(image, 2, 19))
-            driver.page.send = AsyncMock()
-            challenge = PonyChart(driver, scratch_directory=scratch_directory)
-            challenge._wait_for_image_loaded = AsyncMock()
+            self.assertFalse(image_directory.exists())
+            self.assertEqual(first, image)
+            self.assertEqual(second, image)
+            self.assertEqual(driver.page.evaluate.await_count, 2)
+            driver.page.send.assert_not_awaited()
+            temporary.assert_not_called()
 
-            captured = Path(await challenge._save_pony_chart_image())
-
-            # A deployment that cannot trust the process default temp
-            # directory (e.g. its TMPDIR happens to point somewhere slow or
-            # remote) can redirect capture explicitly instead.
-            self.assertEqual(captured.parent, scratch_directory)
-            self.assertNotEqual(captured.parent, Path(tempfile.gettempdir()))
-            self.assertEqual(captured.read_bytes(), image)
-            captured.unlink()
-
-    async def test_retain_pony_chart_image_creates_directory_and_unique_copies(
+    async def test_retain_pony_chart_image_creates_unique_direct_writes(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "source.png"
-            source.write_bytes(b"challenge")
+            image = b"challenge"
             image_directory = root / "nested" / "pony_chart"
             driver = Mock(headless=True)
             challenge = PonyChart(driver, image_directory=image_directory)
 
-            await challenge._retain_pony_chart_image(str(source))
-            await challenge._retain_pony_chart_image(str(source))
+            await challenge._retain_pony_chart_image(image)
+            await challenge._retain_pony_chart_image(image)
 
             retained = sorted(image_directory.iterdir())
             self.assertEqual(len(retained), 2)
@@ -273,10 +235,7 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
             for path in retained:
                 self.assertTrue(path.name.startswith("pony_chart_"))
                 self.assertEqual(path.suffix, ".png")
-                self.assertEqual(path.read_bytes(), b"challenge")
-            # Retention copies the source; it never deletes it (deletion of
-            # the scratch capture is ``check()``'s responsibility).
-            self.assertTrue(source.exists())
+                self.assertEqual(path.read_bytes(), image)
 
     async def test_retain_pony_chart_image_without_directory_is_noop(
         self,
@@ -284,26 +243,32 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         driver = Mock(headless=True)
         challenge = PonyChart(driver)
 
-        await challenge._retain_pony_chart_image("/nonexistent/does-not-matter.png")
+        with patch.object(challenge, "_write_retained_capture") as write:
+            await challenge._retain_pony_chart_image(b"challenge")
 
-    async def test_retain_pony_chart_image_swallows_copy_failure(self) -> None:
+        write.assert_not_called()
+
+    async def test_retain_pony_chart_image_swallows_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "source.png"
-            source.write_bytes(b"challenge")
+            image = b"challenge"
             image_directory = root / "pony_chart"
             driver = Mock(headless=True)
             challenge = PonyChart(driver, image_directory=image_directory)
-            copy_error = OSError("NAS unreachable")
+            write_error = OSError("NAS unreachable")
 
             with (
-                patch.object(ponychart_module.shutil, "copy2", side_effect=copy_error),
+                patch.object(
+                    challenge,
+                    "_write_retained_capture",
+                    side_effect=write_error,
+                ),
                 patch.object(ponychart_module, "logger") as ponychart_logger,
             ):
-                await challenge._retain_pony_chart_image(str(source))
+                await challenge._retain_pony_chart_image(image)
 
             ponychart_logger.warning.assert_called_once_with(
-                "PonyChart image retention copy failed error_type=%s",
+                "PonyChart image retention write failed error_type=%s",
                 "OSError",
             )
 
@@ -328,20 +293,16 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         driver.page.send = AsyncMock(
             return_value=base64.b64encode(image).decode("ascii")
         )
+        challenge = PonyChart(driver)
+        challenge._wait_for_image_loaded = AsyncMock()
 
-        with tempfile.TemporaryDirectory() as directory:
-            scratch = Path(directory)
-            challenge = PonyChart(driver, scratch_directory=scratch)
-            challenge._wait_for_image_loaded = AsyncMock()
+        captured = await challenge._capture_pony_chart_image()
 
-            captured = Path(await challenge._save_pony_chart_image())
+        self.assertEqual(captured, image)
+        self.assertEqual(driver.page.evaluate.await_count, 2)
+        driver.page.send.assert_awaited_once()
 
-            self.assertEqual(captured.read_bytes(), image)
-            self.assertEqual(driver.page.evaluate.await_count, 2)
-            driver.page.send.assert_awaited_once()
-            captured.unlink()
-
-    async def test_invalid_canvas_base64_or_png_never_creates_scratch_file(
+    async def test_invalid_canvas_base64_or_png_is_rejected_in_memory(
         self,
     ) -> None:
         header = struct.pack(">IIBBBBB", 3, 4, 8, 6, 0, 0, 0)
@@ -368,22 +329,20 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
             "bad-png-checksum": _canvas_payload(bytes(bad_checksum_png), 3, 4),
         }
         for name, payload in cases.items():
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
-                scratch = Path(directory)
+            with self.subTest(name=name):
                 driver = Mock(headless=True)
                 driver.page = Mock()
                 driver.page.evaluate = AsyncMock(return_value=payload)
                 driver.page.send = AsyncMock()
-                challenge = PonyChart(driver, scratch_directory=scratch)
+                challenge = PonyChart(driver)
                 challenge._wait_for_image_loaded = AsyncMock()
 
                 with self.assertRaises(ValueError):
-                    await challenge._save_pony_chart_image()
+                    await challenge._capture_pony_chart_image()
 
-                self.assertEqual(list(scratch.iterdir()), [])
                 driver.page.send.assert_not_awaited()
 
-    async def test_canvas_header_dimension_mismatch_is_rejected_without_file(
+    async def test_canvas_header_dimension_mismatch_is_rejected_in_memory(
         self,
     ) -> None:
         image = _png_bytes(11, 9)
@@ -391,19 +350,15 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         driver.page = Mock()
         driver.page.evaluate = AsyncMock(return_value=_canvas_payload(image, 11, 10))
         driver.page.send = AsyncMock()
+        challenge = PonyChart(driver)
+        challenge._wait_for_image_loaded = AsyncMock()
 
-        with tempfile.TemporaryDirectory() as directory:
-            scratch = Path(directory)
-            challenge = PonyChart(driver, scratch_directory=scratch)
-            challenge._wait_for_image_loaded = AsyncMock()
+        with self.assertRaisesRegex(ValueError, "dimensions did not match"):
+            await challenge._capture_pony_chart_image()
 
-            with self.assertRaisesRegex(ValueError, "dimensions did not match"):
-                await challenge._save_pony_chart_image()
+        driver.page.send.assert_not_awaited()
 
-            self.assertEqual(list(scratch.iterdir()), [])
-            driver.page.send.assert_not_awaited()
-
-    async def test_canvas_timeout_does_not_fallback_retry_or_create_file(self) -> None:
+    async def test_canvas_timeout_does_not_fallback_or_retry(self) -> None:
         driver = Mock(headless=True)
         driver.page = Mock()
 
@@ -413,26 +368,23 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
 
         driver.page.evaluate = AsyncMock(side_effect=hang)
         driver.page.send = AsyncMock()
-        with tempfile.TemporaryDirectory() as directory:
-            scratch = Path(directory)
-            challenge = PonyChart(driver, scratch_directory=scratch)
-            challenge._wait_for_image_loaded = AsyncMock()
+        challenge = PonyChart(driver)
+        challenge._wait_for_image_loaded = AsyncMock()
 
-            with (
-                patch.object(
-                    ponychart_module,
-                    "_PONYCHART_DOM_CAPTURE_TIMEOUT_SECONDS",
-                    0.01,
-                ),
-                self.assertRaises(ZendriverOperationTimeout),
-            ):
-                await challenge._save_pony_chart_image()
+        with (
+            patch.object(
+                ponychart_module,
+                "_PONYCHART_DOM_CAPTURE_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await challenge._capture_pony_chart_image()
 
-            driver.page.evaluate.assert_awaited_once()
-            driver.page.send.assert_not_awaited()
-            self.assertEqual(list(scratch.iterdir()), [])
+        driver.page.evaluate.assert_awaited_once()
+        driver.page.send.assert_not_awaited()
 
-    async def test_screenshot_timeout_does_not_retry_or_create_file(self) -> None:
+    async def test_screenshot_timeout_does_not_retry(self) -> None:
         driver = Mock(headless=True)
         driver.page = Mock()
         driver.page.evaluate = AsyncMock(
@@ -453,24 +405,21 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError("unreachable")
 
         driver.page.send = AsyncMock(side_effect=hang)
-        with tempfile.TemporaryDirectory() as directory:
-            scratch = Path(directory)
-            challenge = PonyChart(driver, scratch_directory=scratch)
-            challenge._wait_for_image_loaded = AsyncMock()
+        challenge = PonyChart(driver)
+        challenge._wait_for_image_loaded = AsyncMock()
 
-            with (
-                patch.object(
-                    ponychart_module,
-                    "_PONYCHART_SCREENSHOT_TIMEOUT_SECONDS",
-                    0.01,
-                ),
-                self.assertRaises(ZendriverOperationTimeout),
-            ):
-                await challenge._save_pony_chart_image()
+        with (
+            patch.object(
+                ponychart_module,
+                "_PONYCHART_SCREENSHOT_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await challenge._capture_pony_chart_image()
 
-            self.assertEqual(driver.page.evaluate.await_count, 2)
-            driver.page.send.assert_awaited_once()
-            self.assertEqual(list(scratch.iterdir()), [])
+        self.assertEqual(driver.page.evaluate.await_count, 2)
+        driver.page.send.assert_awaited_once()
 
 
 class PonyChartLoggingTests(unittest.IsolatedAsyncioTestCase):
@@ -489,9 +438,10 @@ class PonyChartLoggingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(ponychart_module, "_predict", predictor),
             patch.object(ponychart_module, "logger") as ponychart_logger,
         ):
-            labels = await challenge._auto_answer("challenge.png")
+            labels = await challenge._auto_answer(b"challenge")
 
         self.assertEqual(labels, frozenset({"Zeta", "alpha"}))
+        predictor.assert_called_once_with(b"challenge")
         alpha.click.assert_awaited_once_with()
         zeta.click.assert_awaited_once_with()
         ponychart_logger.debug.assert_called_once_with(
@@ -517,7 +467,7 @@ class PonyChartLoggingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(ponychart_module, "_predict", predictor),
             patch.object(ponychart_module, "logger") as ponychart_logger,
         ):
-            await challenge._auto_answer("challenge.png")
+            await challenge._auto_answer(b"challenge")
 
         twilight.click.assert_awaited_once_with()
         ponychart_logger.warning.assert_called_once_with(
@@ -555,7 +505,7 @@ class PonyChartLoggingTests(unittest.IsolatedAsyncioTestCase):
             ),
             self.assertRaises(BattleInterruptedError) as raised,
         ):
-            await challenge._auto_answer("challenge.png")
+            await challenge._auto_answer(b"challenge")
 
         self.assertEqual(
             raised.exception.diagnostic_code,
@@ -579,184 +529,162 @@ class PonyChartLoggingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(ponychart_module, "_predict", predictor),
             self.assertRaises(ZendriverOperationTimeout) as raised,
         ):
-            await challenge._auto_answer("challenge.png")
+            await challenge._auto_answer(b"challenge")
 
         self.assertIs(raised.exception, timeout)
         twilight.click.assert_awaited_once_with()
 
     async def test_auto_answer_timeout_stops_challenge_handling(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            image = Path(directory) / "challenge.png"
-            image.write_bytes(b"challenge")
-            driver = Mock(headless=True)
-            challenge = PonyChart(driver)
-            challenge._check = AsyncMock(return_value=True)
-            challenge._save_pony_chart_image = AsyncMock(return_value=str(image))
-            timeout = ZendriverOperationTimeout(timeout_seconds=3.0)
-            challenge._auto_answer = AsyncMock(side_effect=timeout)
+        image = b"challenge"
+        driver = Mock(headless=True)
+        challenge = PonyChart(driver)
+        challenge._check = AsyncMock(return_value=True)
+        challenge._capture_pony_chart_image = AsyncMock(return_value=image)
+        timeout = ZendriverOperationTimeout(timeout_seconds=3.0)
+        challenge._auto_answer = AsyncMock(side_effect=timeout)
 
-            with self.assertRaises(ZendriverOperationTimeout) as raised:
-                await challenge.check()
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await challenge.check()
 
-            self.assertIs(raised.exception, timeout)
-            challenge._check.assert_awaited_once_with()
-            self.assertFalse(image.exists())
+        self.assertIs(raised.exception, timeout)
+        challenge._check.assert_awaited_once_with()
+        challenge._auto_answer.assert_awaited_once_with(image)
 
     async def test_fallback_start_warns_and_success_detail_is_debug(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            image = Path(directory) / "challenge.png"
-            image.write_bytes(b"challenge")
-            driver = Mock(headless=True)
-            driver.page = Mock()
-            submit = Mock()
-            submit.click = AsyncMock()
-            driver.page.xpath = AsyncMock(return_value=[submit])
-            challenge = PonyChart(driver)
-            challenge._check = AsyncMock(side_effect=[True] * 12 + [False])
-            challenge._save_pony_chart_image = AsyncMock(return_value=str(image))
-            challenge._auto_answer = AsyncMock(
-                return_value=frozenset({"Twilight Sparkle"})
-            )
+        image = b"challenge"
+        driver = Mock(headless=True)
+        driver.page = Mock()
+        submit = Mock()
+        submit.click = AsyncMock()
+        driver.page.xpath = AsyncMock(return_value=[submit])
+        challenge = PonyChart(driver)
+        challenge._check = AsyncMock(side_effect=[True] * 12 + [False])
+        challenge._capture_pony_chart_image = AsyncMock(return_value=image)
+        challenge._auto_answer = AsyncMock(return_value=frozenset({"Twilight Sparkle"}))
 
-            with (
-                patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
-                patch.object(ponychart_module, "logger") as ponychart_logger,
-            ):
-                detected = await challenge.check()
+        with (
+            patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
+            patch.object(ponychart_module, "logger") as ponychart_logger,
+        ):
+            detected = await challenge.check()
 
-            self.assertTrue(detected)
-            self.assertFalse(image.exists())
-            submit.click.assert_awaited_once_with()
-            ponychart_logger.warning.assert_called_once_with(
-                "PonyChart remained present after %ds; "
-                "attempting fallback submission",
-                10,
-            )
-            ponychart_logger.debug.assert_called_once_with(
-                "PonyChart challenge absent after fallback submission "
-                "attempt clicked=%s",
-                True,
-            )
-            ponychart_logger.info.assert_not_called()
+        self.assertTrue(detected)
+        submit.click.assert_awaited_once_with()
+        ponychart_logger.warning.assert_called_once_with(
+            "PonyChart remained present after %ds; " "attempting fallback submission",
+            10,
+        )
+        ponychart_logger.debug.assert_called_once_with(
+            "PonyChart challenge absent after fallback submission "
+            "attempt clicked=%s",
+            True,
+        )
+        ponychart_logger.info.assert_not_called()
 
     async def test_fallback_click_error_recovery_warns_once_with_safe_type(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            image = Path(directory) / "challenge.png"
-            image.write_bytes(b"challenge")
-            driver = Mock(headless=True)
-            driver.page = Mock()
-            fallback_submit = Mock()
-            fallback_submit.click = AsyncMock()
-            driver.page.xpath = AsyncMock(
-                side_effect=RuntimeError("private click detail\nsecond line")
-            )
-            driver.page.select = AsyncMock(return_value=fallback_submit)
-            challenge = PonyChart(driver)
-            challenge._check = AsyncMock(side_effect=[True] * 12 + [False])
-            challenge._save_pony_chart_image = AsyncMock(return_value=str(image))
-            challenge._auto_answer = AsyncMock(
-                return_value=frozenset({"Twilight Sparkle"})
-            )
+        image = b"challenge"
+        driver = Mock(headless=True)
+        driver.page = Mock()
+        fallback_submit = Mock()
+        fallback_submit.click = AsyncMock()
+        driver.page.xpath = AsyncMock(
+            side_effect=RuntimeError("private click detail\nsecond line")
+        )
+        driver.page.select = AsyncMock(return_value=fallback_submit)
+        challenge = PonyChart(driver)
+        challenge._check = AsyncMock(side_effect=[True] * 12 + [False])
+        challenge._capture_pony_chart_image = AsyncMock(return_value=image)
+        challenge._auto_answer = AsyncMock(return_value=frozenset({"Twilight Sparkle"}))
 
-            with (
-                patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
-                patch.object(
-                    ponychart_module,
-                    "is_browser_generation_error",
-                    return_value=False,
+        with (
+            patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
+            patch.object(
+                ponychart_module,
+                "is_browser_generation_error",
+                return_value=False,
+            ),
+            patch.object(ponychart_module, "logger") as ponychart_logger,
+        ):
+            detected = await challenge.check()
+
+        self.assertTrue(detected)
+        fallback_submit.click.assert_awaited_once_with()
+        self.assertEqual(
+            ponychart_logger.warning.call_args_list,
+            [
+                call(
+                    "PonyChart remained present after %ds; "
+                    "attempting fallback submission",
+                    10,
                 ),
-                patch.object(ponychart_module, "logger") as ponychart_logger,
-            ):
-                detected = await challenge.check()
-
-            self.assertTrue(detected)
-            fallback_submit.click.assert_awaited_once_with()
-            self.assertEqual(
-                ponychart_logger.warning.call_args_list,
-                [
-                    call(
-                        "PonyChart remained present after %ds; "
-                        "attempting fallback submission",
-                        10,
-                    ),
-                    call(
-                        "PonyChart fallback submission recovered after lookup error "
-                        "clicked=%s xpath_error_type=%s selector_error_type=%s",
-                        True,
-                        "RuntimeError",
-                        "none",
-                    ),
-                ],
-            )
-            self.assertNotIn(
-                "private click detail",
-                " ".join(str(call_args) for call_args in ponychart_logger.mock_calls),
-            )
-            ponychart_logger.info.assert_not_called()
+                call(
+                    "PonyChart fallback submission recovered after lookup error "
+                    "clicked=%s xpath_error_type=%s selector_error_type=%s",
+                    True,
+                    "RuntimeError",
+                    "none",
+                ),
+            ],
+        )
+        self.assertNotIn(
+            "private click detail",
+            " ".join(str(call_args) for call_args in ponychart_logger.mock_calls),
+        )
+        ponychart_logger.info.assert_not_called()
 
     async def test_fallback_submit_timeout_is_not_replayed(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            image = Path(directory) / "challenge.png"
-            image.write_bytes(b"challenge")
-            driver = Mock(headless=True)
-            driver.page = Mock()
-            timeout = ZendriverOperationTimeout(timeout_seconds=3.0)
-            submit = Mock()
-            submit.click = AsyncMock(side_effect=timeout)
-            driver.page.xpath = AsyncMock(return_value=[submit])
-            driver.page.select = AsyncMock()
-            challenge = PonyChart(driver)
-            challenge._check = AsyncMock(return_value=True)
-            challenge._save_pony_chart_image = AsyncMock(return_value=str(image))
-            challenge._auto_answer = AsyncMock(
-                return_value=frozenset({"Twilight Sparkle"})
-            )
+        image = b"challenge"
+        driver = Mock(headless=True)
+        driver.page = Mock()
+        timeout = ZendriverOperationTimeout(timeout_seconds=3.0)
+        submit = Mock()
+        submit.click = AsyncMock(side_effect=timeout)
+        driver.page.xpath = AsyncMock(return_value=[submit])
+        driver.page.select = AsyncMock()
+        challenge = PonyChart(driver)
+        challenge._check = AsyncMock(return_value=True)
+        challenge._capture_pony_chart_image = AsyncMock(return_value=image)
+        challenge._auto_answer = AsyncMock(return_value=frozenset({"Twilight Sparkle"}))
 
-            with (
-                patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
-                self.assertRaises(ZendriverOperationTimeout) as raised,
-            ):
-                await challenge.check()
+        with (
+            patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
+            self.assertRaises(ZendriverOperationTimeout) as raised,
+        ):
+            await challenge.check()
 
-            self.assertIs(raised.exception, timeout)
-            submit.click.assert_awaited_once_with()
-            driver.page.select.assert_not_awaited()
-            self.assertFalse(image.exists())
+        self.assertIs(raised.exception, timeout)
+        submit.click.assert_awaited_once_with()
+        driver.page.select.assert_not_awaited()
 
     async def test_fallback_submit_generic_error_is_not_replayed(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            image = Path(directory) / "challenge.png"
-            image.write_bytes(b"challenge")
-            driver = Mock(headless=True)
-            driver.page = Mock()
-            click_error = RuntimeError("submit detached after dispatch")
-            submit = Mock()
-            submit.click = AsyncMock(side_effect=click_error)
-            driver.page.xpath = AsyncMock(return_value=[submit])
-            driver.page.select = AsyncMock()
-            challenge = PonyChart(driver)
-            challenge._check = AsyncMock(return_value=True)
-            challenge._save_pony_chart_image = AsyncMock(return_value=str(image))
-            challenge._auto_answer = AsyncMock(
-                return_value=frozenset({"Twilight Sparkle"})
-            )
+        image = b"challenge"
+        driver = Mock(headless=True)
+        driver.page = Mock()
+        click_error = RuntimeError("submit detached after dispatch")
+        submit = Mock()
+        submit.click = AsyncMock(side_effect=click_error)
+        driver.page.xpath = AsyncMock(return_value=[submit])
+        driver.page.select = AsyncMock()
+        challenge = PonyChart(driver)
+        challenge._check = AsyncMock(return_value=True)
+        challenge._capture_pony_chart_image = AsyncMock(return_value=image)
+        challenge._auto_answer = AsyncMock(return_value=frozenset({"Twilight Sparkle"}))
 
-            with (
-                patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
-                self.assertRaises(BattleInterruptedError) as raised,
-            ):
-                await challenge.check()
+        with (
+            patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
+            self.assertRaises(BattleInterruptedError) as raised,
+        ):
+            await challenge.check()
 
-            self.assertEqual(
-                raised.exception.diagnostic_code,
-                "battle.ponychart.submit-outcome-unknown",
-            )
-            self.assertIs(raised.exception.__cause__, click_error)
-            submit.click.assert_awaited_once_with()
-            driver.page.select.assert_not_awaited()
-            self.assertFalse(image.exists())
+        self.assertEqual(
+            raised.exception.diagnostic_code,
+            "battle.ponychart.submit-outcome-unknown",
+        )
+        self.assertIs(raised.exception.__cause__, click_error)
+        submit.click.assert_awaited_once_with()
+        driver.page.select.assert_not_awaited()
 
 
 if __name__ == "__main__":

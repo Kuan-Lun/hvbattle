@@ -193,7 +193,7 @@ class PonyChartHangProtectionTests(unittest.IsolatedAsyncioTestCase):
                 pony_chart._wait_for_image_loaded(timeout=0.2), timeout=5
             )
 
-    async def test_save_pony_chart_image_times_out_instead_of_hanging_forever(
+    async def test_capture_pony_chart_image_times_out_instead_of_hanging_forever(
         self,
     ) -> None:
         pony_chart = object.__new__(PonyChart)
@@ -203,7 +203,7 @@ class PonyChartHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         pony_chart._wait_for_image_loaded = AsyncMock(return_value=None)
 
         with self.assertRaises(ZendriverOperationTimeout):
-            await asyncio.wait_for(pony_chart._save_pony_chart_image(), timeout=5)
+            await asyncio.wait_for(pony_chart._capture_pony_chart_image(), timeout=5)
 
 
 class SkillManagerHangProtectionTests(unittest.IsolatedAsyncioTestCase):

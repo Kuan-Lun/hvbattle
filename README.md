@@ -87,11 +87,13 @@ browser replacement or worker restart remains a calling-application decision.
 `BattleSession` preloads the PonyChart classifier and ONNX model before opening
 the browser, so a timed challenge never pays the first-load cost. The runner
 checks for and resolves PonyChart before parsing an ordinary battle turn or
-calling client strategy code. Set `ponychart_image_directory` to retain the
-image captured for every detected challenge, including successful resolutions
-and failures. Each capture receives a collision-resistant `pony_chart_*.png`
-name, and callers own retention for that directory. Without an image directory,
-classifier screenshots remain temporary and are removed after each attempt.
+calling client strategy code. Browser PNG captures stay in memory through
+classification and challenge handling. Set `ponychart_image_directory` to
+retain every detected challenge, including successful resolutions and failures;
+the captured bytes are written once after each attempt under a
+collision-resistant `pony_chart_*.png` name, and callers own retention for that
+directory. Without an image directory, challenge images are never written to
+the filesystem.
 
 PonyChart model files are stored as immutable, content-addressed generations.
 Each update downloads both files over verified TLS into a same-filesystem

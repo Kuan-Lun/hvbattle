@@ -170,12 +170,24 @@ returned `BattleCompleted`. Arena choice follows the same boundary:
 `list_arena_options()` returns data and `start_arena(option)` starts only the
 option explicitly selected by the caller.
 The three `goto_*()` listing operations require an explicit `expected_realm`,
-issue one canonical realm-scoped Battle URL GET, and then validate the battle
-blocker, origin, realm, root path, query, and route-specific DOM. URL identity
-and all four battle markers come from one atomic browser observation; origin,
-expected realm, and root path are trusted before a marker may surface as a
-battle blocker. The operations do not hover, expand, inspect, or click the site
-menu, and they do not retry an unknown navigation outcome.
+issue one canonical realm-scoped Battle URL GET, and then wait for an explicit
+ten-second readiness deadline. Each readiness observation atomically reads URL
+identity, all four battle markers, and the route-specific DOM. A blocker is
+accepted when that same observation proves the trusted origin, expected realm,
+and exact realm root path. A marker-free listing additionally requires the
+exact canonical Battle query and its route DOM. Loading or otherwise unknown
+documents are observed again until the deadline; the GET itself is never
+retried. The operations do not hover, expand, inspect, or click the site menu.
+
+If readiness remains unknown at the deadline, `hbrowser` captures one bounded,
+private HTML diagnostic named `battle_route_not_ready` under
+`HBROWSER_LOG_DIR`. Encounter query values are redacted by `hbrowser`, and its
+file-size and retention limits apply. The raised `BattleRouteReadinessError`
+exposes the resulting `diagnostic_path` for the application log without placing
+HTML or raw URL queries in ordinary logs. A diagnostic capture failure is
+recorded on the readiness error when the browser generation and log sink remain
+usable. Browser-generation and log-persistence failures remain fatal and
+propagate unchanged.
 
 `inspect_battle_presence()` reports only what the current document represents;
 its `ABSENT` result can describe a stale pre-battle tab and is therefore not a
@@ -186,11 +198,17 @@ realm and root path. A marker-free current document, including a non-HV page,
 causes one canonical Arena-listing GET for the explicit realm. A trusted
 redirect blocker for PonyChart, active battle, or next-floor is adopted as
 `ACTIVE`, and the final completion blocker is adopted as `COMPLETION`. A marker
-on an untrusted origin, wrong realm, or unexpected path is a navigation safety
-error, never battle evidence. `ABSENT` is accepted only after the GET lands on
-the validated realm-scoped route with no blocker.
+in the current document on an untrusted origin, wrong realm, or unexpected path
+is a navigation safety error, never battle evidence. After the canonical GET,
+those identities remain unknown and are polled until the deadline. A trusted
+battle redirect may instead use a route such as `ss=ba` with a private
+`encounter` value, so its blocker is accepted without requiring the original
+listing query. Neither that query nor the encounter value is emitted to the
+ordinary log. The exact listing query remains mandatory when no blocker exists.
+`ABSENT` is accepted only after the deadline observer reaches the validated
+realm-scoped route with its Arena DOM and no blocker.
 
-This atomic observation contract is the `hvbattle` 0.8 / `hvbrowser` 0.5
+This atomic observation contract is the `hvbattle` 0.9 / `hvbrowser` 0.6
 package line; the dependency range intentionally rejects older or newer minor
 lines with different navigation contracts.
 

@@ -14,8 +14,8 @@ class PublicApiTests(unittest.TestCase):
         with project_path.open("rb") as project_file:
             project = tomllib.load(project_file)["project"]
 
-        self.assertEqual(project["version"], "0.8.1")
-        self.assertIn("hvbrowser>=0.5.0,<0.6", project["dependencies"])
+        self.assertEqual(project["version"], "0.9.0")
+        self.assertIn("hvbrowser>=0.6.0,<0.7", project["dependencies"])
 
     def test_import_does_not_require_credentials(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
@@ -40,6 +40,7 @@ class PublicApiTests(unittest.TestCase):
         self.assertTrue(hasattr(hvbattle, "BattleStepResult"))
         self.assertTrue(hasattr(hvbattle, "BattleInterruptedError"))
         self.assertTrue(hasattr(hvbattle, "BattleActionOutcomeUnknownError"))
+        self.assertTrue(hasattr(hvbattle, "BattleRouteReadinessError"))
         self.assertTrue(hasattr(hvbattle, "TurnDecision"))
         self.assertTrue(hasattr(hvbattle, "ArenaOption"))
         self.assertTrue(hasattr(hvbattle, "GrindfestOption"))

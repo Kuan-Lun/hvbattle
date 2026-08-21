@@ -6,9 +6,10 @@ safety-critical evidence decisions.
 It covers:
 
 - atomic startup presence reconciliation in which origin, expected realm, and
-  realm root path are trusted before a marker may become active/completion
-  evidence, while marker-free current documents remain provisional until a
-  validated canonical Battle landing;
+  realm root path are trusted before a current-document marker may become
+  active/completion evidence, while canonical redirect blockers require that
+  same identity but not the listing query; marker-free absence additionally
+  requires the exact Battle route query and route DOM;
 - next-round transition evidence and document readiness;
 - authoritative XHR/action receipts;
 - immutable action/dialog-token evidence for the exact communication-failure
@@ -38,6 +39,10 @@ does not prove that Chromium, the DOM probe, the network, Python logging
 handlers, or a calling application's persistent log sink faithfully reports
 those observations. Python tests remain necessary to keep the production
 implementation aligned with the model and to test those runtime boundaries.
+The canonical route observer's ten-second polling deadline and bounded HTML
+diagnostic are runtime liveness and observability mechanisms; the model covers
+the trusted final observation they must produce, not wall-clock scheduling or
+filesystem retention.
 
 The exit policy models `main.py` and `main.sh` in the private battle workspace,
 plus `should_retry_battle` in the outer `battle.zsh` launcher. It proves that a

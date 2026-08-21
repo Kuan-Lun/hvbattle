@@ -45,7 +45,9 @@ URL identity and all battle markers belong to one atomic observation. A marker
 may become positive state evidence only after that same observation proves the
 trusted origin, expected realm, and exact realm root path. A marker-free current
 document, including an untrusted document, authorizes only a canonical GET. Its
-absence settles only when the canonical landing identity and route both verify.
+canonical result may use a blocker after identity verification even when a real
+battle redirect no longer has the listing query. Marker-free absence requires
+both the exact listing query and the expected route DOM.
 -/
 def startupBlockerPresence : StartupNavigationBlocker → BattlePresence
   | .completion => .completion
@@ -66,14 +68,18 @@ def reconcileCurrentStartupObservation
 def reconcileCanonicalStartupObservation
     (identity : StartupNavigationIdentity)
     (blocker : Option StartupNavigationBlocker)
-    (routeValidated : Bool) : StartupReconciliationDecision :=
+    (routeQueryValidated routeDomReady : Bool) :
+    StartupReconciliationDecision :=
   if identity ≠ .expected then
     .rejected
   else
     match blocker with
-    | some blocker => .resolved (startupBlockerPresence blocker)
-    | none =>
-        if routeValidated then .resolved .absent else .rejected
+    | some blocker =>
+        .resolved (startupBlockerPresence blocker)
+    | none => if routeQueryValidated then
+        if routeDomReady then .resolved .absent else .rejected
+      else
+        .rejected
 
 theorem markerFreeCurrentDocumentOnlyNavigates
     (identity : StartupNavigationIdentity) :
@@ -109,22 +115,31 @@ theorem canonicalWrongIdentityMarkerIsRejected
     (identity : StartupNavigationIdentity)
     (blocker : StartupNavigationBlocker)
     (wrong : identity ≠ .expected) :
-    reconcileCanonicalStartupObservation identity (some blocker) true =
+    reconcileCanonicalStartupObservation identity (some blocker) true true =
       .rejected := by
   simp [reconcileCanonicalStartupObservation, wrong]
 
+theorem canonicalRedirectMarkerDoesNotRequireListingQuery
+    (blocker : StartupNavigationBlocker) :
+    reconcileCanonicalStartupObservation .expected (some blocker) false true =
+      .resolved (startupBlockerPresence blocker) := by
+  simp [reconcileCanonicalStartupObservation]
+
 theorem trustedCanonicalRedirectIsAdopted
     (blocker : StartupNavigationBlocker) :
-    reconcileCanonicalStartupObservation .expected (some blocker) false =
+    reconcileCanonicalStartupObservation .expected (some blocker) false false =
       .resolved (startupBlockerPresence blocker) := by
   simp [reconcileCanonicalStartupObservation]
 
 theorem canonicalAbsenceRequiresValidatedRoute :
-    reconcileCanonicalStartupObservation .expected none true =
+    reconcileCanonicalStartupObservation .expected none true true =
       .resolved .absent ∧
-    reconcileCanonicalStartupObservation .expected none false =
+    reconcileCanonicalStartupObservation .expected none true false =
+      .rejected ∧
+    reconcileCanonicalStartupObservation .expected none false true =
       .rejected := by
   exact ⟨by simp [reconcileCanonicalStartupObservation],
+    by simp [reconcileCanonicalStartupObservation],
     by simp [reconcileCanonicalStartupObservation]⟩
 
 inductive DocumentReadiness where

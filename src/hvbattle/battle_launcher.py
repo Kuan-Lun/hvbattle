@@ -1,10 +1,11 @@
 """Explicit navigation and submission for application-selected battles."""
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 
 from hvbrowser import (
@@ -14,10 +15,13 @@ from hvbrowser import (
     MaintenanceNavigationBlocker,
     MaintenanceNavigationObservation,
     Realm,
+    RealmDetectionError,
     RealmNavigator,
     observe_maintenance_navigation,
+    realm_from_url,
 )
 from hvbrowser.runtime import (
+    LogPersistenceError,
     is_browser_generation_error,
     setup_logger,
     wait_for_zendriver,
@@ -67,7 +71,7 @@ _BATTLE_ROUTE_LABELS = {
     "rb": "Ring of Blood",
     "gr": "GrindFest",
 }
-_BATTLE_ROUTE_READY_SCRIPTS = {
+_BATTLE_ROUTE_READY_EXPRESSIONS = {
     "ar": "Boolean(document.getElementById('arena_list'))",
     "rb": (
         "Boolean(document.getElementById('arena_list') "
@@ -77,14 +81,82 @@ _BATTLE_ROUTE_READY_SCRIPTS = {
 }
 _NAVIGATION_READ_TIMEOUT_SECONDS = 5.0
 _NAVIGATION_MUTATION_TIMEOUT_SECONDS = 15.0
+_BATTLE_ROUTE_READINESS_DEADLINE_SECONDS = 10.0
+_BATTLE_ROUTE_READINESS_POLL_SECONDS = 0.2
+_BATTLE_ROUTE_DIAGNOSTIC_KIND = "battle_route_not_ready"
 
 
-class _BattleRoutePageError(RuntimeError):
-    """The requested canonical Battle route could not be verified."""
+def _contains_log_persistence_error(error: BaseException) -> bool:
+    """Find a durable-log failure in one bounded exception graph."""
+
+    pending: list[BaseException] = [error]
+    visited: set[int] = set()
+    while pending and len(visited) < 64:
+        candidate = pending.pop()
+        identity = id(candidate)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if isinstance(candidate, LogPersistenceError):
+            return True
+        if isinstance(candidate, BaseExceptionGroup):
+            pending.extend(reversed(candidate.exceptions))
+        if candidate.__context__ is not None:
+            pending.append(candidate.__context__)
+        if candidate.__cause__ is not None:
+            pending.append(candidate.__cause__)
+    return False
 
 
-class _BattleNavigationSafetyError(_BattleRoutePageError):
+class BattleRouteReadinessError(RuntimeError):
+    """A canonical Battle route stayed unknown until its readiness deadline."""
+
+    def __init__(
+        self,
+        *,
+        route: str,
+        expected_realm: Realm,
+        deadline_seconds: float,
+        observation_count: int,
+        last_state: str,
+        diagnostic_path: str | None,
+        diagnostic_error_type: str | None,
+    ) -> None:
+        self.route = route
+        self.expected_realm = expected_realm
+        self.deadline_seconds = deadline_seconds
+        self.observation_count = observation_count
+        self.last_state = last_state
+        self.diagnostic_path = diagnostic_path
+        self.diagnostic_error_type = diagnostic_error_type
+
+        message = (
+            f"{_BATTLE_ROUTE_LABELS[route]} did not become ready within "
+            f"{deadline_seconds:g}s; last_state={last_state}"
+        )
+        if diagnostic_path is not None:
+            message += f"; diagnostic saved to {diagnostic_path}"
+        elif diagnostic_error_type is not None:
+            message += f"; diagnostic capture failed ({diagnostic_error_type})"
+        super().__init__(message)
+
+
+class _BattleNavigationSafetyError(RuntimeError):
     """Battle state, origin, path, or realm could not be trusted."""
+
+
+class _BattleRouteReadinessState(StrEnum):
+    """Sanitized result of one atomic post-GET route observation."""
+
+    UNTRUSTED_ORIGIN = "untrusted-origin"
+    WRONG_REALM = "wrong-realm"
+    INVALID_URL = "invalid-url"
+    WRONG_PATH = "wrong-path"
+    WRONG_QUERY = "wrong-query"
+    BLOCKED = "blocked"
+    READY = "ready"
+    ROUTE_DOM_MISSING = "route-dom-missing"
+    INVALID_OBSERVATION = "invalid-observation"
 
 
 class _StartupBattleRouteSource(StrEnum):
@@ -100,6 +172,74 @@ class _StartupBattleRouteResult:
 
     source: _StartupBattleRouteSource
     blocker: MaintenanceNavigationBlocker | None
+
+
+@dataclass(frozen=True, slots=True)
+class _BattleRouteReadinessObservation:
+    """One atomic route identity, blocker, and route-DOM observation."""
+
+    url: str
+    realm: Realm | None
+    blocker: MaintenanceNavigationBlocker | None
+    route_ready: bool
+
+
+def _battle_route_readiness_script(route: str) -> str:
+    route_ready_expression = _BATTLE_ROUTE_READY_EXPRESSIONS[route]
+    return f"""
+    (() => {{
+        const completion = document.getElementById("pane_completion");
+        return {{
+            url: window.location.href,
+            challenge: Boolean(document.getElementById("riddlesubmit")),
+            completion: Boolean(
+                completion
+                && completion.querySelector('img[src*="finishbattle.png"]')
+            ),
+            nextFloor: Boolean(document.getElementById("btcp")),
+            active: Boolean(document.getElementById("battle_main")),
+            routeReady: {route_ready_expression},
+        }};
+    }})()
+    """
+
+
+def _parse_battle_route_readiness_observation(
+    raw: object,
+) -> _BattleRouteReadinessObservation:
+    if not isinstance(raw, dict):
+        raise RuntimeError("Invalid Battle route readiness observation payload")
+    payload = cast(dict[object, object], raw)
+    url = payload.get("url")
+    if not isinstance(url, str):
+        raise RuntimeError("Invalid Battle route readiness observation payload")
+    marker_names = ("challenge", "completion", "nextFloor", "active")
+    if any(type(payload.get(name)) is not bool for name in marker_names):
+        raise RuntimeError("Invalid Battle route readiness observation payload")
+    route_ready = payload.get("routeReady")
+    if type(route_ready) is not bool:
+        raise RuntimeError("Invalid Battle route readiness observation payload")
+
+    blocker: MaintenanceNavigationBlocker | None = None
+    if payload["challenge"]:
+        blocker = MaintenanceNavigationBlocker.CHALLENGE
+    elif payload["completion"]:
+        blocker = MaintenanceNavigationBlocker.COMPLETION
+    elif payload["nextFloor"]:
+        blocker = MaintenanceNavigationBlocker.NEXT_FLOOR
+    elif payload["active"]:
+        blocker = MaintenanceNavigationBlocker.ACTIVE
+
+    try:
+        realm = realm_from_url(url)
+    except RealmDetectionError:
+        realm = None
+    return _BattleRouteReadinessObservation(
+        url=url,
+        realm=realm,
+        blocker=blocker,
+        route_ready=route_ready,
+    )
 
 
 def _parse_optional_exp_multiplier(value: Any) -> float | None:
@@ -172,20 +312,12 @@ class BattleLauncher:
         self._raise_if_blocked(current)
 
         await self._get_battle_route(expected_realm, route)
-        landed = await self._observe_navigation(
-            f"after opening {_BATTLE_ROUTE_LABELS[route]}"
+        landed = await self._wait_for_battle_route_readiness(
+            expected_realm=expected_realm,
+            route=route,
         )
-        self._validate_observation_identity(
-            landed,
-            expected_realm,
-            f"after opening {_BATTLE_ROUTE_LABELS[route]}",
-        )
-        self._raise_if_blocked(landed)
-        await self._verify_unblocked_battle_route_destination(
-            landed,
-            expected_realm,
-            route,
-        )
+        if landed.blocker is not None:
+            raise MaintenanceNavigationBlockedError(landed.blocker)
         return True
 
     async def _get_battle_route(
@@ -197,7 +329,9 @@ class BattleLauncher:
         try:
             await self.browser.get(direct_url)
         except Exception as error:
-            if is_browser_generation_error(error):
+            if _contains_log_persistence_error(error) or is_browser_generation_error(
+                error
+            ):
                 raise
             raise _BattleNavigationSafetyError(
                 f"The direct {_BATTLE_ROUTE_LABELS[route]} navigation outcome is "
@@ -211,7 +345,9 @@ class BattleLauncher:
         try:
             return await observe_maintenance_navigation(self.page)
         except Exception as error:
-            if is_browser_generation_error(error):
+            if _contains_log_persistence_error(error) or is_browser_generation_error(
+                error
+            ):
                 raise
             raise _BattleNavigationSafetyError(
                 f"Unable to observe trusted Battle navigation state {context}"
@@ -258,45 +394,162 @@ class BattleLauncher:
         path_prefix = "/isekai" if realm is Realm.ISEKAI else ""
         return f"{HENTAIVERSE_ROOT_URL}{path_prefix}/?s=Battle&ss={route}"
 
-    async def _verify_unblocked_battle_route_destination(
-        self,
-        observation: MaintenanceNavigationObservation,
+    @staticmethod
+    def _classify_battle_route_readiness(
+        observation: _BattleRouteReadinessObservation,
         expected_realm: Realm,
         route: str,
-    ) -> None:
-        self._validate_observation_identity(
-            observation,
-            expected_realm,
-            f"while verifying {_BATTLE_ROUTE_LABELS[route]}",
-        )
+    ) -> _BattleRouteReadinessState:
+        if observation.realm is None:
+            return _BattleRouteReadinessState.UNTRUSTED_ORIGIN
+        if observation.realm is not expected_realm:
+            return _BattleRouteReadinessState.WRONG_REALM
+        try:
+            parsed_url = urlsplit(observation.url)
+        except ValueError:
+            return _BattleRouteReadinessState.INVALID_URL
+        expected_path = "/isekai/" if expected_realm is Realm.ISEKAI else "/"
+        if parsed_url.path != expected_path:
+            return _BattleRouteReadinessState.WRONG_PATH
         if observation.blocker is not None:
-            raise AssertionError("Blocked Battle route reached unblocked verifier")
-        parsed_url = urlsplit(observation.url)
-        query = parse_qs(parsed_url.query, keep_blank_values=True)
+            return _BattleRouteReadinessState.BLOCKED
+        try:
+            query = parse_qs(parsed_url.query, keep_blank_values=True)
+        except ValueError:
+            return _BattleRouteReadinessState.INVALID_URL
         expected_query = {
             "s": ["Battle"],
             "ss": [route],
         }
-        if any(query.get(key) != value for key, value in expected_query.items()):
-            raise _BattleRoutePageError(
-                f"Battle navigation did not land on {_BATTLE_ROUTE_LABELS[route]}"
-            )
+        if query != expected_query:
+            return _BattleRouteReadinessState.WRONG_QUERY
+        if observation.route_ready:
+            return _BattleRouteReadinessState.READY
+        return _BattleRouteReadinessState.ROUTE_DOM_MISSING
+
+    async def _observe_battle_route_readiness(
+        self,
+        route: str,
+        *,
+        timeout_seconds: float,
+    ) -> _BattleRouteReadinessObservation:
+        raw = await wait_for_zendriver(
+            self.page.evaluate(_battle_route_readiness_script(route)),
+            timeout=timeout_seconds,
+            owner=self.page,
+        )
+        return _parse_battle_route_readiness_observation(raw)
+
+    async def _capture_route_readiness_diagnostic(
+        self,
+    ) -> tuple[str | None, str | None]:
         try:
-            route_ready = await wait_for_zendriver(
-                self.page.evaluate(_BATTLE_ROUTE_READY_SCRIPTS[route]),
-                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
-                owner=self.page,
+            path = await self.browser.save_page_diagnostic(
+                _BATTLE_ROUTE_DIAGNOSTIC_KIND
             )
+            return (str(path) if path is not None else None), None
+        except LogPersistenceError:
+            raise
         except Exception as error:
-            if is_browser_generation_error(error):
+            if _contains_log_persistence_error(error) or is_browser_generation_error(
+                error
+            ):
                 raise
-            raise _BattleRoutePageError(
-                f"Unable to inspect {_BATTLE_ROUTE_LABELS[route]} page structure"
-            ) from error
-        if route_ready is not True:
-            raise _BattleRoutePageError(
-                f"{_BATTLE_ROUTE_LABELS[route]} page structure is not ready"
+            logger.warning(
+                "Battle route diagnostic capture failed " "kind=%s error_type=%s",
+                _BATTLE_ROUTE_DIAGNOSTIC_KIND,
+                type(error).__name__,
             )
+            logger.debug(
+                "Battle route diagnostic capture traceback",
+                exc_info=True,
+            )
+            return None, type(error).__name__
+
+    async def _wait_for_battle_route_readiness(
+        self,
+        *,
+        expected_realm: Realm,
+        route: str,
+    ) -> _BattleRouteReadinessObservation:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _BATTLE_ROUTE_READINESS_DEADLINE_SECONDS
+        observation_count = 0
+        last_state = _BattleRouteReadinessState.INVALID_OBSERVATION
+        last_error: Exception | None = None
+
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                observation = await self._observe_battle_route_readiness(
+                    route,
+                    timeout_seconds=min(
+                        _NAVIGATION_READ_TIMEOUT_SECONDS,
+                        remaining,
+                    ),
+                )
+            except Exception as observation_error:
+                if _contains_log_persistence_error(
+                    observation_error
+                ) or is_browser_generation_error(observation_error):
+                    raise
+                last_error = observation_error
+                last_state = _BattleRouteReadinessState.INVALID_OBSERVATION
+            else:
+                observation_count += 1
+                last_error = None
+                last_state = self._classify_battle_route_readiness(
+                    observation,
+                    expected_realm,
+                    route,
+                )
+                if last_state in {
+                    _BattleRouteReadinessState.BLOCKED,
+                    _BattleRouteReadinessState.READY,
+                }:
+                    logger.debug(
+                        "Battle route readiness resolved "
+                        "route=%s expected_realm=%s state=%s observations=%d",
+                        route,
+                        expected_realm.value,
+                        last_state.value,
+                        observation_count,
+                    )
+                    return observation
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(_BATTLE_ROUTE_READINESS_POLL_SECONDS, remaining))
+
+        diagnostic_path, diagnostic_error_type = (
+            await self._capture_route_readiness_diagnostic()
+        )
+        logger.warning(
+            "Battle route readiness deadline exhausted "
+            "route=%s expected_realm=%s state=%s observations=%d "
+            "diagnostic_saved=%s diagnostic_error_type=%s",
+            route,
+            expected_realm.value,
+            last_state.value,
+            observation_count,
+            diagnostic_path is not None,
+            diagnostic_error_type or "none",
+        )
+        readiness_error = BattleRouteReadinessError(
+            route=route,
+            expected_realm=expected_realm,
+            deadline_seconds=_BATTLE_ROUTE_READINESS_DEADLINE_SECONDS,
+            observation_count=observation_count,
+            last_state=last_state.value,
+            diagnostic_path=diagnostic_path,
+            diagnostic_error_type=diagnostic_error_type,
+        )
+        if last_error is not None:
+            raise readiness_error from last_error
+        raise readiness_error
 
     async def goto_arena(self, *, expected_realm: Realm) -> bool:
         return await self._goto_battle_route("ar", expected_realm=expected_realm)
@@ -337,25 +590,15 @@ class BattleLauncher:
         )
 
         await self._get_battle_route(expected_realm, "ar")
-        landed = await self._observe_navigation(
-            "after canonical startup Battle navigation"
-        )
-        self._validate_observation_identity(
-            landed,
-            expected_realm,
-            "after canonical startup Battle navigation",
+        landed = await self._wait_for_battle_route_readiness(
+            expected_realm=expected_realm,
+            route="ar",
         )
         if landed.blocker is not None:
             return _StartupBattleRouteResult(
                 _StartupBattleRouteSource.CANONICAL_BATTLE_GET,
                 landed.blocker,
             )
-
-        await self._verify_unblocked_battle_route_destination(
-            landed,
-            expected_realm,
-            "ar",
-        )
         return _StartupBattleRouteResult(
             _StartupBattleRouteSource.CANONICAL_BATTLE_GET,
             None,

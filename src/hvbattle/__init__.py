@@ -1,5 +1,6 @@
 """Public battle-domain API."""
 
+from .battle_launcher import BattleRouteReadinessError
 from .contracts import (
     ArenaOption,
     BattleAbsent,
@@ -47,6 +48,7 @@ __all__ = [
     "BattleInterruptedError",
     "BattlePresence",
     "BattleRecoveryExhaustedError",
+    "BattleRouteReadinessError",
     "BattleLifecycle",
     "BattleRunner",
     "BattleSession",

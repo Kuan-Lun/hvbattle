@@ -352,7 +352,7 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             return_value=RingOfBloodStartOutcome.SUBMITTED
         )
 
-        self.assertTrue(await session.goto_ring_of_blood())
+        self.assertTrue(await session.goto_ring_of_blood(expected_realm=Realm.ISEKAI))
         self.assertIs(await session.inspect_ring_of_blood(), snapshot)
         self.assertIs(
             await session.start_ring_of_blood(
@@ -362,7 +362,9 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             RingOfBloodStartOutcome.SUBMITTED,
         )
 
-        session._launcher.goto_ring_of_blood.assert_awaited_once_with()
+        session._launcher.goto_ring_of_blood.assert_awaited_once_with(
+            expected_realm=Realm.ISEKAI
+        )
         session._launcher.inspect_ring_of_blood.assert_awaited_once_with()
         session._launcher.start_ring_of_blood.assert_awaited_once_with(
             option,

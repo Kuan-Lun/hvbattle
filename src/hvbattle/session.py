@@ -6,7 +6,11 @@ from pathlib import Path
 from typing import Any, Self
 
 from hv_bie.types import BattleSnapshot
-from hvbrowser import HentaiVerseSession, Realm
+from hvbrowser import (
+    HentaiVerseSession,
+    MaintenanceNavigationBlocker,
+    Realm,
+)
 from hvbrowser.runtime import (
     is_browser_generation_error,
     setup_logger,
@@ -701,14 +705,14 @@ class BattleSession:
     async def resolve_ponychart(self) -> bool:
         return await self._ponychart.check()
 
-    async def goto_arena(self) -> bool:
-        return await self._launcher.goto_arena()
+    async def goto_arena(self, *, expected_realm: Realm) -> bool:
+        return await self._launcher.goto_arena(expected_realm=expected_realm)
 
-    async def goto_ring_of_blood(self) -> bool:
-        return await self._launcher.goto_ring_of_blood()
+    async def goto_ring_of_blood(self, *, expected_realm: Realm) -> bool:
+        return await self._launcher.goto_ring_of_blood(expected_realm=expected_realm)
 
-    async def goto_grindfest(self) -> bool:
-        return await self._launcher.goto_grindfest()
+    async def goto_grindfest(self, *, expected_realm: Realm) -> bool:
+        return await self._launcher.goto_grindfest(expected_realm=expected_realm)
 
     async def go_next_floor(self) -> bool:
         elements = await wait_for_zendriver(
@@ -759,7 +763,12 @@ class BattleSession:
         return await self._launcher.start_grindfest(option)
 
     async def inspect_battle_presence(self) -> BattlePresence:
-        """Distinguish an absent, active, or awaiting-acknowledgement battle."""
+        """Inspect battle evidence in the current document only.
+
+        An ``ABSENT`` result is not authoritative at process startup because
+        the tab can still contain a stale, pre-battle document.  Startup
+        callers must use :meth:`reconcile_startup_battle_presence` instead.
+        """
 
         if await self.is_ponychart_present():
             return BattlePresence.ACTIVE
@@ -847,6 +856,54 @@ class BattleSession:
 
         logger.debug("No active battle detected.")
         return BattlePresence.ABSENT
+
+    async def reconcile_startup_battle_presence(
+        self,
+        *,
+        expected_realm: Realm,
+    ) -> BattlePresence:
+        """Resolve startup state through one trusted, realm-scoped Battle GET.
+
+        Positive current-document evidence wins only when its atomic URL and
+        marker observation proves the expected realm and canonical realm path.
+        A marker-free document causes one canonical Arena listing GET.  Its
+        absence becomes authoritative only after the same atomic observation
+        proves the expected identity and route validation succeeds.  A trusted
+        battle redirect is positive state-transition evidence rather than a
+        navigation failure.
+        """
+
+        result = await self._launcher.reconcile_startup_battle_route(
+            expected_realm=expected_realm
+        )
+        blocker = result.blocker
+        if blocker is None:
+            resolved = BattlePresence.ABSENT
+        elif blocker is MaintenanceNavigationBlocker.COMPLETION:
+            self._completion_observed = True
+            resolved = BattlePresence.COMPLETION
+        elif blocker in {
+            MaintenanceNavigationBlocker.CHALLENGE,
+            MaintenanceNavigationBlocker.NEXT_FLOOR,
+            MaintenanceNavigationBlocker.ACTIVE,
+        }:
+            resolved = BattlePresence.ACTIVE
+        else:
+            raise RuntimeError(
+                f"Unsupported startup battle navigation blocker: {blocker!r}"
+            )
+        log_resolved = (
+            logger.debug if resolved is BattlePresence.ABSENT else logger.info
+        )
+        log_resolved(
+            "Startup battle presence reconciled "
+            "source=%s blocker=%s expected_realm=%s presence=%s",
+            result.source.value,
+            "none" if blocker is None else blocker.value,
+            expected_realm.value,
+            resolved.value,
+        )
+        return resolved
 
     async def is_in_battle(self) -> bool:
         """Return whether the current page represents an active battle."""

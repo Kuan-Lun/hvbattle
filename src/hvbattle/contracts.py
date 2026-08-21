@@ -123,7 +123,7 @@ class BattleAbsent:
 
 
 class BattlePresence(StrEnum):
-    """Authoritative page state observed at a battle startup boundary."""
+    """Battle state represented by one observation or startup reconciliation."""
 
     ABSENT = "absent"
     ACTIVE = "active"

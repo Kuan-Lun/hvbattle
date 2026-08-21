@@ -5,6 +5,10 @@ safety-critical evidence decisions.
 
 It covers:
 
+- atomic startup presence reconciliation in which origin, expected realm, and
+  realm root path are trusted before a marker may become active/completion
+  evidence, while marker-free current documents remain provisional until a
+  validated canonical Battle landing;
 - next-round transition evidence and document readiness;
 - authoritative XHR/action receipts;
 - immutable action/dialog-token evidence for the exact communication-failure

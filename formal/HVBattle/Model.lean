@@ -14,6 +14,119 @@ DOM, and Python runtime correctness remain assumptions at this boundary.
 
 namespace HVBattle
 
+inductive BattlePresence where
+  | absent
+  | active
+  | completion
+  deriving DecidableEq, Repr
+
+inductive StartupNavigationBlocker where
+  | challenge
+  | completion
+  | nextFloor
+  | active
+  deriving DecidableEq, Repr
+
+inductive StartupNavigationIdentity where
+  | expected
+  | wrongRealm
+  | wrongPath
+  | untrusted
+  deriving DecidableEq, Repr
+
+inductive StartupReconciliationDecision where
+  | navigateCanonical
+  | resolved (presence : BattlePresence)
+  | rejected
+  deriving DecidableEq, Repr
+
+/-!
+URL identity and all battle markers belong to one atomic observation. A marker
+may become positive state evidence only after that same observation proves the
+trusted origin, expected realm, and exact realm root path. A marker-free current
+document, including an untrusted document, authorizes only a canonical GET. Its
+absence settles only when the canonical landing identity and route both verify.
+-/
+def startupBlockerPresence : StartupNavigationBlocker → BattlePresence
+  | .completion => .completion
+  | .challenge | .nextFloor | .active => .active
+
+def reconcileCurrentStartupObservation
+    (identity : StartupNavigationIdentity)
+    (blocker : Option StartupNavigationBlocker) :
+    StartupReconciliationDecision :=
+  match blocker with
+  | none => .navigateCanonical
+  | some blocker =>
+      if identity = .expected then
+        .resolved (startupBlockerPresence blocker)
+      else
+        .rejected
+
+def reconcileCanonicalStartupObservation
+    (identity : StartupNavigationIdentity)
+    (blocker : Option StartupNavigationBlocker)
+    (routeValidated : Bool) : StartupReconciliationDecision :=
+  if identity ≠ .expected then
+    .rejected
+  else
+    match blocker with
+    | some blocker => .resolved (startupBlockerPresence blocker)
+    | none =>
+        if routeValidated then .resolved .absent else .rejected
+
+theorem markerFreeCurrentDocumentOnlyNavigates
+    (identity : StartupNavigationIdentity) :
+    reconcileCurrentStartupObservation identity none =
+      .navigateCanonical := by
+  rfl
+
+theorem untrustedCurrentMarkerIsRejected
+    (blocker : StartupNavigationBlocker) :
+    reconcileCurrentStartupObservation .untrusted (some blocker) =
+      .rejected := by
+  simp [reconcileCurrentStartupObservation]
+
+theorem wrongRealmCurrentMarkerIsRejected
+    (blocker : StartupNavigationBlocker) :
+    reconcileCurrentStartupObservation .wrongRealm (some blocker) =
+      .rejected := by
+  simp [reconcileCurrentStartupObservation]
+
+theorem wrongPathCurrentMarkerIsRejected
+    (blocker : StartupNavigationBlocker) :
+    reconcileCurrentStartupObservation .wrongPath (some blocker) =
+      .rejected := by
+  simp [reconcileCurrentStartupObservation]
+
+theorem trustedCurrentMarkerIsAdopted
+    (blocker : StartupNavigationBlocker) :
+    reconcileCurrentStartupObservation .expected (some blocker) =
+      .resolved (startupBlockerPresence blocker) := by
+  simp [reconcileCurrentStartupObservation]
+
+theorem canonicalWrongIdentityMarkerIsRejected
+    (identity : StartupNavigationIdentity)
+    (blocker : StartupNavigationBlocker)
+    (wrong : identity ≠ .expected) :
+    reconcileCanonicalStartupObservation identity (some blocker) true =
+      .rejected := by
+  simp [reconcileCanonicalStartupObservation, wrong]
+
+theorem trustedCanonicalRedirectIsAdopted
+    (blocker : StartupNavigationBlocker) :
+    reconcileCanonicalStartupObservation .expected (some blocker) false =
+      .resolved (startupBlockerPresence blocker) := by
+  simp [reconcileCanonicalStartupObservation]
+
+theorem canonicalAbsenceRequiresValidatedRoute :
+    reconcileCanonicalStartupObservation .expected none true =
+      .resolved .absent ∧
+    reconcileCanonicalStartupObservation .expected none false =
+      .rejected := by
+  exact ⟨by simp [reconcileCanonicalStartupObservation],
+    by simp [reconcileCanonicalStartupObservation]⟩
+
 inductive DocumentReadiness where
   | loading
   | interactive

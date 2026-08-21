@@ -169,6 +169,31 @@ perform maintenance, post-battle tasks, and next-battle selection after the
 returned `BattleCompleted`. Arena choice follows the same boundary:
 `list_arena_options()` returns data and `start_arena(option)` starts only the
 option explicitly selected by the caller.
+The three `goto_*()` listing operations require an explicit `expected_realm`,
+issue one canonical realm-scoped Battle URL GET, and then validate the battle
+blocker, origin, realm, root path, query, and route-specific DOM. URL identity
+and all four battle markers come from one atomic browser observation; origin,
+expected realm, and root path are trusted before a marker may surface as a
+battle blocker. The operations do not hover, expand, inspect, or click the site
+menu, and they do not retry an unknown navigation outcome.
+
+`inspect_battle_presence()` reports only what the current document represents;
+its `ABSENT` result can describe a stale pre-battle tab and is therefore not a
+startup decision. Account orchestration must use
+`reconcile_startup_battle_presence(expected_realm=...)`. A current-document
+marker wins only when the same atomic observation proves the expected trusted
+realm and root path. A marker-free current document, including a non-HV page,
+causes one canonical Arena-listing GET for the explicit realm. A trusted
+redirect blocker for PonyChart, active battle, or next-floor is adopted as
+`ACTIVE`, and the final completion blocker is adopted as `COMPLETION`. A marker
+on an untrusted origin, wrong realm, or unexpected path is a navigation safety
+error, never battle evidence. `ABSENT` is accepted only after the GET lands on
+the validated realm-scoped route with no blocker.
+
+This atomic observation contract is the `hvbattle` 0.8 / `hvbrowser` 0.5
+package line; the dependency range intentionally rejects older or newer minor
+lines with different navigation contracts.
+
 `goto_ring_of_blood()` and `inspect_ring_of_blood()` expose every listed named
 challenge, including rows without a current start action, together with EXP
 modifiers, entry costs, and the live Tokens of Blood balance. The snapshot's

@@ -1,12 +1,22 @@
 import os
 import subprocess
 import sys
+import tomllib
 import typing
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 
 class PublicApiTests(unittest.TestCase):
+    def test_clean_break_package_line_is_exact(self) -> None:
+        project_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        with project_path.open("rb") as project_file:
+            project = tomllib.load(project_file)["project"]
+
+        self.assertEqual(project["version"], "0.8.0")
+        self.assertIn("hvbrowser>=0.5.0,<0.6", project["dependencies"])
+
     def test_import_does_not_require_credentials(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             import hvbattle

@@ -2,6 +2,8 @@
 
 import json
 import re
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -9,10 +11,11 @@ from hvbrowser import (
     HENTAIVERSE_ROOT_URL,
     HVDriver,
     MaintenanceNavigationBlockedError,
+    MaintenanceNavigationBlocker,
+    MaintenanceNavigationObservation,
     Realm,
     RealmNavigator,
-    classify_maintenance_navigation_blocker,
-    realm_from_url,
+    observe_maintenance_navigation,
 )
 from hvbrowser.runtime import (
     is_browser_generation_error,
@@ -59,7 +62,7 @@ _RING_OF_BLOOD_ATOMIC_RESULTS = frozenset(
         "missing-exact-action",
     }
 )
-_BATTLE_MENU_LABELS = {
+_BATTLE_ROUTE_LABELS = {
     "ar": "The Arena",
     "rb": "Ring of Blood",
     "gr": "GrindFest",
@@ -74,15 +77,29 @@ _BATTLE_ROUTE_READY_SCRIPTS = {
 }
 _NAVIGATION_READ_TIMEOUT_SECONDS = 5.0
 _NAVIGATION_MUTATION_TIMEOUT_SECONDS = 15.0
-_SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS = 2.0
 
 
-class _BattleMenuPageError(RuntimeError):
-    """The requested Battle menu route could not be opened or verified."""
+class _BattleRoutePageError(RuntimeError):
+    """The requested canonical Battle route could not be verified."""
 
 
-class _BattleMenuNavigationSafetyError(_BattleMenuPageError):
+class _BattleNavigationSafetyError(_BattleRoutePageError):
     """Battle state, origin, path, or realm could not be trusted."""
+
+
+class _StartupBattleRouteSource(StrEnum):
+    """Where authoritative startup battle evidence was observed."""
+
+    CURRENT_DOCUMENT = "current-document"
+    CANONICAL_BATTLE_GET = "canonical-battle-get"
+
+
+@dataclass(frozen=True, slots=True)
+class _StartupBattleRouteResult:
+    """Trusted startup route reconciliation returned to BattleSession."""
+
+    source: _StartupBattleRouteSource
+    blocker: MaintenanceNavigationBlocker | None
 
 
 def _parse_optional_exp_multiplier(value: Any) -> float | None:
@@ -139,205 +156,130 @@ class BattleLauncher:
     async def _path_prefix(self) -> str:
         return "/isekai" if await self.realm.current() is Realm.ISEKAI else ""
 
-    async def _goto_via_battle_menu(self, route: str) -> bool:
-        label = _BATTLE_MENU_LABELS[route]
-        realm = await self._trusted_current_realm()
-        try:
-            await self._open_battle_route_from_menu(realm, route)
-            return True
-        except MaintenanceNavigationBlockedError:
-            raise
-        except _BattleMenuNavigationSafetyError:
-            raise
-        except _BattleMenuPageError as error:
-            logger.warning(
-                "Battle menu navigation did not open the requested page; "
-                "retrying once through the realm-scoped direct URL: "
-                "kind=%s realm=%s error_type=%s",
-                label,
-                realm.value,
-                type(error).__name__,
-            )
+    async def _goto_battle_route(
+        self,
+        route: str,
+        *,
+        expected_realm: Realm,
+    ) -> bool:
+        self._validate_expected_realm(expected_realm)
+        current = await self._observe_navigation("before direct Battle navigation")
+        self._validate_observation_identity(
+            current,
+            expected_realm,
+            "before direct Battle navigation",
+        )
+        self._raise_if_blocked(current)
 
-        await self._open_battle_route_directly(realm, route)
+        await self._get_battle_route(expected_realm, route)
+        landed = await self._observe_navigation(
+            f"after opening {_BATTLE_ROUTE_LABELS[route]}"
+        )
+        self._validate_observation_identity(
+            landed,
+            expected_realm,
+            f"after opening {_BATTLE_ROUTE_LABELS[route]}",
+        )
+        self._raise_if_blocked(landed)
+        await self._verify_unblocked_battle_route_destination(
+            landed,
+            expected_realm,
+            route,
+        )
         return True
 
-    async def _open_battle_route_from_menu(
+    async def _get_battle_route(
         self,
-        realm: Realm,
+        expected_realm: Realm,
         route: str,
     ) -> None:
-        await self._ensure_battle_navigation_is_safe("before opening Battle menu")
-        try:
-            battle_menu = await wait_for_zendriver(
-                self.page.select(
-                    "#parent_Battle", timeout=_NAVIGATION_READ_TIMEOUT_SECONDS
-                ),
-                timeout=(
-                    _NAVIGATION_READ_TIMEOUT_SECONDS
-                    + _SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS
-                ),
-                owner=self.page,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise _BattleMenuPageError("Battle menu is missing") from error
-        if battle_menu is None:
-            raise _BattleMenuPageError("Battle menu is missing")
-
-        menu_xpath = (
-            "//*[@id='child_Battle']"
-            "//*[@onclick and contains(@onclick, 's=Battle') "
-            f"and contains(@onclick, 'ss={route}')]"
-            " | //*[@id='child_Battle']//a[contains(@href, 's=Battle') "
-            f"and contains(@href, 'ss={route}')]"
-        )
-        try:
-            target_elements = await wait_for_zendriver(
-                self.page.xpath(menu_xpath, timeout=5),
-                timeout=(
-                    _NAVIGATION_READ_TIMEOUT_SECONDS
-                    + _SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS
-                ),
-                owner=self.page,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise _BattleMenuPageError(
-                f"Unable to find {_BATTLE_MENU_LABELS[route]} in the Battle menu"
-            ) from error
-        if not target_elements:
-            raise _BattleMenuPageError(
-                f"Unable to find {_BATTLE_MENU_LABELS[route]} in the Battle menu"
-            )
-
-        target = target_elements[0]
-        try:
-            await wait_for_zendriver(
-                battle_menu.mouse_move(),
-                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
-                owner=battle_menu,
-            )
-            await wait_for_zendriver(
-                target.mouse_move(),
-                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
-                owner=target,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise _BattleMenuPageError(
-                f"Unable to prepare {_BATTLE_MENU_LABELS[route]} navigation"
-            ) from error
-
-        try:
-            await self.browser.wait(
-                target.mouse_click,
-                ischangeurl=True,
-                owner=target,
-                operation_timeout=_NAVIGATION_MUTATION_TIMEOUT_SECONDS,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise _BattleMenuNavigationSafetyError(
-                f"The {_BATTLE_MENU_LABELS[route]} click outcome is unknown"
-            ) from error
-
-        await self._verify_battle_route_destination(realm, route)
-
-    async def _open_battle_route_directly(
-        self,
-        realm: Realm,
-        route: str,
-    ) -> None:
-        await self._ensure_battle_navigation_is_safe("before direct Battle navigation")
-        direct_url = self._battle_route_url(realm, route)
+        direct_url = self._battle_route_url(expected_realm, route)
         try:
             await self.browser.get(direct_url)
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
-            raise _BattleMenuNavigationSafetyError(
-                f"The direct {_BATTLE_MENU_LABELS[route]} navigation outcome is "
+            raise _BattleNavigationSafetyError(
+                f"The direct {_BATTLE_ROUTE_LABELS[route]} navigation outcome is "
                 "unknown"
             ) from error
 
-        await self._verify_battle_route_destination(realm, route)
-
-    async def _trusted_current_realm(self) -> Realm:
+    async def _observe_navigation(
+        self,
+        context: str,
+    ) -> MaintenanceNavigationObservation:
         try:
-            realm = await self.realm.current()
+            return await observe_maintenance_navigation(self.page)
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
-            raise _BattleMenuNavigationSafetyError(
-                "Unable to determine the current Battle navigation realm"
+            raise _BattleNavigationSafetyError(
+                f"Unable to observe trusted Battle navigation state {context}"
             ) from error
-        if not isinstance(realm, Realm):
-            raise _BattleMenuNavigationSafetyError("Battle navigation realm is invalid")
-        return realm
 
-    async def _ensure_battle_navigation_is_safe(self, context: str) -> None:
+    @staticmethod
+    def _validate_expected_realm(expected_realm: Realm) -> None:
+        if not isinstance(expected_realm, Realm):
+            raise TypeError("expected_realm must be a Realm")
+
+    @staticmethod
+    def _validate_observation_identity(
+        observation: MaintenanceNavigationObservation,
+        expected_realm: Realm,
+        context: str,
+    ) -> None:
+        if observation.realm is None:
+            raise _BattleNavigationSafetyError(
+                f"Battle navigation has an untrusted origin {context}"
+            )
+        if observation.realm is not expected_realm:
+            raise _BattleNavigationSafetyError(
+                f"Battle navigation is in the wrong realm {context}"
+            )
         try:
-            blocker = await classify_maintenance_navigation_blocker(self.page)
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise _BattleMenuNavigationSafetyError(
-                f"Unable to verify battle state {context}"
+            path = urlsplit(observation.url).path
+        except ValueError as error:
+            raise _BattleNavigationSafetyError(
+                f"Battle navigation URL is invalid {context}"
             ) from error
-        if blocker is not None:
-            raise MaintenanceNavigationBlockedError(blocker)
+        expected_path = "/isekai/" if expected_realm is Realm.ISEKAI else "/"
+        if path != expected_path:
+            raise _BattleNavigationSafetyError(
+                f"Battle navigation landed on an unexpected path {context}"
+            )
+
+    @staticmethod
+    def _raise_if_blocked(observation: MaintenanceNavigationObservation) -> None:
+        if observation.blocker is not None:
+            raise MaintenanceNavigationBlockedError(observation.blocker)
 
     @staticmethod
     def _battle_route_url(realm: Realm, route: str) -> str:
         path_prefix = "/isekai" if realm is Realm.ISEKAI else ""
         return f"{HENTAIVERSE_ROOT_URL}{path_prefix}/?s=Battle&ss={route}"
 
-    async def _verify_battle_route_destination(
+    async def _verify_unblocked_battle_route_destination(
         self,
-        realm: Realm,
+        observation: MaintenanceNavigationObservation,
+        expected_realm: Realm,
         route: str,
     ) -> None:
-        await self._ensure_battle_navigation_is_safe(
-            f"after opening {_BATTLE_MENU_LABELS[route]}"
+        self._validate_observation_identity(
+            observation,
+            expected_realm,
+            f"while verifying {_BATTLE_ROUTE_LABELS[route]}",
         )
-        try:
-            current_url = await wait_for_zendriver(
-                self.page.evaluate("window.location.href"),
-                timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-            landed_realm = realm_from_url(current_url)
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise _BattleMenuNavigationSafetyError(
-                f"Unable to verify the {_BATTLE_MENU_LABELS[route]} URL"
-            ) from error
-        if landed_realm is not realm:
-            raise _BattleMenuNavigationSafetyError(
-                "Battle navigation landed in the wrong realm"
-            )
-        if not isinstance(current_url, str):
-            raise _BattleMenuNavigationSafetyError("Battle URL is invalid")
-        parsed_url = urlsplit(current_url)
-        expected_path = "/isekai/" if realm is Realm.ISEKAI else "/"
-        if parsed_url.path != expected_path:
-            raise _BattleMenuNavigationSafetyError(
-                "Battle navigation landed on an unexpected path"
-            )
+        if observation.blocker is not None:
+            raise AssertionError("Blocked Battle route reached unblocked verifier")
+        parsed_url = urlsplit(observation.url)
         query = parse_qs(parsed_url.query, keep_blank_values=True)
         expected_query = {
             "s": ["Battle"],
             "ss": [route],
         }
         if any(query.get(key) != value for key, value in expected_query.items()):
-            raise _BattleMenuPageError(
-                f"Battle navigation did not land on {_BATTLE_MENU_LABELS[route]}"
+            raise _BattleRoutePageError(
+                f"Battle navigation did not land on {_BATTLE_ROUTE_LABELS[route]}"
             )
         try:
             route_ready = await wait_for_zendriver(
@@ -348,22 +290,76 @@ class BattleLauncher:
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
-            raise _BattleMenuPageError(
-                f"Unable to inspect {_BATTLE_MENU_LABELS[route]} page structure"
+            raise _BattleRoutePageError(
+                f"Unable to inspect {_BATTLE_ROUTE_LABELS[route]} page structure"
             ) from error
         if route_ready is not True:
-            raise _BattleMenuPageError(
-                f"{_BATTLE_MENU_LABELS[route]} page structure is not ready"
+            raise _BattleRoutePageError(
+                f"{_BATTLE_ROUTE_LABELS[route]} page structure is not ready"
             )
 
-    async def goto_arena(self) -> bool:
-        return await self._goto_via_battle_menu("ar")
+    async def goto_arena(self, *, expected_realm: Realm) -> bool:
+        return await self._goto_battle_route("ar", expected_realm=expected_realm)
 
-    async def goto_ring_of_blood(self) -> bool:
-        return await self._goto_via_battle_menu("rb")
+    async def goto_ring_of_blood(self, *, expected_realm: Realm) -> bool:
+        return await self._goto_battle_route("rb", expected_realm=expected_realm)
 
-    async def goto_grindfest(self) -> bool:
-        return await self._goto_via_battle_menu("gr")
+    async def goto_grindfest(self, *, expected_realm: Realm) -> bool:
+        return await self._goto_battle_route("gr", expected_realm=expected_realm)
+
+    async def reconcile_startup_battle_route(
+        self,
+        *,
+        expected_realm: Realm,
+    ) -> _StartupBattleRouteResult:
+        """Reconcile startup markers against one explicit realm trust boundary."""
+
+        self._validate_expected_realm(expected_realm)
+        current = await self._observe_navigation("in the current startup document")
+        if current.blocker is not None:
+            self._validate_observation_identity(
+                current,
+                expected_realm,
+                "in the current startup document",
+            )
+            return _StartupBattleRouteResult(
+                _StartupBattleRouteSource.CURRENT_DOCUMENT,
+                current.blocker,
+            )
+
+        current_realm = "untrusted" if current.realm is None else current.realm.value
+        logger.debug(
+            "Startup battle presence is provisional "
+            "source=current-document blocker=none expected_realm=%s "
+            "current_realm=%s",
+            expected_realm.value,
+            current_realm,
+        )
+
+        await self._get_battle_route(expected_realm, "ar")
+        landed = await self._observe_navigation(
+            "after canonical startup Battle navigation"
+        )
+        self._validate_observation_identity(
+            landed,
+            expected_realm,
+            "after canonical startup Battle navigation",
+        )
+        if landed.blocker is not None:
+            return _StartupBattleRouteResult(
+                _StartupBattleRouteSource.CANONICAL_BATTLE_GET,
+                landed.blocker,
+            )
+
+        await self._verify_unblocked_battle_route_destination(
+            landed,
+            expected_realm,
+            "ar",
+        )
+        return _StartupBattleRouteResult(
+            _StartupBattleRouteSource.CANONICAL_BATTLE_GET,
+            None,
+        )
 
     async def list_arena_options(self) -> tuple[ArenaOption, ...]:
         """Return Arena choices without selecting one for the client."""

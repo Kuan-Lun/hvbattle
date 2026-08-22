@@ -116,3 +116,5 @@ jobs:
       - name: Publish
         if: steps.version.outputs.publish == 'true'
         uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          attestations: false

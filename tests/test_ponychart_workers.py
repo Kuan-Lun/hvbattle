@@ -17,6 +17,11 @@ from hvbattle._ponychart_workers import (
     PonyChartRetentionOwner,
 )
 
+# ``spawn`` starts a fresh interpreter and can be slow on shared CI runners.
+# The owner reserves one second of this total budget for deterministic cleanup,
+# leaving four seconds for an expected-success worker startup and READY frame.
+_TEST_WORKER_STARTUP_TIMEOUT_SECONDS = 5.0
+
 
 def _fake_inference_worker(
     connection: workers._InferenceChannel,
@@ -282,7 +287,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
             self.owner.close_sync(timeout=1.0)
 
     def test_sync_cached_prepare_rejects_result_after_ready_deadline(self) -> None:
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         original_state_for = self.owner._state_for
 
         def slow_state_for(
@@ -300,7 +308,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_cached_prepare_rejects_result_after_ready_deadline(
         self,
     ) -> None:
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         original_state_for = self.owner._state_for
 
         def slow_state_for(
@@ -321,7 +332,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_async_second_cache_check_cannot_return_after_deadline(
         self,
     ) -> None:
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         state = self.owner._states[self.descriptor.generation]
         call_count = 0
 
@@ -384,7 +398,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_prepared_worker_matches_request_id_and_reuses_loaded_process(
         self,
     ) -> None:
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(self.descriptor)
         state = self.owner._states[self.descriptor.generation]
 
@@ -396,7 +413,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.owner._states[self.descriptor.generation], state)
 
     async def test_success_unlinks_parent_owned_shared_memory(self) -> None:
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(self.descriptor)
 
         (shared_memory_name,) = await self.owner.predict(
@@ -411,7 +431,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_deadline_expired_after_image_copy_does_not_send_request(
         self,
     ) -> None:
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(self.descriptor)
         state = self.owner._states[self.descriptor.generation]
         connection = state.connection
@@ -436,7 +459,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
             worker_target=_partial_prediction_worker,
             register_atexit=False,
         )
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(self.descriptor)
 
         with self.assertRaises(TimeoutError):
@@ -467,7 +493,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_worker_attach_finishing_after_deadline_is_rejected(
         self,
     ) -> None:
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(self.descriptor)
         state = self.owner._states.pop(self.descriptor.generation)
         lease = self.owner.reserve(self.descriptor)
@@ -518,7 +547,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         marker = Path(self.directory.name) / "request-started"
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(self.descriptor)
 
         with self.assertRaisesRegex(TimeoutError, "semantic deadline"):
@@ -533,13 +565,20 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
             SharedMemory(name=shared_memory_name, track=False)
         self.assertNotIn(self.descriptor.generation, self.owner._states)
         self.assertEqual(
-            await self.owner.predict(self.descriptor, b"rebuilt", timeout=1.0),
+            await self.owner.predict(
+                self.descriptor,
+                b"rebuilt",
+                timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+            ),
             ("rebuilt",),
         )
 
     async def test_cancellation_reaps_request_worker_before_propagating(self) -> None:
         marker = Path(self.directory.name) / "cancel-request-started"
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(self.descriptor)
         prediction = asyncio.create_task(
             self.owner.predict(
@@ -576,7 +615,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
             worker_target=_stubborn_inference_worker,
             register_atexit=False,
         )
-        self.owner.prepare(descriptor, timeout=1.0)
+        self.owner.prepare(
+            descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(descriptor)
 
         with self.assertRaises(TimeoutError):
@@ -588,14 +630,17 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_generation_swap_retires_old_worker_after_exact_lease(self) -> None:
         marker = Path(self.directory.name) / "old-request"
         release = marker.with_suffix(".release")
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(self.descriptor)
         old_state = self.owner._states[self.descriptor.generation]
         old_prediction = asyncio.create_task(
             self.owner.predict(
                 self.descriptor,
                 f"block:{marker}".encode(),
-                timeout=2.0,
+                timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
             )
         )
         for _ in range(100):
@@ -609,7 +654,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
             Path(self.directory.name) / "new-model.onnx",
             Path(self.directory.name) / "new-thresholds.json",
         )
-        self.owner.prepare(replacement, timeout=1.0)
+        self.owner.prepare(
+            replacement,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         retired = self.owner.activate(replacement)
         self.owner.retire_superseded(retired, timeout=1.0)
 
@@ -628,7 +676,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         marker = Path(self.directory.name) / "close-request"
-        self.owner.prepare(self.descriptor, timeout=1.0)
+        self.owner.prepare(
+            self.descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(self.descriptor)
         prediction = asyncio.create_task(
             self.owner.predict(
@@ -667,7 +718,10 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
             worker_target=_stubborn_inference_worker,
             register_atexit=False,
         )
-        self.owner.prepare(descriptor, timeout=1.0)
+        self.owner.prepare(
+            descriptor,
+            timeout=_TEST_WORKER_STARTUP_TIMEOUT_SECONDS,
+        )
         self.owner.activate(descriptor)
         prediction = asyncio.create_task(
             self.owner.predict(descriptor, b"hang", timeout=2.0)

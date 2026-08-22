@@ -4,8 +4,6 @@ from collections import deque
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
-from hvbrowser.runtime import LogPersistenceError, ZendriverOperationTimeout
-
 from hvbattle import (
     BattleAbsent,
     BattleActionKind,
@@ -51,6 +49,7 @@ class _StepSession:
         self.realm_probes = 0
         self.battle_probes = 0
         self.prepare_calls = 0
+        self.prepare_timeouts: list[float | None] = []
         self.go_next_floor = AsyncMock(return_value=True)
         self.acknowledge_battle_completion = AsyncMock()
         self.recover_unknown_action = AsyncMock(return_value=True)
@@ -82,8 +81,13 @@ class _StepSession:
             return self._ponychart_results.popleft()
         return False
 
-    async def prepare_turn_state(self) -> BattleTurnState:
+    async def prepare_turn_state(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> BattleTurnState:
         self.prepare_calls += 1
+        self.prepare_timeouts.append(timeout)
         phase = self._phases.popleft()
         if phase in {BattleTurnPhase.ACTIVE, BattleTurnPhase.NEXT_FLOOR}:
             self.turn += 1
@@ -384,7 +388,7 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(completed, BattleCompleted)
         sleep.assert_awaited_once_with(3)
 
-    async def test_retryable_timeout_is_a_cooperative_deferred_result(self) -> None:
+    async def test_unclassified_timeout_is_immediately_terminal(self) -> None:
         session = _StepSession(BattleTurnPhase.ACTIVE)
         session.prepare_turn_state = AsyncMock(side_effect=TimeoutError("read"))
         strategy = Mock()
@@ -393,22 +397,8 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         runner = BattleRunner(  # type: ignore[arg-type]
             session,
             strategy,
-            timeout_retries=2,
-            retry_delay=7,
             sleep=sleep,
         )
-
-        deferred = await runner.step()
-
-        self.assertEqual(
-            deferred,
-            BattleStepIdle(
-                retry_after=7,
-                reason=BattleStepIdleReason.RETRYABLE_TIMEOUT,
-            ),
-        )
-        sleep.assert_not_awaited()
-        strategy.take_turn.assert_not_awaited()
 
         with self.assertRaisesRegex(
             BattleInterruptedError,
@@ -417,6 +407,9 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             await runner.step()
 
         self.assertEqual(raised.exception.diagnostic_code, "battle.turn-timeout")
+        session.prepare_turn_state.assert_awaited_once()
+        sleep.assert_not_awaited()
+        strategy.take_turn.assert_not_awaited()
 
     async def test_state_not_ready_yields_without_policy_or_mutation(self) -> None:
         session = _StepSession(BattleTurnPhase.NOT_READY)
@@ -480,17 +473,19 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         strategy = Mock()
         strategy.take_turn = AsyncMock(return_value=TurnDecision.IDLE)
-        clock = Mock(side_effect=[0.0, 100.0])
+        now = 0.0
         runner = BattleRunner(  # type: ignore[arg-type]
             session,
             strategy,
-            state_readiness_timeout=30,
+            state_readiness_timeout=5,
             sleep=AsyncMock(),
-            clock=clock,
+            clock=lambda: now,
         )
 
         first = await runner.step()
+        now = 1.0
         active = await runner.step()
+        now = 100.0
         second = await runner.step()
 
         self.assertIsInstance(first, BattleStepIdle)
@@ -498,152 +493,143 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             second,
             BattleStepIdle(
-                retry_after=2,
+                retry_after=0.25,
                 reason=BattleStepIdleReason.STATE_NOT_READY,
             ),
         )
+        self.assertEqual(session.prepare_timeouts, [5.0, 4.0, 5.0])
         session.save_page_diagnostic.assert_not_awaited()
 
-    async def test_state_readiness_exhaustion_captures_one_diagnostic(
+    async def test_exact_readiness_expiry_starts_no_probe_or_diagnostic(
         self,
     ) -> None:
         session = _StepSession(
             BattleTurnPhase.NOT_READY,
-            BattleTurnPhase.NOT_READY,
-            BattleTurnPhase.NOT_READY,
+            BattleTurnPhase.ACTIVE,
         )
         strategy = Mock()
         strategy.on_battle_started = AsyncMock()
         strategy.take_turn = AsyncMock()
-        clock = Mock(side_effect=[0.0, 30.0, 31.0])
+        now = 0.0
         runner = BattleRunner(  # type: ignore[arg-type]
             session,
             strategy,
-            state_readiness_timeout=30,
+            state_readiness_timeout=5,
             sleep=AsyncMock(),
-            clock=clock,
+            clock=lambda: now,
         )
 
         first = await runner.step()
-        with self.assertRaises(BattleStateReadinessError) as first_error:
-            await runner.step()
-        with self.assertRaises(BattleStateReadinessError) as second_error:
+        now = 5.0
+        with self.assertRaises(BattleStateReadinessError) as raised:
             await runner.step()
 
         self.assertIsInstance(first, BattleStepIdle)
         self.assertEqual(
-            first_error.exception.diagnostic_code,
+            raised.exception.diagnostic_code,
             "battle.state-readiness-exhausted",
         )
-        self.assertEqual(first_error.exception.observation_count, 2)
-        self.assertEqual(
-            first_error.exception.diagnostic_path,
-            "diagnostics/battle_state_not_ready_1.html",
-        )
-        self.assertEqual(second_error.exception.observation_count, 3)
-        session.save_page_diagnostic.assert_awaited_once_with("battle_state_not_ready")
+        self.assertEqual(raised.exception.observation_count, 1)
+        self.assertIsNone(raised.exception.diagnostic_path)
+        self.assertIsNone(raised.exception.diagnostic_error_type)
+        self.assertEqual(session.prepare_calls, 1)
+        self.assertEqual(session.prepare_timeouts, [5.0])
+        session.save_page_diagnostic.assert_not_awaited()
         strategy.on_battle_started.assert_not_awaited()
         strategy.take_turn.assert_not_awaited()
 
-    async def test_ordinary_diagnostic_failure_preserves_readiness_error(
+    async def test_final_readiness_probe_returning_at_expiry_is_rejected(
         self,
     ) -> None:
         session = _StepSession(
             BattleTurnPhase.NOT_READY,
-            BattleTurnPhase.NOT_READY,
+            BattleTurnPhase.ACTIVE,
         )
-        session.save_page_diagnostic.side_effect = ValueError("capture failed")
         strategy = Mock()
         strategy.take_turn = AsyncMock()
+        now = 0.0
         runner = BattleRunner(  # type: ignore[arg-type]
             session,
             strategy,
-            state_readiness_timeout=30,
+            state_readiness_timeout=5,
             sleep=AsyncMock(),
-            clock=Mock(side_effect=[0.0, 30.0]),
+            clock=lambda: now,
         )
 
         await runner.step()
+        original_prepare = session.prepare_turn_state
+
+        async def finish_at_deadline(
+            *, timeout: float | None = None
+        ) -> BattleTurnState:
+            nonlocal now
+            self.assertEqual(timeout, 5.0)
+            now = 5.0
+            return await original_prepare(timeout=timeout)
+
+        session.prepare_turn_state = AsyncMock(side_effect=finish_at_deadline)  # type: ignore[method-assign]
+        with self.assertRaises(BattleStateReadinessError):
+            await runner.step()
+
+        strategy.take_turn.assert_not_awaited()
+        session.save_page_diagnostic.assert_not_awaited()
+
+    async def test_initial_read_uses_and_cannot_outlive_readiness_deadline(
+        self,
+    ) -> None:
+        session = _StepSession(BattleTurnPhase.NOT_READY)
+        strategy = Mock()
+        strategy.take_turn = AsyncMock()
+        now = 0.0
+        runner = BattleRunner(  # type: ignore[arg-type]
+            session,
+            strategy,
+            state_readiness_timeout=5,
+            sleep=AsyncMock(),
+            clock=lambda: now,
+        )
+        original_prepare = session.prepare_turn_state
+
+        async def finish_at_deadline(
+            *, timeout: float | None = None
+        ) -> BattleTurnState:
+            nonlocal now
+            self.assertEqual(timeout, 5.0)
+            now = 5.0
+            return await original_prepare(timeout=timeout)
+
+        session.prepare_turn_state = AsyncMock(side_effect=finish_at_deadline)  # type: ignore[method-assign]
+
         with self.assertRaises(BattleStateReadinessError) as raised:
             await runner.step()
 
-        self.assertIsNone(raised.exception.diagnostic_path)
-        self.assertEqual(raised.exception.diagnostic_error_type, "ValueError")
-        session.save_page_diagnostic.assert_awaited_once_with("battle_state_not_ready")
-
-    async def test_nested_log_failure_during_diagnostic_propagates(self) -> None:
-        session = _StepSession(
-            BattleTurnPhase.NOT_READY,
-            BattleTurnPhase.NOT_READY,
-        )
-        persistence_error = LogPersistenceError("write", OSError("disk full"))
-        wrapper = RuntimeError("diagnostic wrapper")
-        wrapper.__cause__ = persistence_error
-        session.save_page_diagnostic.side_effect = wrapper
-        strategy = Mock()
-        strategy.take_turn = AsyncMock()
-        runner = BattleRunner(  # type: ignore[arg-type]
-            session,
-            strategy,
-            state_readiness_timeout=30,
-            sleep=AsyncMock(),
-            clock=Mock(side_effect=[0.0, 30.0]),
-        )
-
-        await runner.step()
-        with self.assertRaises(RuntimeError) as raised:
-            await runner.step()
-
-        self.assertIs(raised.exception, wrapper)
-        self.assertIs(raised.exception.__cause__, persistence_error)
-
-    async def test_generation_failure_during_diagnostic_has_generation_code(
-        self,
-    ) -> None:
-        session = _StepSession(
-            BattleTurnPhase.NOT_READY,
-            BattleTurnPhase.NOT_READY,
-        )
-        generation_error = ZendriverOperationTimeout(timeout_seconds=5.0)
-        session.save_page_diagnostic.side_effect = generation_error
-        strategy = Mock()
-        strategy.take_turn = AsyncMock()
-        runner = BattleRunner(  # type: ignore[arg-type]
-            session,
-            strategy,
-            state_readiness_timeout=30,
-            sleep=AsyncMock(),
-            clock=Mock(side_effect=[0.0, 30.0]),
-        )
-
-        await runner.step()
-        with self.assertRaises(BattleInterruptedError) as raised:
-            await runner.step()
-
-        self.assertEqual(
-            raised.exception.diagnostic_code,
-            "battle.browser-operation-timeout",
-        )
-        self.assertIs(raised.exception.__cause__, generation_error)
+        self.assertEqual(raised.exception.observation_count, 1)
+        self.assertEqual(session.prepare_calls, 1)
+        strategy.take_turn.assert_not_awaited()
+        session.save_page_diagnostic.assert_not_awaited()
 
     async def test_ponychart_progress_resets_readiness_deadline(self) -> None:
         session = _StepSession(
             BattleTurnPhase.NOT_READY,
+            BattleTurnPhase.CHALLENGE,
             BattleTurnPhase.NOT_READY,
         )
         strategy = Mock()
         strategy.take_turn = AsyncMock()
+        now = 0.0
         runner = BattleRunner(  # type: ignore[arg-type]
             session,
             strategy,
-            state_readiness_timeout=30,
+            state_readiness_timeout=5,
             sleep=AsyncMock(),
-            clock=Mock(side_effect=[0.0, 100.0]),
+            clock=lambda: now,
         )
 
         first = await runner.step()
         session._ponychart_results.append(True)
+        now = 1.0
         challenge = await runner.step()
+        now = 100.0
         second = await runner.step()
 
         self.assertIsInstance(first, BattleStepIdle)
@@ -660,7 +646,7 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             second,
             BattleStepIdle(
-                retry_after=2,
+                retry_after=0.25,
                 reason=BattleStepIdleReason.STATE_NOT_READY,
             ),
         )
@@ -710,33 +696,45 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         strategy = Mock()
         strategy.take_turn = AsyncMock()
         sleep = AsyncMock()
+        now = 0.0
         runner = BattleRunner(  # type: ignore[arg-type]
             session,
             strategy,
             idle_delay=4,
-            transition_checks=2,
             sleep=sleep,
+            clock=lambda: now,
         )
 
         first = await runner.step()
         session._active = False
+        now = 4.0
         second = await runner.step()
 
-        expected = BattleStepIdle(
-            retry_after=4,
-            reason=BattleStepIdleReason.TRANSITION_CONFIRMATION,
+        self.assertEqual(
+            first,
+            BattleStepIdle(
+                retry_after=4,
+                reason=BattleStepIdleReason.TRANSITION_CONFIRMATION,
+            ),
         )
-        self.assertEqual(first, expected)
-        self.assertEqual(second, expected)
-        self.assertEqual(session.battle_probes, 2)
+        self.assertEqual(
+            second,
+            BattleStepIdle(
+                retry_after=1,
+                reason=BattleStepIdleReason.TRANSITION_CONFIRMATION,
+            ),
+        )
+        self.assertEqual(session.battle_probes, 1)
         sleep.assert_not_awaited()
         strategy.take_turn.assert_not_awaited()
 
+        now = 5.0
         with self.assertRaisesRegex(
             BattleInterruptedError,
             "disappeared without positive completion evidence",
         ):
             await runner.step()
+        self.assertEqual(session.prepare_calls, 2)
 
     async def test_stop_returns_control_without_freezing_active_runner(self) -> None:
         session = _StepSession(BattleTurnPhase.ACTIVE, BattleTurnPhase.ACTIVE)
@@ -821,11 +819,23 @@ class CooperativeStepContractTests(unittest.TestCase):
                     challenge_poll_interval=value,
                 )
 
+    def test_runner_idle_delay_requires_a_finite_non_negative_number(self) -> None:
+        for value in (-1, float("inf"), float("nan"), True, "2"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "finite and non-negative"),
+            ):
+                BattleRunner(  # type: ignore[arg-type]
+                    Mock(),
+                    Mock(),
+                    idle_delay=value,
+                )
+
     def test_state_readiness_settings_are_bounded_numbers(self) -> None:
-        for value in (-1, float("inf"), float("nan"), True, "30"):
+        for value in (0, -1, 5.1, float("inf"), float("nan"), True, "30"):
             with (
                 self.subTest(timeout=value),
-                self.assertRaisesRegex(ValueError, "finite and non-negative"),
+                self.assertRaisesRegex(ValueError, "in \\(0, 5] seconds"),
             ):
                 BattleRunner(  # type: ignore[arg-type]
                     Mock(),

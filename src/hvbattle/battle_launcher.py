@@ -21,13 +21,14 @@ from hvbrowser import (
     realm_from_url,
 )
 from hvbrowser.runtime import (
-    LogPersistenceError,
     is_browser_generation_error,
     setup_logger,
     wait_for_zendriver,
 )
 
 from ._failure_safety import contains_log_persistence_error
+from ._page_lifecycle import MainFrameDOMContentLoadedWaiter
+from ._timing import PROTOCOL_TIMEOUT_SECONDS, SemanticDeadline, protocol_timeout
 from .contracts import (
     ArenaOption,
     GrindfestOption,
@@ -60,7 +61,11 @@ _TOKEN_COST_PATTERN = re.compile(
 _RING_OF_BLOOD_ATOMIC_RESULTS = frozenset(
     {
         "submitted",
+        "insufficient-tokens",
+        "state-changed",
+        "option-unavailable",
         "unexpected-page",
+        "invalid-state",
         "missing-table",
         "missing-initid",
         "missing-initform",
@@ -81,10 +86,11 @@ _BATTLE_ROUTE_READY_EXPRESSIONS = {
     "gr": "Boolean(document.getElementById('grindfest'))",
 }
 _NAVIGATION_READ_TIMEOUT_SECONDS = 5.0
-_NAVIGATION_MUTATION_TIMEOUT_SECONDS = 15.0
+_NAVIGATION_MUTATION_TIMEOUT_SECONDS = PROTOCOL_TIMEOUT_SECONDS
 _BATTLE_ROUTE_READINESS_DEADLINE_SECONDS = 10.0
+_BATTLE_FORM_RECEIPT_DEADLINE_SECONDS = 15.0
+_BATTLE_FORM_PRE_SUBMIT_DEADLINE_SECONDS = PROTOCOL_TIMEOUT_SECONDS
 _BATTLE_ROUTE_READINESS_POLL_SECONDS = 0.2
-_BATTLE_ROUTE_DIAGNOSTIC_KIND = "battle_route_not_ready"
 
 
 class BattleRouteReadinessError(RuntimeError):
@@ -98,30 +104,25 @@ class BattleRouteReadinessError(RuntimeError):
         deadline_seconds: float,
         observation_count: int,
         last_state: str,
-        diagnostic_path: str | None,
-        diagnostic_error_type: str | None,
     ) -> None:
         self.route = route
         self.expected_realm = expected_realm
         self.deadline_seconds = deadline_seconds
         self.observation_count = observation_count
         self.last_state = last_state
-        self.diagnostic_path = diagnostic_path
-        self.diagnostic_error_type = diagnostic_error_type
 
-        message = (
+        super().__init__(
             f"{_BATTLE_ROUTE_LABELS[route]} did not become ready within "
             f"{deadline_seconds:g}s; last_state={last_state}"
         )
-        if diagnostic_path is not None:
-            message += f"; diagnostic saved to {diagnostic_path}"
-        elif diagnostic_error_type is not None:
-            message += f"; diagnostic capture failed ({diagnostic_error_type})"
-        super().__init__(message)
 
 
 class _BattleNavigationSafetyError(RuntimeError):
     """Battle state, origin, path, or realm could not be trusted."""
+
+
+class _BattleFormOutcomeUnknownError(RuntimeError):
+    """A submitted form lacked a trusted battle-state receipt."""
 
 
 class _BattleRouteReadinessState(StrEnum):
@@ -272,8 +273,181 @@ class BattleLauncher:
     def page(self) -> Any:
         return self.browser.page
 
-    async def _path_prefix(self) -> str:
-        return "/isekai" if await self.realm.current() is Realm.ISEKAI else ""
+    def _main_document_lifecycle(self) -> MainFrameDOMContentLoadedWaiter:
+        return MainFrameDOMContentLoadedWaiter(self.page)
+
+    async def _submit_battle_form(
+        self,
+        script: str,
+        *,
+        kind: str,
+        battle_id: int,
+        route: str,
+        expected_realm: Realm,
+    ) -> object:
+        """Submit once and prove its battle receipt within one deadline."""
+
+        deadline = SemanticDeadline.after(_BATTLE_FORM_RECEIPT_DEADLINE_SECONDS)
+        pre_submit_deadline = deadline.capped(_BATTLE_FORM_PRE_SUBMIT_DEADLINE_SECONDS)
+        lifecycle = self._main_document_lifecycle()
+        mutation_started = False
+        acknowledgement_error: Exception | None = None
+        try:
+            await lifecycle.enable(deadline=pre_submit_deadline)
+            operation_timeout = protocol_timeout(
+                min(
+                    _NAVIGATION_MUTATION_TIMEOUT_SECONDS,
+                    pre_submit_deadline.remaining(),
+                )
+            )
+            lifecycle.trigger()
+            mutation_started = True
+            try:
+                result = await wait_for_zendriver(
+                    self.page.evaluate(script),
+                    timeout=operation_timeout,
+                    owner=self.page,
+                )
+            except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
+                acknowledgement_error = error
+                result = None
+
+            if acknowledgement_error is None and pre_submit_deadline.remaining() <= 0:
+                acknowledgement_error = TimeoutError(
+                    "Battle form submission acknowledgement arrived after its "
+                    "pre-submit deadline"
+                )
+
+            if result == "submitted" or acknowledgement_error is not None:
+                try:
+                    await lifecycle.wait(deadline)
+                    blocker = await self._confirm_battle_form_receipt(
+                        route=route,
+                        expected_realm=expected_realm,
+                        deadline=deadline,
+                    )
+                except Exception as receipt_error:
+                    if acknowledgement_error is not None:
+                        raise acknowledgement_error from receipt_error
+                    raise
+                if acknowledgement_error is not None:
+                    logger.warning(
+                        "Battle form submission reconciled after acknowledgement "
+                        "error kind=%s id=%s route=%s blocker=%s error_type=%s",
+                        kind,
+                        battle_id,
+                        route,
+                        blocker.value,
+                        type(acknowledgement_error).__name__,
+                    )
+                deadline.require_remaining(
+                    "Battle form submission receipt was accepted after its deadline"
+                )
+                return "submitted"
+            pre_submit_deadline.require_remaining(
+                "Battle form submission result arrived after its pre-submit deadline"
+            )
+            return result
+        except Exception as error:
+            if mutation_started:
+                logger.error(
+                    "Battle form submission outcome is unknown "
+                    f"kind={kind} id=%s error_type=%s",
+                    battle_id,
+                    type(error).__name__,
+                )
+            raise
+        finally:
+            lifecycle.close()
+
+    async def _confirm_battle_form_receipt(
+        self,
+        *,
+        route: str,
+        expected_realm: Realm,
+        deadline: SemanticDeadline,
+    ) -> MaintenanceNavigationBlocker:
+        """Read one trusted post-navigation battle marker without a new deadline."""
+
+        remaining = deadline.require_remaining(
+            "Battle form receipt deadline expired before marker observation"
+        )
+        try:
+            observation = await self._observe_battle_route_readiness(
+                route,
+                timeout_seconds=min(_NAVIGATION_READ_TIMEOUT_SECONDS, remaining),
+            )
+        except Exception as error:
+            if is_browser_generation_error(error):
+                raise
+            raise _BattleFormOutcomeUnknownError(
+                "Battle form receipt observation was invalid"
+            ) from error
+        try:
+            deadline.require_remaining(
+                "Battle form receipt deadline expired during marker observation"
+            )
+        except TimeoutError as error:
+            raise _BattleFormOutcomeUnknownError(
+                "Battle form receipt marker arrived after its deadline"
+            ) from error
+        state = self._classify_battle_route_readiness(
+            observation,
+            expected_realm,
+            route,
+        )
+        if (
+            state is not _BattleRouteReadinessState.BLOCKED
+            or observation.blocker is None
+        ):
+            raise _BattleFormOutcomeUnknownError(
+                "Battle form receipt did not expose a trusted battle marker; "
+                f"route={route}; state={state.value}"
+            )
+        try:
+            deadline.require_remaining(
+                "Battle form receipt classification completed after its deadline"
+            )
+        except TimeoutError as error:
+            raise _BattleFormOutcomeUnknownError(
+                "Battle form receipt classification completed after its deadline"
+            ) from error
+        logger.debug(
+            "Battle form receipt confirmed route=%s expected_realm=%s blocker=%s",
+            route,
+            expected_realm.value,
+            observation.blocker.value,
+        )
+        return observation.blocker
+
+    async def confirm_current_battle_receipt(
+        self,
+        *,
+        expected_realm: Realm,
+        timeout: float,
+    ) -> MaintenanceNavigationBlocker:
+        """Atomically verify the current URL identity and a positive battle marker.
+
+        This is used after a caller-owned navigation deadline.  ``timeout`` is
+        only the remaining budget for one current-document observation and may
+        never exceed the protocol-command watchdog.
+        """
+
+        self._validate_expected_realm(expected_realm)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int | float)
+            or not 0 < float(timeout) <= PROTOCOL_TIMEOUT_SECONDS
+        ):
+            raise ValueError("battle receipt timeout must be in (0, 5] seconds")
+        deadline = SemanticDeadline.after(float(timeout))
+        return await self._confirm_battle_form_receipt(
+            route="ar",
+            expected_realm=expected_realm,
+            deadline=deadline,
+        )
 
     async def _goto_battle_route(
         self,
@@ -282,7 +456,11 @@ class BattleLauncher:
         expected_realm: Realm,
     ) -> bool:
         self._validate_expected_realm(expected_realm)
-        current = await self._observe_navigation("before direct Battle navigation")
+        deadline = SemanticDeadline.after(_BATTLE_ROUTE_READINESS_DEADLINE_SECONDS)
+        current = await self._observe_navigation(
+            "before direct Battle navigation",
+            deadline=deadline,
+        )
         self._validate_observation_identity(
             current,
             expected_realm,
@@ -290,23 +468,39 @@ class BattleLauncher:
         )
         self._raise_if_blocked(current)
 
-        await self._get_battle_route(expected_realm, route)
+        await self._get_battle_route(expected_realm, route, deadline=deadline)
         landed = await self._wait_for_battle_route_readiness(
             expected_realm=expected_realm,
             route=route,
+            deadline=deadline,
         )
         if landed.blocker is not None:
             raise MaintenanceNavigationBlockedError(landed.blocker)
+        deadline.require_remaining(
+            "Battle route readiness was accepted after its deadline"
+        )
         return True
 
     async def _get_battle_route(
         self,
         expected_realm: Realm,
         route: str,
+        *,
+        deadline: SemanticDeadline,
     ) -> None:
         direct_url = self._battle_route_url(expected_realm, route)
+        lifecycle = MainFrameDOMContentLoadedWaiter(self.page)
         try:
-            await self.browser.get(direct_url)
+            await lifecycle.enable(deadline=deadline)
+            lifecycle.trigger()
+            # HVDriver accepts hbrowser's nominal Deadline type, but only uses
+            # its ``remaining()`` protocol. Passing the same object keeps its
+            # internal navigation phases inside this absolute route deadline.
+            await self.browser.get(direct_url, deadline=cast(Any, deadline))
+            await lifecycle.wait(deadline)
+            deadline.require_remaining(
+                "Battle route navigation deadline expired at lifecycle receipt"
+            )
         except Exception as error:
             if contains_log_persistence_error(error) or is_browser_generation_error(
                 error
@@ -316,13 +510,20 @@ class BattleLauncher:
                 f"The direct {_BATTLE_ROUTE_LABELS[route]} navigation outcome is "
                 "unknown"
             ) from error
+        finally:
+            lifecycle.close()
 
     async def _observe_navigation(
         self,
         context: str,
+        *,
+        deadline: SemanticDeadline,
     ) -> MaintenanceNavigationObservation:
         try:
-            return await observe_maintenance_navigation(self.page)
+            async with asyncio.timeout(deadline.protocol_timeout()):
+                observation = await observe_maintenance_navigation(self.page)
+            deadline.require_remaining(f"Battle navigation deadline expired {context}")
+            return observation
         except Exception as error:
             if contains_log_persistence_error(error) or is_browser_generation_error(
                 error
@@ -414,51 +615,24 @@ class BattleLauncher:
     ) -> _BattleRouteReadinessObservation:
         raw = await wait_for_zendriver(
             self.page.evaluate(_battle_route_readiness_script(route)),
-            timeout=timeout_seconds,
+            timeout=protocol_timeout(timeout_seconds),
             owner=self.page,
         )
         return _parse_battle_route_readiness_observation(raw)
-
-    async def _capture_route_readiness_diagnostic(
-        self,
-    ) -> tuple[str | None, str | None]:
-        try:
-            path = await self.browser.save_page_diagnostic(
-                _BATTLE_ROUTE_DIAGNOSTIC_KIND
-            )
-            return (str(path) if path is not None else None), None
-        except LogPersistenceError:
-            raise
-        except Exception as error:
-            if contains_log_persistence_error(error) or is_browser_generation_error(
-                error
-            ):
-                raise
-            logger.warning(
-                "Battle route diagnostic capture failed " "kind=%s error_type=%s",
-                _BATTLE_ROUTE_DIAGNOSTIC_KIND,
-                type(error).__name__,
-            )
-            logger.debug(
-                "Battle route diagnostic capture traceback",
-                exc_info=True,
-            )
-            return None, type(error).__name__
 
     async def _wait_for_battle_route_readiness(
         self,
         *,
         expected_realm: Realm,
         route: str,
+        deadline: SemanticDeadline,
     ) -> _BattleRouteReadinessObservation:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _BATTLE_ROUTE_READINESS_DEADLINE_SECONDS
         observation_count = 0
         last_state = _BattleRouteReadinessState.INVALID_OBSERVATION
         last_error: Exception | None = None
 
         while True:
-            remaining = deadline - loop.time()
+            remaining = deadline.remaining()
             if remaining <= 0:
                 break
             try:
@@ -478,12 +652,16 @@ class BattleLauncher:
                 last_state = _BattleRouteReadinessState.INVALID_OBSERVATION
             else:
                 observation_count += 1
+                if deadline.remaining() <= 0:
+                    break
                 last_error = None
                 last_state = self._classify_battle_route_readiness(
                     observation,
                     expected_realm,
                     route,
                 )
+                if deadline.remaining() <= 0:
+                    break
                 if last_state in {
                     _BattleRouteReadinessState.BLOCKED,
                     _BattleRouteReadinessState.READY,
@@ -498,24 +676,18 @@ class BattleLauncher:
                     )
                     return observation
 
-            remaining = deadline - loop.time()
+            remaining = deadline.remaining()
             if remaining <= 0:
                 break
             await asyncio.sleep(min(_BATTLE_ROUTE_READINESS_POLL_SECONDS, remaining))
 
-        diagnostic_path, diagnostic_error_type = (
-            await self._capture_route_readiness_diagnostic()
-        )
         logger.warning(
             "Battle route readiness deadline exhausted "
-            "route=%s expected_realm=%s state=%s observations=%d "
-            "diagnostic_saved=%s diagnostic_error_type=%s",
+            "route=%s expected_realm=%s state=%s observations=%d",
             route,
             expected_realm.value,
             last_state.value,
             observation_count,
-            diagnostic_path is not None,
-            diagnostic_error_type or "none",
         )
         readiness_error = BattleRouteReadinessError(
             route=route,
@@ -523,8 +695,6 @@ class BattleLauncher:
             deadline_seconds=_BATTLE_ROUTE_READINESS_DEADLINE_SECONDS,
             observation_count=observation_count,
             last_state=last_state.value,
-            diagnostic_path=diagnostic_path,
-            diagnostic_error_type=diagnostic_error_type,
         )
         if last_error is not None:
             raise readiness_error from last_error
@@ -547,7 +717,11 @@ class BattleLauncher:
         """Reconcile startup markers against one explicit realm trust boundary."""
 
         self._validate_expected_realm(expected_realm)
-        current = await self._observe_navigation("in the current startup document")
+        deadline = SemanticDeadline.after(_BATTLE_ROUTE_READINESS_DEADLINE_SECONDS)
+        current = await self._observe_navigation(
+            "in the current startup document",
+            deadline=deadline,
+        )
         if current.blocker is not None:
             self._validate_observation_identity(
                 current,
@@ -568,10 +742,11 @@ class BattleLauncher:
             current_realm,
         )
 
-        await self._get_battle_route(expected_realm, "ar")
+        await self._get_battle_route(expected_realm, "ar", deadline=deadline)
         landed = await self._wait_for_battle_route_readiness(
             expected_realm=expected_realm,
             route="ar",
+            deadline=deadline,
         )
         if landed.blocker is not None:
             return _StartupBattleRouteResult(
@@ -840,107 +1015,138 @@ class BattleLauncher:
         option: RingOfBloodOption,
         *,
         expected_before: RingOfBloodSnapshot,
+        expected_realm: Realm,
     ) -> RingOfBloodStartOutcome:
         """Submit one Ring challenge after revalidating its inspected state."""
         if not isinstance(option, RingOfBloodOption):
             raise TypeError("option must be a RingOfBloodOption")
         if not isinstance(expected_before, RingOfBloodSnapshot):
             raise TypeError("expected_before must be a RingOfBloodSnapshot")
-
-        ring_url = f"{HENTAIVERSE_ROOT_URL}{await self._path_prefix()}/?s=Battle&ss=rb"
-        current_url = await wait_for_zendriver(
-            self.page.evaluate("window.location.href"),
-            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
-            owner=self.page,
-        )
-        if current_url != ring_url:
-            logger.debug(
-                "Ring of Blood pre-submit check id=%s reason=unexpected-page",
-                option.battle_id,
-            )
-            return RingOfBloodStartOutcome.OPTION_UNAVAILABLE
-
-        current = await self.inspect_ring_of_blood()
-        current_by_id = {
-            current_option.battle_id: current_option
-            for current_option in current.options
-        }
-        current_option = current_by_id.get(option.battle_id)
-        logger.debug(
-            "Ring of Blood pre-submit check id=%s action_present=%s "
-            "snapshot_matches=%s required=%s available=%s",
-            option.battle_id,
-            current_option is not None,
-            current == expected_before,
-            option.entry_cost,
-            current.tokens_of_blood,
-        )
-        if current_option is None:
-            logger.debug(
-                "Ring of Blood option is unavailable id=%s",
-                option.battle_id,
-            )
-            return RingOfBloodStartOutcome.OPTION_UNAVAILABLE
-        if current_option != option or current != expected_before:
-            logger.debug(
-                "Ring of Blood state changed before submission id=%s",
-                option.battle_id,
-            )
+        self._validate_expected_realm(expected_realm)
+        if option not in expected_before.options:
             return RingOfBloodStartOutcome.STATE_CHANGED
-        if current.tokens_of_blood < current_option.entry_cost:
-            logger.debug(
-                "Ring of Blood tokens are insufficient id=%s required=%s available=%s",
-                option.battle_id,
-                current_option.entry_cost,
-                current.tokens_of_blood,
-            )
-            return RingOfBloodStartOutcome.INSUFFICIENT_TOKENS
 
-        ring_url_js = json.dumps(ring_url)
-        try:
-            atomic_result = await wait_for_zendriver(
-                self.page.evaluate(rf"""
+        expected_snapshot = {
+            "tokens": expected_before.tokens_of_blood,
+            "challenges": [
+                {
+                    "challengeName": challenge.challenge_name,
+                    "expMultiplier": challenge.exp_multiplier,
+                    "entryCost": challenge.entry_cost,
+                    "actionId": (
+                        None
+                        if challenge.start_action is None
+                        else challenge.start_action.battle_id
+                    ),
+                }
+                for challenge in expected_before.challenges
+            ],
+        }
+        expected_url_js = json.dumps(self._battle_route_url(expected_realm, "rb"))
+        expected_snapshot_js = json.dumps(expected_snapshot)
+        atomic_result = await self._submit_battle_form(
+            rf"""
                 (() => {{
-                    const expectedUrl = {ring_url_js};
-                    if (window.location.href !== expectedUrl) return 'unexpected-page';
-                    const expectedId = {current_option.battle_id};
-                    const expectedCost = {current_option.entry_cost};
+                    const expectedUrl = {expected_url_js};
+                    if (window.location.href !== expectedUrl) {{
+                        return 'unexpected-page';
+                    }}
+                    const expectedId = {option.battle_id};
+                    const expectedCost = {option.entry_cost};
+                    const expectedSnapshot = {expected_snapshot_js};
                     const table = document.getElementById('arena_list');
+                    const tokenContainer = document.getElementById('arena_tokens');
                     const initid = document.getElementById('initid');
                     const initform = document.getElementById('initform');
                     if (!table) return 'missing-table';
+                    if (!tokenContainer) return 'invalid-state';
                     if (!initid) return 'missing-initid';
                     if (!initform) return 'missing-initform';
-                    const hasExactAction = Array.from(table.querySelectorAll(
-                        'img[onclick*="init_battle"]'
-                    )).some((element) => {{
-                        const onclick = (
-                            element.getAttribute('onclick') || ''
-                        ).trim();
-                        const match = /^init_battle\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*;?$/.exec(
-                            onclick
+                    const normalize = (value) =>
+                        (value || '').replace(/\s+/g, ' ').trim();
+                    const parseInteger = (pattern, value) => {{
+                        const match = pattern.exec(normalize(value));
+                        return match ? Number(match[1].replaceAll(',', '')) : null;
+                    }};
+                    const rows = Array.from(table.querySelectorAll('tr'));
+                    const headers = Array.from(
+                        rows[0]?.querySelectorAll('th') || []
+                    ).map((cell) => normalize(cell.textContent).toLowerCase());
+                    const challengeIndex = headers.indexOf('challenge');
+                    const expIndex = headers.indexOf('exp mod');
+                    const entryCostIndex = headers.indexOf('entry cost');
+                    if (
+                        challengeIndex < 0
+                        || expIndex < 0
+                        || entryCostIndex < 0
+                    ) return 'invalid-state';
+                    const tokens = parseInteger(
+                        /\b(\d[\d,]*)\s+tokens?\s+of\s+blood\b/i,
+                        tokenContainer.textContent,
+                    );
+                    if (tokens === null) return 'invalid-state';
+                    const challenges = [];
+                    for (const row of rows.slice(1)) {{
+                        const cells = Array.from(row.children).filter(
+                            (cell) => cell.tagName === 'TD'
                         );
-                        return match !== null
-                            && Number(match[1]) === expectedId
-                            && Number(match[2]) === expectedCost;
-                    }});
-                    if (!hasExactAction) return 'missing-exact-action';
+                        const challengeName = normalize(
+                            cells[challengeIndex]?.textContent
+                        );
+                        if (!challengeName) return 'invalid-state';
+                        const expMatch = /^[x×]\s*(\d+(?:\.\d+)?)$/i.exec(
+                            normalize(cells[expIndex]?.textContent)
+                        );
+                        const expMultiplier = expMatch
+                            ? Number(expMatch[1])
+                            : null;
+                        const entryCost = parseInteger(
+                            /\b(\d[\d,]*)\s+tokens?\b/i,
+                            cells[entryCostIndex]?.textContent,
+                        );
+                        const action = row.querySelector(
+                            'img[onclick*="init_battle"]'
+                        );
+                        let actionId = null;
+                        if (action) {{
+                            const match = /^init_battle\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*;?$/.exec(
+                                (action.getAttribute('onclick') || '').trim()
+                            );
+                            if (
+                                !match
+                                || expMultiplier === null
+                                || entryCost === null
+                                || Number(match[2]) !== entryCost
+                            ) return 'invalid-state';
+                            actionId = Number(match[1]);
+                        }}
+                        challenges.push({{
+                            challengeName,
+                            expMultiplier,
+                            entryCost,
+                            actionId,
+                        }});
+                    }}
+                    const currentSnapshot = {{tokens, challenges}};
+                    const selected = challenges.find(
+                        (challenge) => challenge.actionId === expectedId
+                    );
+                    if (!selected) return 'option-unavailable';
+                    if (JSON.stringify(currentSnapshot) !== JSON.stringify(
+                        expectedSnapshot
+                    )) return 'state-changed';
+                    if (selected.entryCost !== expectedCost) return 'state-changed';
+                    if (tokens < expectedCost) return 'insufficient-tokens';
                     initid.value = String(expectedId);
                     initform.submit();
                     return 'submitted';
                 }})()
-                """),
-                timeout=_NAVIGATION_MUTATION_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-        except Exception as error:
-            logger.error(
-                "Battle form submission outcome is unknown "
-                "kind=ring-of-blood id=%s error_type=%s",
-                option.battle_id,
-                type(error).__name__,
-            )
-            raise
+            """,
+            kind="ring-of-blood",
+            battle_id=option.battle_id,
+            route="rb",
+            expected_realm=expected_realm,
+        )
         result = (
             atomic_result
             if isinstance(atomic_result, str)
@@ -952,6 +1158,32 @@ class BattleLauncher:
             option.battle_id,
             result,
         )
+        if result == "insufficient-tokens":
+            logger.debug(
+                "Ring of Blood tokens are insufficient id=%s required=%s available=%s",
+                option.battle_id,
+                option.entry_cost,
+                expected_before.tokens_of_blood,
+            )
+            return RingOfBloodStartOutcome.INSUFFICIENT_TOKENS
+        if result == "state-changed":
+            logger.debug(
+                "Ring of Blood state changed before submission id=%s",
+                option.battle_id,
+            )
+            return RingOfBloodStartOutcome.STATE_CHANGED
+        if result == "option-unavailable":
+            logger.debug(
+                "Ring of Blood option is unavailable id=%s",
+                option.battle_id,
+            )
+            return RingOfBloodStartOutcome.OPTION_UNAVAILABLE
+        if result == "unexpected-page":
+            logger.debug(
+                "Ring of Blood pre-submit check id=%s reason=unexpected-page",
+                option.battle_id,
+            )
+            return RingOfBloodStartOutcome.OPTION_UNAVAILABLE
         if result != "submitted":
             logger.warning(
                 "Battle form was not submitted kind=ring-of-blood id=%s reason=%s",
@@ -963,57 +1195,73 @@ class BattleLauncher:
         logger.debug("Submitted Ring of Blood battle form id=%s", option.battle_id)
         return RingOfBloodStartOutcome.SUBMITTED
 
-    async def start_arena(self, option: ArenaOption) -> bool:
+    async def start_arena(
+        self,
+        option: ArenaOption,
+        *,
+        expected_realm: Realm,
+    ) -> bool:
         """Submit one Arena option explicitly selected by the caller."""
-        arena_url = f"{HENTAIVERSE_ROOT_URL}{await self._path_prefix()}/?s=Battle&ss=ar"
-        current_url = await wait_for_zendriver(
-            self.page.evaluate("window.location.href"),
-            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
-            owner=self.page,
-        )
-        if current_url != arena_url:
-            logger.debug(
-                "Battle form submission skipped kind=arena id=%s "
-                "reason=unexpected-page expected=%s current=%s",
-                option.battle_id,
-                arena_url,
-                current_url,
-            )
-            return False
-
+        if not isinstance(option, ArenaOption):
+            raise TypeError("option must be an ArenaOption")
+        self._validate_expected_realm(expected_realm)
+        expected_url_js = json.dumps(self._battle_route_url(expected_realm, "ar"))
         token_js = json.dumps(option.token)
-        try:
-            submitted = await wait_for_zendriver(
-                self.page.evaluate(f"""
+        result = await self._submit_battle_form(
+            rf"""
                 (() => {{
+                    const expectedUrl = {expected_url_js};
+                    if (window.location.href !== expectedUrl) {{
+                        return 'unexpected-page';
+                    }}
+                    const expectedId = {option.battle_id};
+                    const expectedToken = {token_js};
+                    const table = document.getElementById('arena_list');
                     const initid = document.getElementById('initid');
                     const initform = document.getElementById('initform');
-                    if (!initid || !initform) return false;
-                    initid.value = '{option.battle_id}';
-                    const tokenVal = {token_js};
-                    if (tokenVal !== null) {{
+                    if (!table || !initid || !initform) return 'form-unavailable';
+                    const hasExactAction = Array.from(table.querySelectorAll(
+                        'img[onclick*="init_battle"]'
+                    )).some((element) => {{
+                        const match = /^init_battle\(\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(['"])([^'"]*)\3\s*)?\)\s*;?$/.exec(
+                            (element.getAttribute('onclick') || '').trim()
+                        );
+                        return match !== null
+                            && Number(match[1]) === expectedId
+                            && (
+                                expectedToken === null
+                                    ? match[4] === undefined
+                                    : match[4] === expectedToken
+                            );
+                    }});
+                    if (!hasExactAction) return 'option-unavailable';
+                    initid.value = String(expectedId);
+                    if (expectedToken !== null) {{
                         const inittoken = document.getElementById('inittoken');
-                        if (inittoken) inittoken.value = tokenVal;
+                        if (!inittoken) return 'form-unavailable';
+                        inittoken.value = expectedToken;
                     }}
                     initform.submit();
-                    return true;
+                    return 'submitted';
                 }})()
-                """),
-                timeout=_NAVIGATION_MUTATION_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-        except Exception as error:
-            logger.error(
-                "Battle form submission outcome is unknown kind=arena id=%s "
-                "error_type=%s",
+            """,
+            kind="arena",
+            battle_id=option.battle_id,
+            route="ar",
+            expected_realm=expected_realm,
+        )
+        if result == "unexpected-page":
+            logger.debug(
+                "Battle form submission skipped kind=arena id=%s "
+                "reason=unexpected-page",
                 option.battle_id,
-                type(error).__name__,
             )
-            raise
-        if submitted is not True:
+            return False
+        if result != "submitted":
             logger.warning(
-                "Battle form was not submitted kind=arena id=%s",
+                "Battle form was not submitted kind=arena id=%s reason=%s",
                 option.battle_id,
+                result if isinstance(result, str) else "unexpected-result",
             )
             return False
 
@@ -1048,53 +1296,62 @@ class BattleLauncher:
             options.append(GrindfestOption(battle_id=int(match.group(1))))
         return tuple(options)
 
-    async def start_grindfest(self, option: GrindfestOption) -> bool:
+    async def start_grindfest(
+        self,
+        option: GrindfestOption,
+        *,
+        expected_realm: Realm,
+    ) -> bool:
         """Submit one GrindFest option explicitly selected by the caller."""
-        grindfest_url = (
-            f"{HENTAIVERSE_ROOT_URL}{await self._path_prefix()}/?s=Battle&ss=gr"
-        )
-        current_url = await wait_for_zendriver(
-            self.page.evaluate("window.location.href"),
-            timeout=_NAVIGATION_READ_TIMEOUT_SECONDS,
-            owner=self.page,
-        )
-        if current_url != grindfest_url:
-            logger.debug(
-                "Battle form submission skipped kind=grindfest id=%s "
-                "reason=unexpected-page expected=%s current=%s",
-                option.battle_id,
-                grindfest_url,
-                current_url,
-            )
-            return False
-
-        try:
-            submitted = await wait_for_zendriver(
-                self.page.evaluate(f"""
+        if not isinstance(option, GrindfestOption):
+            raise TypeError("option must be a GrindfestOption")
+        self._validate_expected_realm(expected_realm)
+        expected_url_js = json.dumps(self._battle_route_url(expected_realm, "gr"))
+        result = await self._submit_battle_form(
+            rf"""
                 (() => {{
+                    const expectedUrl = {expected_url_js};
+                    if (window.location.href !== expectedUrl) {{
+                        return 'unexpected-page';
+                    }}
+                    const expectedId = {option.battle_id};
+                    const container = document.getElementById('grindfest');
                     const initid = document.getElementById('initid');
                     const initform = document.getElementById('initform');
-                    if (!initid || !initform) return false;
-                    initid.value = '{option.battle_id}';
+                    if (!container || !initid || !initform) {{
+                        return 'form-unavailable';
+                    }}
+                    const hasExactAction = Array.from(container.querySelectorAll(
+                        'img[onclick*="init_battle"]'
+                    )).some((element) => {{
+                        const match = /^init_battle\(\s*(\d+)\s*\)\s*;?$/.exec(
+                            (element.getAttribute('onclick') || '').trim()
+                        );
+                        return match !== null && Number(match[1]) === expectedId;
+                    }});
+                    if (!hasExactAction) return 'option-unavailable';
+                    initid.value = String(expectedId);
                     initform.submit();
-                    return true;
+                    return 'submitted';
                 }})()
-                """),
-                timeout=_NAVIGATION_MUTATION_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-        except Exception as error:
-            logger.error(
-                "Battle form submission outcome is unknown kind=grindfest id=%s "
-                "error_type=%s",
+            """,
+            kind="grindfest",
+            battle_id=option.battle_id,
+            route="gr",
+            expected_realm=expected_realm,
+        )
+        if result == "unexpected-page":
+            logger.debug(
+                "Battle form submission skipped kind=grindfest id=%s "
+                "reason=unexpected-page",
                 option.battle_id,
-                type(error).__name__,
             )
-            raise
-        if submitted is not True:
+            return False
+        if result != "submitted":
             logger.warning(
-                "Battle form was not submitted kind=grindfest id=%s",
+                "Battle form was not submitted kind=grindfest id=%s reason=%s",
                 option.battle_id,
+                result if isinstance(result, str) else "unexpected-result",
             )
             return False
 

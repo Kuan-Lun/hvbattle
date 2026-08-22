@@ -1,6 +1,7 @@
 """Typed battle snapshot state and derived combat views."""
 
 import asyncio
+import math
 import re
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from hv_bie.types import BattleSnapshot
 from hvbrowser import HVDriver
 from hvbrowser.runtime import wait_for_zendriver
 from zendriver.core.connection import ProtocolException
+
+from ._timing import PROTOCOL_TIMEOUT_SECONDS, protocol_timeout
 
 
 @dataclass(slots=True)
@@ -85,35 +88,76 @@ class BattleStateStore:
         self.overview_monsters = OverviewMonsters()
         self.log_entries = CombatLogTracker()
 
-    async def _get_content(self, timeout: float = 10.0) -> str:
+    @staticmethod
+    def _validated_timeout(timeout: float) -> float:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int | float)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+            or timeout > PROTOCOL_TIMEOUT_SECONDS
+        ):
+            raise ValueError("battle content timeout must be finite and in (0, 5]")
+        return float(timeout)
+
+    async def _get_content(
+        self,
+        timeout: float = PROTOCOL_TIMEOUT_SECONDS,
+        *,
+        _deadline_at: float | None = None,
+    ) -> str:
         """Read HTML with one bounded retry for zendriver's duplicate-id race."""
-        deadline = asyncio.get_running_loop().time() + timeout
+        timeout = self._validated_timeout(timeout)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout if _deadline_at is None else _deadline_at
+
+        def remaining() -> float:
+            return max(0.0, deadline - loop.time())
+
+        operation_timeout = remaining()
+        if operation_timeout <= 0:
+            raise TimeoutError("Battle content deadline expired before its read")
         try:
-            return await wait_for_zendriver(
+            content = await wait_for_zendriver(
                 self._driver.page.get_content(),
-                timeout=timeout,
+                timeout=protocol_timeout(operation_timeout),
                 owner=self._driver.page,
             )
         except ProtocolException as error:
             if "duplicate" not in str(error).casefold():
                 raise
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
+            operation_timeout = remaining()
+            if operation_timeout <= 0:
                 raise TimeoutError(
                     "Battle content retry budget was exhausted"
                 ) from error
-            return await wait_for_zendriver(
+            content = await wait_for_zendriver(
                 self._driver.page.get_content(),
-                timeout=remaining,
+                timeout=protocol_timeout(operation_timeout),
                 owner=self._driver.page,
             )
+        if not isinstance(content, str):
+            raise TypeError("Battle page content must be text")
+        if remaining() <= 0:
+            raise TimeoutError("Battle content result arrived after its deadline")
+        return content
 
-    async def inspect(self, *, timeout: float = 10.0) -> BattleSnapshot:
+    async def inspect(
+        self, *, timeout: float = PROTOCOL_TIMEOUT_SECONDS
+    ) -> BattleSnapshot:
         """Parse the page without consuming log or derived-view state."""
-        return parse_snapshot(await self._get_content(timeout=timeout))
+        timeout = self._validated_timeout(timeout)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        snapshot = parse_snapshot(
+            await self._get_content(timeout=timeout, _deadline_at=deadline)
+        )
+        if loop.time() >= deadline:
+            raise TimeoutError("Battle snapshot parsing exceeded its deadline")
+        return snapshot
 
-    async def update(self) -> None:
-        snapshot = await self.inspect()
+    async def update(self, *, timeout: float = PROTOCOL_TIMEOUT_SECONDS) -> None:
+        snapshot = await self.inspect(timeout=timeout)
         self.snap = snapshot
         self.log_entries.update(snapshot)
         self.overview_monsters = OverviewMonsters.from_snapshot(snapshot)

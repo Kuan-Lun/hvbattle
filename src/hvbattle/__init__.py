@@ -30,6 +30,7 @@ from .contracts import (
 from .control_panel import BaseControlPanel, ControlPanel, NullControlPanel
 from .hv_battle_ponychart import (
     PonyChartResolutionError,
+    close_ponychart_workers,
     preload_ponychart_classifier,
     refresh_ponychart_classifier,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "RingOfBloodSnapshot",
     "RingOfBloodStartOutcome",
     "TurnDecision",
+    "close_ponychart_workers",
     "preload_ponychart_classifier",
     "refresh_ponychart_classifier",
 ]

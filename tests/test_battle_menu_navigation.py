@@ -1,5 +1,6 @@
 import inspect
 import unittest
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -7,13 +8,16 @@ from unittest.mock import AsyncMock, patch
 from hvbrowser import (
     MaintenanceNavigationBlockedError,
     MaintenanceNavigationBlocker,
+    MaintenanceNavigationObservation,
     Realm,
 )
 from hvbrowser.runtime import LogPersistenceError, ZendriverOperationTimeout
+from zendriver import cdp
 
 from hvbattle import BattlePresence, BattleRouteReadinessError, BattleSession
 from hvbattle import battle_launcher as battle_launcher_module
 from hvbattle import session as session_module
+from hvbattle._timing import SemanticDeadline
 from hvbattle.battle_launcher import BattleLauncher
 
 
@@ -67,6 +71,50 @@ class _Page:
         self.route_readiness_scripts: list[str] = []
         self.select_calls: list[str] = []
         self.xpath_calls: list[str] = []
+        self.handlers: dict[type[object], list[object]] = defaultdict(list)
+        self.main_frame_id = "main-frame"
+        self.loader_id = "loader-0"
+        self._loader_sequence = 0
+
+    def add_handler(self, event_type: type[object], handler: object) -> None:
+        self.handlers[event_type].append(handler)
+
+    def remove_handlers(self, event_type: type[object], handler: object) -> None:
+        self.handlers[event_type].remove(handler)
+
+    async def send(self, command: object) -> object:
+        payload = next(command)  # type: ignore[arg-type]
+        method = payload["method"]
+        if method == "Page.setLifecycleEventsEnabled":
+            return None
+        if method == "Page.getFrameTree":
+            return SimpleNamespace(
+                frame=SimpleNamespace(
+                    id_=self.main_frame_id,
+                    loader_id=self.loader_id,
+                )
+            )
+        raise AssertionError(f"Unexpected CDP command: {method}")
+
+    async def emit_navigation_lifecycle(self) -> None:
+        self._loader_sequence += 1
+        self.loader_id = f"loader-{self._loader_sequence}"
+        frame_event = SimpleNamespace(
+            frame=SimpleNamespace(
+                id_=self.main_frame_id,
+                loader_id=self.loader_id,
+                parent_id=None,
+            )
+        )
+        lifecycle_event = SimpleNamespace(
+            frame_id=self.main_frame_id,
+            loader_id=self.loader_id,
+            name="DOMContentLoaded",
+        )
+        for handler in tuple(self.handlers[cdp.page.FrameNavigated]):
+            await handler(frame_event)  # type: ignore[operator]
+        for handler in tuple(self.handlers[cdp.page.LifecycleEvent]):
+            await handler(lifecycle_event)  # type: ignore[operator]
 
     async def select(self, selector: str, **_kwargs: object) -> object:
         self.select_calls.append(selector)
@@ -130,16 +178,22 @@ class _Browser:
         self.direct_destination: str | None = None
         self.get_error: Exception | None = None
         self.get_calls: list[str] = []
+        self.get_deadlines: list[object] = []
+        self.get_remaining: list[float] = []
         self.wait_calls: list[object] = []
         self.diagnostic_calls: list[str] = []
         self.diagnostic_path: Path | None = None
         self.diagnostic_error: Exception | None = None
 
-    async def get(self, url: str) -> None:
+    async def get(self, url: str, *, deadline: object | None = None) -> None:
         self.get_calls.append(url)
+        self.get_deadlines.append(deadline)
+        if deadline is not None:
+            self.get_remaining.append(float(deadline.remaining()))  # type: ignore[attr-defined]
         if self.get_error is not None:
             raise self.get_error
         self.page.current_url = self.direct_destination or url
+        await self.page.emit_navigation_lifecycle()
 
     async def wait(self, *_args: object, **_kwargs: object) -> None:
         self.wait_calls.append((_args, _kwargs))
@@ -407,14 +461,13 @@ class BattleDirectNavigationTests(unittest.IsolatedAsyncioTestCase):
                 launcher, browser, page = _launcher()
                 page.observation_results = [_observation("https://hentaiverse.org/")]
                 browser.direct_destination = landed_url
-                browser.diagnostic_path = Path("/tmp/battle_route_not_ready.html")
                 page.markers = _markers(completion=True)
 
                 with (
                     patch.object(
                         battle_launcher_module,
                         "_BATTLE_ROUTE_READINESS_DEADLINE_SECONDS",
-                        0.01,
+                        0.1,
                     ),
                     patch.object(
                         battle_launcher_module,
@@ -435,10 +488,7 @@ class BattleDirectNavigationTests(unittest.IsolatedAsyncioTestCase):
                     ["https://hentaiverse.org/?s=Battle&ss=ar"],
                 )
                 self.assertGreater(page.route_observation_calls, 1)
-                self.assertEqual(
-                    browser.diagnostic_calls,
-                    ["battle_route_not_ready"],
-                )
+                self.assertEqual(browser.diagnostic_calls, [])
 
     async def test_marker_free_untrusted_preflight_fails_for_regular_goto(self) -> None:
         cases = (
@@ -476,6 +526,106 @@ class BattleDirectNavigationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reached)
         self.assertEqual(page.route_observation_calls, 3)
         self.assertEqual(browser.diagnostic_calls, [])
+
+    async def test_ready_route_observation_at_exact_deadline_is_not_accepted(
+        self,
+    ) -> None:
+        launcher, browser, _page = _launcher()
+        now = 0.0
+        deadline = SemanticDeadline(expires_at=10.0, _clock=lambda: now)
+        observation = battle_launcher_module._parse_battle_route_readiness_observation(
+            _route_observation(
+                "https://hentaiverse.org/?s=Battle&ss=ar",
+                route_ready=True,
+            )
+        )
+
+        async def observe(
+            _route: str,
+            *,
+            timeout_seconds: float,
+        ) -> object:
+            nonlocal now
+            self.assertEqual(timeout_seconds, 5.0)
+            now = 10.0
+            return observation
+
+        launcher._observe_battle_route_readiness = AsyncMock(side_effect=observe)
+
+        with self.assertRaises(BattleRouteReadinessError) as raised:
+            await launcher._wait_for_battle_route_readiness(
+                expected_realm=Realm.PERSISTENT,
+                route="ar",
+                deadline=deadline,
+            )
+
+        self.assertEqual(raised.exception.observation_count, 1)
+        launcher._observe_battle_route_readiness.assert_awaited_once()
+        self.assertEqual(browser.diagnostic_calls, [])
+
+    async def test_route_classification_finishing_at_deadline_is_not_accepted(
+        self,
+    ) -> None:
+        launcher, browser, _page = _launcher()
+        now = 0.0
+        deadline = SemanticDeadline(expires_at=10.0, _clock=lambda: now)
+        observation = battle_launcher_module._parse_battle_route_readiness_observation(
+            _route_observation(
+                "https://hentaiverse.org/?s=Battle&ss=ar",
+                route_ready=True,
+            )
+        )
+        launcher._observe_battle_route_readiness = AsyncMock(return_value=observation)
+
+        def classify_late(*_args: object) -> object:
+            nonlocal now
+            now = 10.0
+            return battle_launcher_module._BattleRouteReadinessState.READY
+
+        with (
+            patch.object(
+                launcher,
+                "_classify_battle_route_readiness",
+                side_effect=classify_late,
+            ),
+            self.assertRaises(BattleRouteReadinessError),
+        ):
+            await launcher._wait_for_battle_route_readiness(
+                expected_realm=Realm.PERSISTENT,
+                route="ar",
+                deadline=deadline,
+            )
+
+        launcher._observe_battle_route_readiness.assert_awaited_once()
+        self.assertEqual(browser.diagnostic_calls, [])
+
+    async def test_preflight_and_get_share_consumed_route_deadline(self) -> None:
+        launcher, browser, _page = _launcher()
+        now = 0.0
+        deadline = SemanticDeadline(expires_at=10.0, _clock=lambda: now)
+
+        async def consume_preflight(_page: object) -> MaintenanceNavigationObservation:
+            nonlocal now
+            now = 4.0
+            return MaintenanceNavigationObservation(
+                "https://hentaiverse.org/",
+                Realm.PERSISTENT,
+                None,
+            )
+
+        with (
+            patch.object(SemanticDeadline, "after", return_value=deadline),
+            patch.object(
+                battle_launcher_module,
+                "observe_maintenance_navigation",
+                side_effect=consume_preflight,
+            ),
+        ):
+            reached = await launcher.goto_arena(expected_realm=Realm.PERSISTENT)
+
+        self.assertTrue(reached)
+        self.assertEqual(browser.get_deadlines, [deadline])
+        self.assertEqual(browser.get_remaining, [6.0])
 
     async def test_transient_unknown_documents_are_polled_until_trusted(self) -> None:
         launcher, browser, page = _launcher()
@@ -531,7 +681,6 @@ class BattleDirectNavigationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(case=case_name):
                 launcher, browser, page = _launcher()
                 browser.direct_destination = destination
-                browser.diagnostic_path = Path("/tmp/battle_route_not_ready.html")
 
                 with (
                     patch.object(
@@ -550,23 +699,17 @@ class BattleDirectNavigationTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(raised.exception.last_state, "wrong-query")
                 self.assertEqual(
-                    raised.exception.diagnostic_path,
-                    "/tmp/battle_route_not_ready.html",
-                )
-                self.assertEqual(
                     browser.get_calls,
                     ["https://hentaiverse.org/?s=Battle&ss=rb"],
                 )
                 self.assertGreater(page.route_observation_calls, 1)
-                self.assertEqual(
-                    browser.diagnostic_calls,
-                    ["battle_route_not_ready"],
-                )
+                self.assertEqual(browser.diagnostic_calls, [])
 
-    async def test_missing_route_structure_waits_then_saves_diagnostic(self) -> None:
+    async def test_missing_route_structure_stops_without_post_deadline_diagnostic(
+        self,
+    ) -> None:
         launcher, browser, page = _launcher()
         page.route_ready["rb"] = False
-        browser.diagnostic_path = Path("/tmp/battle_route_not_ready.html")
 
         with (
             patch.object(
@@ -585,17 +728,13 @@ class BattleDirectNavigationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.last_state, "route-dom-missing")
         self.assertEqual(
-            raised.exception.diagnostic_path,
-            "/tmp/battle_route_not_ready.html",
-        )
-        self.assertEqual(
             browser.get_calls,
             ["https://hentaiverse.org/?s=Battle&ss=rb"],
         )
         self.assertGreater(page.route_observation_calls, 1)
-        self.assertEqual(browser.diagnostic_calls, ["battle_route_not_ready"])
+        self.assertEqual(browser.diagnostic_calls, [])
 
-    async def test_ordinary_diagnostic_failure_does_not_mask_readiness(self) -> None:
+    async def test_expired_readiness_never_starts_available_diagnostic(self) -> None:
         launcher, browser, page = _launcher()
         page.route_ready["ar"] = False
         browser.diagnostic_error = RuntimeError("diagnostic write failed")
@@ -615,54 +754,8 @@ class BattleDirectNavigationTests(unittest.IsolatedAsyncioTestCase):
         ):
             await launcher.goto_arena(expected_realm=Realm.PERSISTENT)
 
-        self.assertEqual(
-            raised.exception.diagnostic_error_type,
-            "RuntimeError",
-        )
-        self.assertIsNone(raised.exception.diagnostic_path)
-        self.assertEqual(
-            browser.diagnostic_calls,
-            ["battle_route_not_ready"],
-        )
-
-    async def test_fatal_diagnostic_errors_propagate_exactly(self) -> None:
-        nested_sink_failure = RuntimeError("diagnostic wrapper")
-        nested_sink_failure.__cause__ = LogPersistenceError(
-            "emit",
-            OSError("nested disk failure"),
-        )
-        cases = (
-            LogPersistenceError("emit", OSError("disk failed")),
-            nested_sink_failure,
-            ZendriverOperationTimeout(timeout_seconds=5.0),
-        )
-
-        for diagnostic_error in cases:
-            with self.subTest(error_type=type(diagnostic_error).__name__):
-                launcher, browser, page = _launcher()
-                page.route_ready["ar"] = False
-                browser.diagnostic_error = diagnostic_error
-
-                with (
-                    patch.object(
-                        battle_launcher_module,
-                        "_BATTLE_ROUTE_READINESS_DEADLINE_SECONDS",
-                        0.005,
-                    ),
-                    patch.object(
-                        battle_launcher_module,
-                        "_BATTLE_ROUTE_READINESS_POLL_SECONDS",
-                        0.001,
-                    ),
-                    self.assertRaises(type(diagnostic_error)) as raised,
-                ):
-                    await launcher.goto_arena(expected_realm=Realm.PERSISTENT)
-
-                self.assertIs(raised.exception, diagnostic_error)
-                self.assertEqual(
-                    browser.diagnostic_calls,
-                    ["battle_route_not_ready"],
-                )
+        self.assertEqual(raised.exception.last_state, "route-dom-missing")
+        self.assertEqual(browser.diagnostic_calls, [])
 
     async def test_nested_log_failure_in_readiness_observation_is_not_retried(
         self,
@@ -916,7 +1009,6 @@ class StartupBattlePresenceReconciliationTests(unittest.IsolatedAsyncioTestCase)
                 session, browser, page = _session_with_launcher()
                 page.observation_results = [_observation("https://hentaiverse.org/")]
                 browser.direct_destination = landed_url
-                browser.diagnostic_path = Path("/tmp/battle_route_not_ready.html")
                 page.markers = _markers(completion=True)
 
                 with (
@@ -943,10 +1035,7 @@ class StartupBattlePresenceReconciliationTests(unittest.IsolatedAsyncioTestCase)
                     ["https://hentaiverse.org/?s=Battle&ss=ar"],
                 )
                 self.assertGreater(page.route_observation_calls, 1)
-                self.assertEqual(
-                    browser.diagnostic_calls,
-                    ["battle_route_not_ready"],
-                )
+                self.assertEqual(browser.diagnostic_calls, [])
 
     async def test_confirmed_absence_logs_canonical_source_at_debug(self) -> None:
         session, browser, page = _session_with_launcher()

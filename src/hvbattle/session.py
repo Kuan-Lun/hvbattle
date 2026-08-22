@@ -1,7 +1,9 @@
 """State inspection and atomic actions for one HentaiVerse battle session."""
 
 import asyncio
+import math
 from collections.abc import Awaitable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
 
@@ -18,6 +20,7 @@ from hvbrowser.runtime import (
 )
 from zendriver import cdp
 
+from ._timing import PROTOCOL_TIMEOUT_SECONDS, SemanticDeadline, protocol_timeout
 from .battle_launcher import BattleLauncher
 from .battle_state import BattleStateStore
 from .contracts import (
@@ -45,7 +48,7 @@ _BATTLE_PHASE_ACTIVE = "active"
 _BATTLE_PHASE_COMPLETE = "complete"
 _BATTLE_PHASE_NEXT_FLOOR = "next-floor"
 _FINAL_COMPLETION_SELECTOR = '#pane_completion img[src*="finishbattle.png"]'
-_DIALOG_MUTATION_TIMEOUT_SECONDS = 15.0
+_DIALOG_MUTATION_TIMEOUT_SECONDS = PROTOCOL_TIMEOUT_SECONDS
 _BATTLE_PHASE_JS = r"""
 (() => {
     const pane = document.getElementById("pane_completion");
@@ -59,6 +62,52 @@ _BATTLE_PHASE_JS = r"""
     return "active";
 })()
 """
+_BATTLE_PRESENCE_JS = r"""
+(() => {
+    const completionPane = document.getElementById("pane_completion");
+    return {
+        ponychart: Boolean(document.getElementById("riddlesubmit")),
+        completion: Boolean(
+            completionPane
+            && completionPane.querySelector('img[src*="finishbattle.png"]')
+        ),
+        nextFloor: Boolean(document.getElementById("btcp")),
+        battleMain: Boolean(document.getElementById("battle_main")),
+    };
+})()
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class _BattlePresenceObservation:
+    ponychart: bool
+    completion: bool
+    next_floor: bool
+    battle_main: bool
+
+    @classmethod
+    def from_raw(cls, raw: object) -> _BattlePresenceObservation:
+        if not isinstance(raw, dict) or set(raw) != {
+            "ponychart",
+            "completion",
+            "nextFloor",
+            "battleMain",
+        }:
+            raise RuntimeError(f"Invalid battle presence payload: {raw!r}")
+        values = (
+            raw["ponychart"],
+            raw["completion"],
+            raw["nextFloor"],
+            raw["battleMain"],
+        )
+        if any(type(value) is not bool for value in values):
+            raise RuntimeError(f"Invalid battle presence payload: {raw!r}")
+        return cls(
+            ponychart=raw["ponychart"],
+            completion=raw["completion"],
+            next_floor=raw["nextFloor"],
+            battle_main=raw["battleMain"],
+        )
 
 
 class BattleSession:
@@ -275,7 +324,7 @@ class BattleSession:
     async def _ensure_classifier(self) -> None:
         if self._classifier_prepared:
             return
-        await asyncio.to_thread(preload_ponychart_classifier)
+        await preload_ponychart_classifier()
         self._classifier_prepared = True
 
     async def __aexit__(
@@ -422,7 +471,6 @@ class BattleSession:
         stable_checks: int = 2,
         check_interval: float = 0.25,
         probe_timeout: float = 2.0,
-        reload_timeout: float = 15.0,
     ) -> bool:
         """Delegate reload reconciliation, then clear only session-owned caches."""
         if not isinstance(error, BattleActionOutcomeUnknownError):
@@ -442,7 +490,6 @@ class BattleSession:
             stable_checks=stable_checks,
             check_interval=check_interval,
             probe_timeout=probe_timeout,
-            reload_timeout=reload_timeout,
         )
         if not recovered:
             return False
@@ -460,44 +507,104 @@ class BattleSession:
             return "Round   ? / ?  "
         return f"Round {self.current_round:>3} / {self.total_rounds:<3}"
 
-    async def prepare_turn_state(self) -> BattleTurnState:
-        """Refresh the page and return one explicit turn-preparation state."""
-        if not await self._has_battle_marker():
-            return BattleTurnState(BattleTurnPhase.ABSENT)
+    async def prepare_turn_state(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> BattleTurnState:
+        """Refresh the page and return one explicit turn-preparation state.
 
-        phase = await self._read_battle_phase()
-        if phase == _BATTLE_PHASE_COMPLETE:
+        Every browser read shares one absolute deadline. ``timeout`` lets the
+        runner pass the remaining readiness budget; ordinary preparation uses
+        one protocol-sized five-second budget for the whole snapshot.
+        """
+        operation_timeout = PROTOCOL_TIMEOUT_SECONDS if timeout is None else timeout
+        if (
+            not isinstance(operation_timeout, (int, float))
+            or isinstance(operation_timeout, bool)
+            or not math.isfinite(operation_timeout)
+            or operation_timeout <= 0
+            or operation_timeout > PROTOCOL_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "prepare_turn_state timeout must be finite and in the range (0, 5]"
+            )
+        return await self._prepare_turn_state_bounded(operation_timeout)
+
+    async def _prepare_turn_state_bounded(self, timeout: float) -> BattleTurnState:
+        """Reconcile a pending NOT_READY state within one absolute deadline."""
+
+        deadline = SemanticDeadline.after(timeout)
+        observation = await self._read_battle_presence_observation(
+            timeout=deadline.protocol_timeout()
+        )
+        deadline.require_remaining(
+            "Battle state readiness deadline expired during presence probe"
+        )
+        if not observation.battle_main:
+            return BattleTurnState(BattleTurnPhase.ABSENT)
+        if observation.completion:
             self._completion_observed = True
             logger.debug("Final battle completion control is ready.")
             return BattleTurnState(BattleTurnPhase.COMPLETE)
-        if phase == _BATTLE_PHASE_NEXT_FLOOR:
+        if observation.next_floor:
             return self._prepare_round_transition()
-        if await self.is_ponychart_present():
+        if observation.ponychart:
             return BattleTurnState(BattleTurnPhase.CHALLENGE)
 
         try:
-            await self._state().update()
+            await self._state().update(
+                timeout=deadline.require_remaining(
+                    "Battle state readiness deadline expired before content probe"
+                )
+            )
+            deadline.require_remaining(
+                "Battle state readiness deadline expired during content probe"
+            )
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
-            if await self.is_ponychart_present():
+            if deadline.remaining() <= 0:
+                # The parser/content transaction consumed the final budget.
+                # Preserve that failure without starting a reconciliation read.
+                raise
+            observation = await self._read_battle_presence_observation(
+                timeout=deadline.protocol_timeout()
+            )
+            deadline.require_remaining(
+                "Battle state readiness deadline expired during error reconciliation"
+            )
+            if observation.ponychart:
                 return BattleTurnState(BattleTurnPhase.CHALLENGE)
-            phase = await self._read_battle_phase()
-            if phase == _BATTLE_PHASE_COMPLETE:
+            if observation.completion:
                 self._completion_observed = True
                 logger.debug("Final battle completion control appeared while parsing.")
                 return BattleTurnState(BattleTurnPhase.COMPLETE)
-            if phase == _BATTLE_PHASE_NEXT_FLOOR:
+            if observation.next_floor:
                 return self._prepare_round_transition()
             raise
 
-        phase = await self._read_battle_phase()
-        if phase == _BATTLE_PHASE_COMPLETE:
+        observation = await self._read_battle_presence_observation(
+            timeout=deadline.protocol_timeout()
+        )
+        deadline.require_remaining(
+            "Battle state readiness deadline expired during final presence probe"
+        )
+        if observation.completion:
             self._completion_observed = True
             logger.debug("Final battle completion control appeared after parsing.")
             return BattleTurnState(BattleTurnPhase.COMPLETE)
-        if phase == _BATTLE_PHASE_NEXT_FLOOR:
+        if observation.next_floor:
             return self._prepare_round_transition()
+        if observation.ponychart:
+            return BattleTurnState(BattleTurnPhase.CHALLENGE)
+        if not observation.battle_main:
+            return BattleTurnState(BattleTurnPhase.ABSENT)
+        return self._prepare_parsed_active_turn()
+
+    def _prepare_parsed_active_turn(self) -> BattleTurnState:
+        """Publish one already-parsed active snapshot to turn policy."""
+
         parser_warnings = tuple(self.snapshot.warnings)
         if not self.alive_monster_ids:
             logger.debug(
@@ -571,11 +678,27 @@ class BattleSession:
         """Inspect challenge presence without parsing ordinary battle HTML."""
         return await self._ponychart.is_present()
 
+    async def _read_battle_presence_observation(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> _BattlePresenceObservation:
+        """Read every battle-presence marker in one protocol transaction."""
+        operation_timeout = (
+            PROTOCOL_TIMEOUT_SECONDS if timeout is None else protocol_timeout(timeout)
+        )
+        raw = await wait_for_zendriver(
+            self.page.evaluate(_BATTLE_PRESENCE_JS),
+            timeout=operation_timeout,
+            owner=self.page,
+        )
+        return _BattlePresenceObservation.from_raw(raw)
+
     async def _read_battle_phase(self) -> str:
         """Read final and next-floor controls atomically, with final priority."""
         phase = await wait_for_zendriver(
             self.page.evaluate(_BATTLE_PHASE_JS),
-            timeout=8.0,
+            timeout=PROTOCOL_TIMEOUT_SECONDS,
             owner=self.page,
         )
         if phase not in {
@@ -606,7 +729,7 @@ class BattleSession:
         return bool(
             await wait_for_zendriver(
                 self.page.evaluate("Boolean(document.getElementById('battle_main'))"),
-                timeout=5.0,
+                timeout=PROTOCOL_TIMEOUT_SECONDS,
                 owner=self.page,
             )
         )
@@ -742,8 +865,16 @@ class BattleSession:
     async def list_arena_options(self) -> tuple[ArenaOption, ...]:
         return await self._launcher.list_arena_options()
 
-    async def start_arena(self, option: ArenaOption) -> bool:
-        return await self._launcher.start_arena(option)
+    async def start_arena(
+        self,
+        option: ArenaOption,
+        *,
+        expected_realm: Realm,
+    ) -> bool:
+        return await self._launcher.start_arena(
+            option,
+            expected_realm=expected_realm,
+        )
 
     async def inspect_ring_of_blood(self) -> RingOfBloodSnapshot:
         return await self._launcher.inspect_ring_of_blood()
@@ -753,17 +884,27 @@ class BattleSession:
         option: RingOfBloodOption,
         *,
         expected_before: RingOfBloodSnapshot,
+        expected_realm: Realm,
     ) -> RingOfBloodStartOutcome:
         return await self._launcher.start_ring_of_blood(
             option,
             expected_before=expected_before,
+            expected_realm=expected_realm,
         )
 
     async def list_grindfest_options(self) -> tuple[GrindfestOption, ...]:
         return await self._launcher.list_grindfest_options()
 
-    async def start_grindfest(self, option: GrindfestOption) -> bool:
-        return await self._launcher.start_grindfest(option)
+    async def start_grindfest(
+        self,
+        option: GrindfestOption,
+        *,
+        expected_realm: Realm,
+    ) -> bool:
+        return await self._launcher.start_grindfest(
+            option,
+            expected_realm=expected_realm,
+        )
 
     async def save_page_diagnostic(self, kind: str) -> Path | None:
         """Persist one bounded, redacted diagnostic through the browser owner."""
@@ -777,21 +918,32 @@ class BattleSession:
         callers must use :meth:`reconcile_startup_battle_presence` instead.
         """
 
-        if await self.is_ponychart_present():
+        observation = await self._read_battle_presence_observation()
+        if observation.ponychart:
             return BattlePresence.ACTIVE
-        phase = await self._read_battle_phase()
-        if phase == _BATTLE_PHASE_COMPLETE:
+        if observation.completion:
             self._completion_observed = True
             return BattlePresence.COMPLETION
-        if phase == _BATTLE_PHASE_NEXT_FLOOR:
+        if observation.next_floor:
             return BattlePresence.ACTIVE
-        if await self._has_battle_marker():
-            return BattlePresence.ACTIVE
-        if await self.is_ponychart_present():
+        if observation.battle_main:
             return BattlePresence.ACTIVE
 
         logger.debug("No active battle detected.")
         return BattlePresence.ABSENT
+
+    async def confirm_current_battle_receipt(
+        self,
+        *,
+        expected_realm: Realm,
+        timeout: float,
+    ) -> MaintenanceNavigationBlocker:
+        """Verify one caller-navigated document without starting a second wait."""
+
+        return await self._launcher.confirm_current_battle_receipt(
+            expected_realm=expected_realm,
+            timeout=timeout,
+        )
 
     async def reconcile_startup_battle_presence(
         self,

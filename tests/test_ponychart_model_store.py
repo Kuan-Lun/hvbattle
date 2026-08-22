@@ -64,6 +64,12 @@ class _Response:
         self._content = content
         self._offset = 0
         self._final_url = final_url
+        self.read_idle_timeouts: list[float] = []
+        self.fp = SimpleNamespace(
+            raw=SimpleNamespace(
+                _sock=SimpleNamespace(settimeout=self.read_idle_timeouts.append)
+            )
+        )
         self.headers: dict[str, str] = {}
         if etag is not None:
             self.headers["ETag"] = etag
@@ -118,6 +124,7 @@ class _Remote:
         self.head_etags: dict[str, list[str | None]] = {}
         self.fail_get: str | None = None
         self.calls: list[tuple[str, str, dict[str, object]]] = []
+        self.responses: list[_Response] = []
         self._head_counts: Counter[str] = Counter()
 
     def __call__(self, request: object, **kwargs: object) -> _Response:
@@ -134,10 +141,12 @@ class _Remote:
                 if scripted
                 else self.etags[filename]
             )
-            return _Response(
+            response = _Response(
                 etag=etag,
                 final_url=self.head_final_urls.get(filename, requested_url),
             )
+            self.responses.append(response)
+            return response
         if filename == self.fail_get:
             raise URLError("offline failure")
         response = _Response(
@@ -147,6 +156,7 @@ class _Remote:
             content_length=self.content_lengths[filename],
         )
         response.headers.update(self.extra_get_headers.get(filename, {}))
+        self.responses.append(response)
         return response
 
     def set_bundle(
@@ -171,6 +181,7 @@ class _Remote:
         self.head_etags.clear()
         self._head_counts.clear()
         self.calls.clear()
+        self.responses.clear()
 
 
 class _Candidate:
@@ -237,16 +248,18 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
         remote: _Remote | Mock,
         *,
         base_url: str = "https://models.invalid/ponychart",
-        timeout: float = 9.5,
-        transfer_timeout: float = 40.0,
+        connect_timeout: float = 4.5,
+        read_idle_timeout: float = 4.5,
+        refresh_timeout: float = 40.0,
         max_model_bytes: int = 1024 * 1024,
         max_thresholds_bytes: int = 1024 * 1024,
     ) -> PonyChartGenerationStore:
         return PonyChartGenerationStore(
             root=self.root,
             base_url=base_url,
-            timeout=timeout,
-            transfer_timeout=transfer_timeout,
+            connect_timeout=connect_timeout,
+            read_idle_timeout=read_idle_timeout,
+            refresh_timeout=refresh_timeout,
             max_model_bytes=max_model_bytes,
             max_thresholds_bytes=max_thresholds_bytes,
             candidate_factory=self.factory,
@@ -299,6 +312,8 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
         generation = self.root / "generations" / loaded.generation
         self.assertEqual((generation / "model.onnx").read_bytes(), b"remote-model")
         self.assertTrue((generation / "manifest.json").is_file())
+        self.assertEqual(loaded.model_path, generation / "model.onnx")
+        self.assertEqual(loaded.thresholds_path, generation / "thresholds.json")
         self.assertEqual(
             self.factory.candidates[-1].model_path,
             generation / "model.onnx",
@@ -317,6 +332,8 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
         )
         reloaded = second_store.load_or_bootstrap()
         self.assertEqual(reloaded.generation, loaded.generation)
+        self.assertEqual(reloaded.model_path, generation / "model.onnx")
+        self.assertEqual(reloaded.thresholds_path, generation / "thresholds.json")
         self.assertEqual(
             second_factory.candidates[-1].model_path,
             generation / "model.onnx",
@@ -525,14 +542,18 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
         self.assertEqual(self._pointer()["generation"], initial.generation)
         self.assertTrue((self.root / "generations" / initial.generation).is_dir())
 
-    def test_all_requests_use_verified_tls_and_finite_timeout(self) -> None:
+    def test_requests_split_connect_idle_and_refresh_timeouts(self) -> None:
         remote = _Remote(
             model=b"model",
             thresholds=b"{}",
             model_etag='"model"',
             thresholds_etag='"thresholds"',
         )
-        self._store(remote, timeout=7.25).load_or_bootstrap()
+        self._store(
+            remote,
+            connect_timeout=4.25,
+            read_idle_timeout=4.75,
+        ).load_or_bootstrap()
 
         self.assertGreater(len(remote.calls), 0)
         for _, _, kwargs in remote.calls:
@@ -541,7 +562,77 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
             self.assertTrue(context.check_hostname)
             self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
             self.assertTrue(context.verify_flags & ssl.VERIFY_X509_STRICT)
-            self.assertEqual(kwargs["timeout"], 7.25)
+            self.assertLessEqual(kwargs["timeout"], 4.25)
+        get_responses = [
+            response
+            for (method, _, _), response in zip(remote.calls, remote.responses)
+            if method == "GET"
+        ]
+        self.assertGreater(len(get_responses), 0)
+        self.assertTrue(
+            all(
+                response.read_idle_timeouts and max(response.read_idle_timeouts) <= 4.75
+                for response in get_responses
+            )
+        )
+
+    def test_connect_timeout_cannot_exceed_protocol_sized_watchdog(self) -> None:
+        for invalid in (5.01, True):
+            with self.subTest(timeout=invalid):
+                with self.assertRaisesRegex(ValueError, "connect_timeout"):
+                    self._store(Mock(), connect_timeout=invalid)
+
+    def test_read_idle_timeout_cannot_exceed_protocol_sized_watchdog(self) -> None:
+        for invalid in (5.01, True):
+            with self.subTest(timeout=invalid):
+                with self.assertRaisesRegex(ValueError, "read_idle_timeout"):
+                    self._store(Mock(), read_idle_timeout=invalid)
+
+    def test_refresh_timeout_cannot_exceed_refresh_lifecycle_budget(self) -> None:
+        for invalid in (120.01, True):
+            with self.subTest(timeout=invalid):
+                with self.assertRaisesRegex(ValueError, "refresh_timeout"):
+                    self._store(Mock(), refresh_timeout=invalid)
+
+    def test_metadata_pair_shares_one_five_second_snapshot_deadline(self) -> None:
+        base_url = "https://models.invalid/ponychart"
+        clock = [0.0]
+        timeouts: list[float] = []
+
+        def urlopen(request: object, **kwargs: object) -> _Response:
+            timeouts.append(float(kwargs["timeout"]))
+            if len(timeouts) == 1:
+                clock[0] = 4.25
+            requested_url = request.full_url  # type: ignore[attr-defined]
+            return _Response(etag='"etag"', final_url=requested_url)
+
+        store = self._store(Mock(), base_url=base_url)
+        store._urlopen = urlopen
+        with patch.object(store_module.time, "monotonic", side_effect=lambda: clock[0]):
+            metadata = store._remote_metadata(deadline=120.0)
+
+        self.assertTrue(metadata.is_complete)
+        self.assertEqual(timeouts, [4.5, 0.75])
+
+    def test_metadata_does_not_start_second_head_after_snapshot_expiry(self) -> None:
+        clock = [0.0]
+        calls = 0
+
+        def urlopen(request: object, **_kwargs: object) -> _Response:
+            nonlocal calls
+            calls += 1
+            clock[0] = 5.0
+            requested_url = request.full_url  # type: ignore[attr-defined]
+            return _Response(etag='"model"', final_url=requested_url)
+
+        store = self._store(Mock())
+        store._urlopen = urlopen
+        with patch.object(store_module.time, "monotonic", side_effect=lambda: clock[0]):
+            metadata = store._remote_metadata(deadline=120.0)
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(metadata.model_etag, '"model"')
+        self.assertIsNone(metadata.thresholds_etag)
 
     def test_tls_context_adds_certifi_to_system_roots(self) -> None:
         context = Mock(
@@ -597,7 +688,7 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
                 _Response(etag='"thresholds"', final_url=thresholds_url),
             )
         )
-        store = self._store(urlopen, base_url=base_url, timeout=6.5)
+        store = self._store(urlopen, base_url=base_url, connect_timeout=4.5)
 
         self.assertEqual(store._remote_etag("model.onnx"), '"model"')
         self.assertEqual(store._remote_etag("thresholds.json"), '"thresholds"')
@@ -616,9 +707,49 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
             next_request.kwargs["context"],
             store._compatibility_ssl_context,
         )
-        self.assertEqual(strict_call.kwargs["timeout"], 6.5)
-        self.assertEqual(compatibility_retry.kwargs["timeout"], 6.5)
-        self.assertEqual(next_request.kwargs["timeout"], 6.5)
+        self.assertEqual(strict_call.kwargs["timeout"], 4.5)
+        self.assertEqual(compatibility_retry.kwargs["timeout"], 4.5)
+        self.assertEqual(next_request.kwargs["timeout"], 4.5)
+
+    def test_missing_ski_fallback_uses_only_snapshot_remaining(self) -> None:
+        base_url = "https://www.csie.ntu.edu.tw/~d06922002/ponychart_classifier"
+        requested_url = f"{base_url}/model.onnx"
+        clock = [0.0]
+        timeouts: list[float] = []
+
+        def urlopen(_request: object, **kwargs: object) -> _Response:
+            timeouts.append(float(kwargs["timeout"]))
+            if len(timeouts) == 1:
+                clock[0] = 4.25
+                raise _missing_ski_error()
+            return _Response(etag='"model"', final_url=requested_url)
+
+        store = self._store(Mock(), base_url=base_url)
+        store._urlopen = urlopen
+        with patch.object(store_module.time, "monotonic", side_effect=lambda: clock[0]):
+            etag = store._remote_etag("model.onnx", deadline=120.0)
+
+        self.assertEqual(etag, '"model"')
+        self.assertEqual(timeouts, [4.5, 0.75])
+
+    def test_missing_ski_fallback_is_not_started_after_snapshot_expiry(self) -> None:
+        base_url = "https://www.csie.ntu.edu.tw/~d06922002/ponychart_classifier"
+        clock = [0.0]
+        calls = 0
+
+        def urlopen(_request: object, **_kwargs: object) -> _Response:
+            nonlocal calls
+            calls += 1
+            clock[0] = 5.0
+            raise _missing_ski_error()
+
+        store = self._store(Mock(), base_url=base_url)
+        store._urlopen = urlopen
+        with patch.object(store_module.time, "monotonic", side_effect=lambda: clock[0]):
+            etag = store._remote_etag("model.onnx", deadline=120.0)
+
+        self.assertIsNone(etag)
+        self.assertEqual(calls, 1)
 
     def test_head_does_not_retry_near_match_certificate_errors(self) -> None:
         base_url = "https://www.csie.ntu.edu.tw/~d06922002/ponychart_classifier"
@@ -849,15 +980,52 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
             model_etag='"model"',
             thresholds_etag='"thresholds"',
         )
-        store = self._store(remote, transfer_timeout=1.0)
+        store = self._store(remote, refresh_timeout=1.0)
+        clock = [0.0]
+
+        def expiring_remote(request: object, **kwargs: object) -> _Response:
+            response = remote(request, **kwargs)
+            if request.get_method() == "GET":  # type: ignore[attr-defined]
+                clock[0] = 2.0
+            return response
+
+        store._urlopen = expiring_remote
 
         with (
-            patch.object(
-                store_module.time,
-                "monotonic",
-                side_effect=(0.0, 0.0, 2.0),
-            ),
+            patch.object(store_module.time, "monotonic", side_effect=lambda: clock[0]),
             self.assertRaises(PonyChartArtifactError),
+        ):
+            store.load_or_bootstrap()
+
+        self.assertFalse((self.root / "current.json").exists())
+        self.assertEqual([call[0] for call in remote.calls], ["HEAD", "HEAD", "GET"])
+
+    def test_candidate_overrun_is_detected_before_pointer_commit(self) -> None:
+        remote = _Remote(
+            model=b"model",
+            thresholds=b"{}",
+            model_etag='"model"',
+            thresholds_etag='"thresholds"',
+        )
+        store = self._store(remote, refresh_timeout=1.0)
+        clock = [0.0]
+        original_factory = store._candidate_factory
+
+        def expiring_factory(model_path: Path, thresholds_path: Path) -> _Candidate:
+            candidate = original_factory(model_path, thresholds_path)
+            original_load = candidate.load
+
+            def expiring_load() -> None:
+                original_load()
+                clock[0] = 2.0
+
+            candidate.load = expiring_load  # type: ignore[method-assign]
+            return candidate
+
+        store._candidate_factory = expiring_factory
+        with (
+            patch.object(store_module.time, "monotonic", side_effect=lambda: clock[0]),
+            self.assertRaises(TimeoutError),
         ):
             store.load_or_bootstrap()
 
@@ -898,12 +1066,32 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
                 patch.dict(sys.modules, {"msvcrt": fake_msvcrt}),
                 patch.object(store_module.time, "sleep") as sleep,
             ):
-                store_module._acquire_windows_file_lock(descriptor)
+                store_module._acquire_windows_file_lock(
+                    descriptor,
+                    deadline=store_module.time.monotonic() + 1.0,
+                )
         finally:
             os.close(descriptor)
 
         self.assertEqual(calls, 3)
         self.assertEqual(sleep.call_count, 2)
+
+    def test_process_lock_deadline_bounds_the_critical_section(self) -> None:
+        store = self._store(Mock())
+        clock = [0.0]
+
+        with (
+            patch.object(store_module.time, "monotonic", side_effect=lambda: clock[0]),
+            self.assertRaisesRegex(TimeoutError, "while held"),
+        ):
+            with store._process_lock() as lock_deadline:
+                self.assertEqual(lock_deadline, 5.0)
+                clock[0] = 6.0
+
+        with store._process_lock(
+            deadline=store_module.time.monotonic() + 1.0
+        ) as lock_deadline:
+            self.assertGreater(lock_deadline, store_module.time.monotonic())
 
     def test_refresh_adopts_peer_pointer_without_network(self) -> None:
         peer_remote, first_store, initial = self._initial_store()
@@ -936,11 +1124,11 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
         release_commit = threading.Event()
         original_commit = first_store._commit_pointer
 
-        def blocked_commit(pointer: object) -> None:
+        def blocked_commit(pointer: object, *, deadline: float) -> None:
             reached_commit.set()
             if not release_commit.wait(timeout=2):
                 raise TimeoutError("test did not release first pointer commit")
-            original_commit(pointer)  # type: ignore[arg-type]
+            original_commit(pointer, deadline=deadline)  # type: ignore[arg-type]
 
         first_store._commit_pointer = blocked_commit  # type: ignore[method-assign]
 
@@ -950,10 +1138,13 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
         original_process_lock = second_store._process_lock
 
         @contextmanager
-        def observed_process_lock() -> Iterator[None]:
+        def observed_process_lock(
+            *,
+            deadline: float | None = None,
+        ) -> Iterator[float]:
             attempted_second_lock.set()
-            with original_process_lock():
-                yield
+            with original_process_lock(deadline=deadline) as lock_deadline:
+                yield lock_deadline
 
         second_store._process_lock = observed_process_lock  # type: ignore[method-assign]
 
@@ -1009,6 +1200,86 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
                 process.terminate()
                 process.join(timeout=5)
 
+    def test_process_lock_contention_honors_caller_deadline(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        parent_connection, child_connection = context.Pipe()
+        process = context.Process(
+            target=_hold_store_process_lock,
+            args=(str(self.root), child_connection),
+        )
+        process.start()
+        child_connection.close()
+        store = self._store(Mock())
+
+        try:
+            self.assertTrue(parent_connection.poll(5))
+            self.assertEqual(parent_connection.recv(), "locked")
+            started = store_module.time.monotonic()
+            with self.assertRaisesRegex(TimeoutError, "lock deadline"):
+                with store._process_lock(deadline=started + 0.2):
+                    self.fail("contended process lock must not be entered")
+            self.assertLess(store_module.time.monotonic() - started, 1.0)
+            self.assertTrue(process.is_alive())
+            parent_connection.send("release")
+            process.join(timeout=5)
+            self.assertEqual(process.exitcode, 0)
+        finally:
+            parent_connection.close()
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    def test_network_and_candidate_validation_run_outside_pointer_lock(self) -> None:
+        remote = _Remote(
+            model=b"model",
+            thresholds=b"{}",
+            model_etag='"model"',
+            thresholds_etag='"thresholds"',
+        )
+        lock_depth = 0
+
+        def guarded_remote(request: object, **kwargs: object) -> _Response:
+            self.assertEqual(lock_depth, 0)
+            return remote(request, **kwargs)
+
+        store = self._store(Mock())
+        store._urlopen = guarded_remote
+        original_process_lock = store._process_lock
+        original_factory = store._candidate_factory
+
+        @contextmanager
+        def observed_process_lock(
+            *,
+            deadline: float | None = None,
+        ) -> Iterator[float]:
+            nonlocal lock_depth
+            with original_process_lock(deadline=deadline) as lock_deadline:
+                lock_depth += 1
+                try:
+                    yield lock_deadline
+                finally:
+                    lock_depth -= 1
+
+        def guarded_factory(model_path: Path, thresholds_path: Path) -> _Candidate:
+            self.assertEqual(lock_depth, 0)
+            candidate = original_factory(model_path, thresholds_path)
+            original_load = candidate.load
+
+            def guarded_load() -> None:
+                self.assertEqual(lock_depth, 0)
+                original_load()
+
+            candidate.load = guarded_load  # type: ignore[method-assign]
+            return candidate
+
+        store._process_lock = observed_process_lock  # type: ignore[method-assign]
+        store._candidate_factory = guarded_factory
+
+        loaded = store.load_or_bootstrap()
+
+        self.assertEqual(self._pointer()["generation"], loaded.generation)
+        self.assertEqual(lock_depth, 0)
+
     def test_concurrent_same_generation_rename_adopts_valid_winner(self) -> None:
         remote = _Remote(
             model=b"model",
@@ -1018,7 +1289,11 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
         )
         store = self._store(remote)
         remote_before = store._remote_metadata()
-        prepared, _ = store._prepare_download_stage(remote_before)
+        deadline = store_module.time.monotonic() + 10.0
+        prepared, _ = store._prepare_download_stage(
+            remote_before,
+            deadline=deadline,
+        )
         destination = self.root / "generations" / prepared.generation
         original_rename = Path.rename
 
@@ -1029,7 +1304,7 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
             return original_rename(path, target)
 
         with patch.object(Path, "rename", new=lose_race):
-            loaded = store._install_prepared(prepared)
+            loaded = store._install_prepared(prepared, deadline=deadline)
 
         self.assertEqual(loaded.generation, prepared.generation)
         self.assertTrue(destination.is_dir())
@@ -1038,95 +1313,206 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
 
 class PonyChartPublicationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self.original_predictor = ponychart_module._predict
-        self.original_generation = ponychart_module._generation_id
-        self.original_store = ponychart_module._model_store
+        self.original_descriptor = ponychart_module._generation_descriptor
+        self.original_store_owner = ponychart_module._store_owner
+        self.original_inference_owner = ponychart_module._inference_owner
+        self.original_retention_owner = ponychart_module._retention_owner
+        self.original_lifecycle_lock = ponychart_module._lifecycle_lock
+        self.original_lifecycle_lock_loop = ponychart_module._lifecycle_lock_loop
+        ponychart_module._store_owner = Mock()
+        ponychart_module._inference_owner = Mock()
+        ponychart_module._inference_owner.prepare_async = AsyncMock()
+        ponychart_module._inference_owner.retire_superseded_async = AsyncMock()
+        ponychart_module._inference_owner.activate.return_value = ()
+        ponychart_module._retention_owner = Mock()
+        ponychart_module._retention_owner.prepare_async = AsyncMock()
+        ponychart_module._lifecycle_lock = None
+        ponychart_module._lifecycle_lock_loop = None
 
     def tearDown(self) -> None:
         with ponychart_module._publication_lock:
-            ponychart_module._predict = self.original_predictor
-            ponychart_module._generation_id = self.original_generation
-        ponychart_module._model_store = self.original_store
+            ponychart_module._generation_descriptor = self.original_descriptor
+        ponychart_module._store_owner = self.original_store_owner
+        ponychart_module._inference_owner = self.original_inference_owner
+        ponychart_module._retention_owner = self.original_retention_owner
+        ponychart_module._lifecycle_lock = self.original_lifecycle_lock
+        ponychart_module._lifecycle_lock_loop = self.original_lifecycle_lock_loop
 
-    def test_preload_publishes_generation_once(self) -> None:
-        predictor = Mock()
-        store = Mock()
-        store.load_or_bootstrap.return_value = LoadedPonyChartGeneration(
-            "a" * 64,
-            predictor,
+    async def test_preload_publishes_descriptor_once(self) -> None:
+        store_owner = ponychart_module._store_owner
+        store_owner.load_or_bootstrap = AsyncMock(
+            return_value=LoadedPonyChartGeneration(
+                "a" * 64,
+                Path("/models/a/model.onnx"),
+                Path("/models/a/thresholds.json"),
+            )
         )
         with ponychart_module._publication_lock:
-            ponychart_module._predict = None
-            ponychart_module._generation_id = None
-        ponychart_module._model_store = store
+            ponychart_module._generation_descriptor = None
 
-        ponychart_module.preload_ponychart_classifier()
-        ponychart_module.preload_ponychart_classifier()
+        await ponychart_module.preload_ponychart_classifier()
+        await ponychart_module.preload_ponychart_classifier()
 
-        store.load_or_bootstrap.assert_called_once_with()
+        store_owner.load_or_bootstrap.assert_awaited_once()
+        descriptor = ponychart_module._published_descriptor()
+        assert descriptor is not None
+        self.assertEqual(descriptor.generation, "a" * 64)
+        self.assertEqual(descriptor.model_path, Path("/models/a/model.onnx"))
         self.assertEqual(
-            ponychart_module._published_snapshot(),
-            (predictor, "a" * 64),
+            descriptor.thresholds_path,
+            Path("/models/a/thresholds.json"),
+        )
+        self.assertEqual(
+            ponychart_module._inference_owner.prepare_async.await_count,
+            2,
+        )
+        self.assertEqual(
+            ponychart_module._retention_owner.prepare_async.await_count,
+            2,
         )
 
-    def test_refresh_failure_keeps_predictor_generation_pair(self) -> None:
-        old_predictor = Mock()
-        ponychart_module._publish(old_predictor, "a" * 64)
-        store = Mock()
-        store.refresh.side_effect = PonyChartArtifactError("unreachable")
-        ponychart_module._model_store = store
+    async def test_refresh_failure_keeps_published_descriptor(self) -> None:
+        old = ponychart_module.PonyChartGenerationDescriptor(
+            "a" * 64,
+            Path("/models/a/model.onnx"),
+            Path("/models/a/thresholds.json"),
+        )
+        with ponychart_module._publication_lock:
+            ponychart_module._generation_descriptor = old
+        ponychart_module._store_owner.refresh = AsyncMock(
+            side_effect=PonyChartArtifactError("unreachable")
+        )
 
         with self.assertRaises(PonyChartArtifactError):
-            ponychart_module.refresh_ponychart_classifier()
+            await ponychart_module.refresh_ponychart_classifier()
 
-        self.assertEqual(
-            ponychart_module._published_snapshot(),
-            (old_predictor, "a" * 64),
+        self.assertIs(ponychart_module._published_descriptor(), old)
+
+    async def test_refresh_passes_one_absolute_lifecycle_deadline_to_all_owners(
+        self,
+    ) -> None:
+        loaded = LoadedPonyChartGeneration(
+            "b" * 64,
+            Path("/models/b/model.onnx"),
+            Path("/models/b/thresholds.json"),
         )
+        ponychart_module._store_owner.refresh = AsyncMock(
+            return_value=PonyChartStoreRefresh(
+                PonyChartRefreshOutcome.UPDATED,
+                loaded,
+            )
+        )
+        retired = Mock()
+        ponychart_module._inference_owner.activate.return_value = (retired,)
+        outer_deadlines: list[float] = []
+        original_phase_deadline = ponychart_module._lifecycle_phase_deadline
+
+        def record_phase_deadline(
+            expires_at: float,
+            *,
+            maximum: float,
+            reserve: float = 0.0,
+            operation: str,
+        ) -> float:
+            outer_deadlines.append(expires_at)
+            return original_phase_deadline(
+                expires_at,
+                maximum=maximum,
+                reserve=reserve,
+                operation=operation,
+            )
+
+        with patch.object(
+            ponychart_module,
+            "_lifecycle_phase_deadline",
+            record_phase_deadline,
+        ):
+            outcome = await ponychart_module.refresh_ponychart_classifier()
+
+        self.assertEqual(outcome, PonyChartRefreshOutcome.UPDATED)
+        self.assertTrue(outer_deadlines)
+        self.assertTrue(
+            all(deadline == outer_deadlines[0] for deadline in outer_deadlines)
+        )
+        refresh_kwargs = ponychart_module._store_owner.refresh.await_args.kwargs
+        prepare_kwargs = (
+            ponychart_module._inference_owner.prepare_async.await_args.kwargs
+        )
+        retire_kwargs = (
+            ponychart_module._inference_owner.retire_superseded_async.await_args.kwargs
+        )
+        self.assertIn("expires_at", refresh_kwargs)
+        self.assertNotIn("timeout", refresh_kwargs)
+        self.assertIn("expires_at", prepare_kwargs)
+        self.assertNotIn("timeout", prepare_kwargs)
+        self.assertIn("expires_at", retire_kwargs)
+        self.assertNotIn("timeout", retire_kwargs)
+        self.assertLess(refresh_kwargs["expires_at"], outer_deadlines[0])
+        self.assertLess(prepare_kwargs["expires_at"], outer_deadlines[0])
+        self.assertLessEqual(retire_kwargs["expires_at"], outer_deadlines[0])
 
     async def test_inflight_prediction_keeps_old_atomic_snapshot(self) -> None:
         old_started = threading.Event()
         release_old = threading.Event()
 
-        def predict_old(_image: bytes) -> object:
-            old_started.set()
-            if not release_old.wait(timeout=2):
-                raise TimeoutError("old prediction was not released")
-            return SimpleNamespace(labels=frozenset({"Old Snapshot"}))
+        async def predict_reserved(
+            descriptor: object,
+            _image: bytes,
+            *,
+            timeout: float,
+        ) -> tuple[str, ...]:
+            self.assertEqual(timeout, 5.0)
+            generation = descriptor.generation  # type: ignore[attr-defined]
+            if generation == "a" * 64:
+                old_started.set()
+                released = await asyncio.to_thread(release_old.wait, 2)
+                if not released:
+                    raise TimeoutError("old prediction was not released")
+                return ("Old Snapshot",)
+            return ("New Snapshot",)
 
-        predict_new = Mock(
-            return_value=SimpleNamespace(labels=frozenset({"New Snapshot"}))
+        inference_owner = Mock()
+        inference_owner.reserve.side_effect = lambda descriptor: descriptor
+        inference_owner.predict_reserved = AsyncMock(side_effect=predict_reserved)
+        inference_owner.prepare_async = AsyncMock()
+        inference_owner.retire_superseded_async = AsyncMock()
+        inference_owner.activate.return_value = ()
+        ponychart_module._inference_owner = inference_owner
+        old = ponychart_module.PonyChartGenerationDescriptor(
+            "a" * 64,
+            Path("/models/a/model.onnx"),
+            Path("/models/a/thresholds.json"),
         )
-        ponychart_module._publish(predict_old, "a" * 64)
-        store = Mock()
-        store.refresh.return_value = PonyChartStoreRefresh(
-            PonyChartRefreshOutcome.UPDATED,
-            LoadedPonyChartGeneration("b" * 64, predict_new),
+        with ponychart_module._publication_lock:
+            ponychart_module._generation_descriptor = old
+        ponychart_module._store_owner.refresh = AsyncMock(
+            return_value=PonyChartStoreRefresh(
+                PonyChartRefreshOutcome.UPDATED,
+                LoadedPonyChartGeneration(
+                    "b" * 64,
+                    Path("/models/b/model.onnx"),
+                    Path("/models/b/thresholds.json"),
+                ),
+            )
         )
-        ponychart_module._model_store = store
 
-        old_label = Mock(text="Old Snapshot")
-        old_label.click = AsyncMock()
-        new_label = Mock(text="New Snapshot")
-        new_label.click = AsyncMock()
         driver = Mock()
         driver.page = Mock()
-        driver.page.select_all = AsyncMock(return_value=[old_label, new_label])
+        driver.page.evaluate = AsyncMock()
         challenge = PonyChart(driver)
 
-        old_answer = asyncio.create_task(challenge._auto_answer(b"old"))
+        old_answer = asyncio.create_task(challenge._predict_labels(b"old"))
         self.assertTrue(await asyncio.to_thread(old_started.wait, 1))
-        outcome = await asyncio.to_thread(ponychart_module.refresh_ponychart_classifier)
+        outcome = await ponychart_module.refresh_ponychart_classifier()
         release_old.set()
 
         self.assertEqual(outcome, PonyChartRefreshOutcome.UPDATED)
-        self.assertEqual(await old_answer, frozenset({"Old Snapshot"}))
+        self.assertEqual(await old_answer, ("Old Snapshot",))
         self.assertEqual(
-            await challenge._auto_answer(b"new"),
-            frozenset({"New Snapshot"}),
+            await challenge._predict_labels(b"new"),
+            ("New Snapshot",),
         )
-        old_label.click.assert_awaited_once_with()
-        new_label.click.assert_awaited_once_with()
+        driver.page.evaluate.assert_not_awaited()
 
 
 if __name__ == "__main__":

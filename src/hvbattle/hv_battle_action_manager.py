@@ -4,7 +4,7 @@ import asyncio
 import json
 import math
 import re
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -16,7 +16,10 @@ from hvbrowser.runtime import (
     setup_logger,
     wait_for_zendriver,
 )
+from zendriver import cdp
 
+from ._page_lifecycle import MainFrameDOMContentLoadedWaiter
+from ._timing import PROTOCOL_TIMEOUT_SECONDS, SemanticDeadline, protocol_timeout
 from .contracts import (
     BattleActionKind,
     BattleActionOutcomeUnknownError,
@@ -28,8 +31,33 @@ from .recovery import BattleRecoveryState
 logger = setup_logger(__name__)
 
 _STALLED_XHR_MINIMUM_AGE_MS = 5_000.0
-_BATTLE_MUTATION_TIMEOUT_SECONDS = 15.0
-_SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS = 2.0
+_BATTLE_MUTATION_TIMEOUT_SECONDS = PROTOCOL_TIMEOUT_SECONDS
+_ACTION_RECEIPT_DEADLINE_SECONDS = 15.0
+_ACTION_PREPARATION_DEADLINE_SECONDS = PROTOCOL_TIMEOUT_SECONDS
+_MAX_SELECTOR_LOOKUP_ATTEMPTS = 50
+
+
+def _validated_receipt_timing(
+    *,
+    timeout: float,
+    check_interval: float,
+    probe_timeout: float,
+    operation: str,
+) -> tuple[float, float, float]:
+    values = (timeout, check_interval, probe_timeout)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value <= 0
+        for value in values
+    ):
+        raise ValueError(f"{operation} timing must be finite and positive")
+    if timeout > _ACTION_RECEIPT_DEADLINE_SECONDS:
+        raise ValueError(f"{operation} receipt deadline must not exceed 15 seconds")
+    if probe_timeout > PROTOCOL_TIMEOUT_SECONDS:
+        raise ValueError(f"{operation} probe timeout must not exceed 5 seconds")
+    return float(timeout), float(check_interval), float(probe_timeout)
 
 
 # HentaiVerse submits a turn through one JSON XHR, then mutates battle panes and
@@ -84,20 +112,22 @@ _ACTION_STATE_JS = r"""
             response: null,
             observer: null,
             restore: null,
+            restored: false,
         };
 
         const log = document.getElementById("textlog");
-        if (log) {
-            monitor.observer = new MutationObserver((mutations) => {
-                for (const mutation of mutations) {
-                    if (
-                        mutation.type === "childList"
-                        && (mutation.addedNodes.length || mutation.removedNodes.length)
-                    ) {
-                        monitor.logMutations += 1;
-                    }
+        const recordLogMutations = (mutations) => {
+            for (const mutation of mutations) {
+                if (
+                    mutation.type === "childList"
+                    && (mutation.addedNodes.length || mutation.removedNodes.length)
+                ) {
+                    monitor.logMutations += 1;
                 }
-            });
+            }
+        };
+        if (log) {
+            monitor.observer = new MutationObserver(recordLogMutations);
             monitor.observer.observe(log, {childList: true, subtree: true});
         }
 
@@ -193,6 +223,9 @@ _ACTION_STATE_JS = r"""
                                 flags.parseOk = false;
                             }
                             monitor.response = flags;
+                            if (typeof monitor.restore === "function") {
+                                monitor.restore();
+                            }
                         },
                         {once: true},
                     );
@@ -202,13 +235,20 @@ _ACTION_STATE_JS = r"""
         };
 
         monitor.restore = () => {
+            if (monitor.restored) return;
+            monitor.restored = true;
             if (XMLHttpRequest.prototype.open === wrappedOpen) {
                 XMLHttpRequest.prototype.open = originalOpen;
             }
             if (XMLHttpRequest.prototype.send === wrappedSend) {
                 XMLHttpRequest.prototype.send = originalSend;
             }
-            if (monitor.observer) monitor.observer.disconnect();
+            if (monitor.observer) {
+                if (typeof monitor.observer.takeRecords === "function") {
+                    recordLogMutations(monitor.observer.takeRecords());
+                }
+                monitor.observer.disconnect();
+            }
         };
         globalThis.__hvbattleActionMonitor = monitor;
         XMLHttpRequest.prototype.open = wrappedOpen;
@@ -741,6 +781,23 @@ def _transition_receipt_has_at_most_one_dispatch(
     )
 
 
+def _stalled_single_xhr(monitor: _ActionMonitorState | None) -> bool:
+    """Whether exactly one observed action XHR has been pending for five seconds."""
+    return bool(
+        monitor is not None
+        and monitor.sent is True
+        and type(monitor.sent_count) is int
+        and monitor.sent_count == 1
+        and monitor.completed is False
+        and monitor.status is None
+        and monitor.outcome is None
+        and isinstance(monitor.request_age_ms, (int, float))
+        and not isinstance(monitor.request_age_ms, bool)
+        and math.isfinite(monitor.request_age_ms)
+        and monitor.request_age_ms >= _STALLED_XHR_MINIMUM_AGE_MS
+    )
+
+
 def _action_recovery_evidence(
     *,
     action_id: str,
@@ -759,13 +816,8 @@ def _action_recovery_evidence(
         selector=selector,
         click_started=click_started,
         xhr_pending_at_least_five_seconds=bool(
-            action_kind is BattleActionKind.TURN
-            and monitor is not None
-            and monitor.completed is False
-            and isinstance(monitor.request_age_ms, (int, float))
-            and not isinstance(monitor.request_age_ms, bool)
-            and math.isfinite(monitor.request_age_ms)
-            and monitor.request_age_ms >= _STALLED_XHR_MINIMUM_AGE_MS
+            action_kind in {BattleActionKind.TURN, BattleActionKind.NEXT_FLOOR}
+            and _stalled_single_xhr(monitor)
         ),
         pre_click_document_id=pre_click_document_id,
         post_click_document_id=post_click_document_id,
@@ -922,10 +974,15 @@ class ElementActionManager:
     def page(self) -> Any:
         return self.hvdriver.page
 
-    async def _click(self, element: Any) -> None:
+    async def _click(
+        self,
+        element: Any,
+        *,
+        operation_timeout: float = _BATTLE_MUTATION_TIMEOUT_SECONDS,
+    ) -> None:
         await self._action.click(
             element,
-            operation_timeout=_BATTLE_MUTATION_TIMEOUT_SECONDS,
+            operation_timeout=protocol_timeout(operation_timeout),
         )
 
     def _begin_submitted_action(self, action_id: str) -> None:
@@ -939,54 +996,6 @@ class ElementActionManager:
             return None
         category = get_category(action_id)
         return category if isinstance(category, str) else None
-
-    async def click_resilient(
-        self,
-        get_element: Callable[[], Coroutine[Any, Any, Any]],
-        retries: int = 3,
-        delay: float = 0.1,
-    ) -> None:
-        """Click a local UI control with retries; never use for a turn action."""
-        await self._action.click_resilient(
-            get_element,
-            retries=retries,
-            delay=delay,
-            operation_timeout=_BATTLE_MUTATION_TIMEOUT_SECONDS,
-        )
-
-    async def click_until(
-        self,
-        get_element: Callable[[], Coroutine[Any, Any, Any]],
-        condition: Callable[[], Coroutine[Any, Any, bool]],
-        max_attempts: int = 5,
-        delay: float = 0.1,
-        timeout: float = 0.3,
-    ) -> None:
-        """Click a local UI control repeatedly until a local condition is true."""
-        await self._action.click_until(
-            get_element,
-            condition,
-            max_attempts=max_attempts,
-            delay=delay,
-            timeout=timeout,
-            operation_timeout=_BATTLE_MUTATION_TIMEOUT_SECONDS,
-        )
-
-    async def click_locator(
-        self,
-        selector: str,
-        retries: int = 3,
-        wait_timeout: float = 2.0,
-        delay: float = 0.1,
-    ) -> None:
-        """Click a local UI control that does not submit a battle turn."""
-        await self._action.click_locator(
-            selector,
-            retries=retries,
-            wait_timeout=wait_timeout,
-            delay=delay,
-            operation_timeout=_BATTLE_MUTATION_TIMEOUT_SECONDS,
-        )
 
     @staticmethod
     def _state_script(monitor_id: str, *, arm_monitor: bool) -> str:
@@ -1003,7 +1012,7 @@ class ElementActionManager:
     ) -> _BattleActionState:
         raw = await wait_for_zendriver(
             self.page.evaluate(self._state_script(monitor_id, arm_monitor=arm_monitor)),
-            timeout=probe_timeout,
+            timeout=protocol_timeout(probe_timeout),
             owner=self.page,
         )
         return _BattleActionState.from_raw(raw)
@@ -1013,7 +1022,7 @@ class ElementActionManager:
     ) -> _BattleExitState:
         raw = await wait_for_zendriver(
             self.page.evaluate(_BATTLE_EXIT_STATE_JS),
-            timeout=probe_timeout,
+            timeout=protocol_timeout(probe_timeout),
             owner=self.page,
         )
         return _BattleExitState.from_raw(raw)
@@ -1031,16 +1040,29 @@ class ElementActionManager:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
             raise TimeoutError("Battle recovery probe budget was exhausted")
-        exit_state = await self._read_battle_exit_state(probe_timeout=remaining)
+        exit_state = await self._read_battle_exit_state(
+            probe_timeout=protocol_timeout(remaining)
+        )
         return _reconcile_recovery_state(action, exit_state)
 
-    async def reload_current_page(self, *, operation_timeout: float) -> None:
-        """Reload the tab's current URL once without creating a browser session."""
-        await wait_for_zendriver(
-            self.page.reload(),
-            timeout=operation_timeout,
-            owner=self.page,
-        )
+    async def reload_current_page(self, *, deadline: SemanticDeadline) -> None:
+        """Reload once and await the new main loader before any DOM probe."""
+        lifecycle = MainFrameDOMContentLoadedWaiter(self.page)
+        try:
+            await lifecycle.enable(deadline=deadline)
+            lifecycle.trigger()
+            command_timeout = deadline.protocol_timeout()
+            await wait_for_zendriver(
+                self.page.send(cdp.page.reload(loader_id=lifecycle.old_loader_id)),
+                timeout=command_timeout,
+                owner=self.page,
+            )
+            deadline.require_remaining(
+                "Battle recovery reload acknowledgement arrived after its deadline"
+            )
+            await lifecycle.wait(deadline)
+        finally:
+            lifecycle.close()
 
     async def clear_page_action_state(
         self, *, probe_timeout: float = 3.0
@@ -1048,7 +1070,7 @@ class ElementActionManager:
         """Discard action hooks that belong to the newly accepted document."""
         document_id = await wait_for_zendriver(
             self.page.evaluate(_CLEAR_PAGE_ACTION_STATE_JS),
-            timeout=probe_timeout,
+            timeout=protocol_timeout(probe_timeout),
             owner=self.page,
         )
         return document_id if isinstance(document_id, str) and document_id else None
@@ -1062,7 +1084,7 @@ class ElementActionManager:
         try:
             await wait_for_zendriver(
                 self.page.evaluate(script),
-                timeout=probe_timeout,
+                timeout=protocol_timeout(probe_timeout),
                 owner=self.page,
             )
         except Exception as error:
@@ -1079,25 +1101,46 @@ class ElementActionManager:
         selector: str,
         *,
         retries: int,
-        wait_timeout: float,
+        deadline: SemanticDeadline,
         delay: float,
     ) -> Any:
-        if retries < 1:
-            raise ValueError("stale_retries must be at least 1")
+        if (
+            isinstance(retries, bool)
+            or not isinstance(retries, int)
+            or not 1 <= retries <= _MAX_SELECTOR_LOOKUP_ATTEMPTS
+        ):
+            raise ValueError(
+                "stale_retries must be an integer between 1 and "
+                f"{_MAX_SELECTOR_LOOKUP_ATTEMPTS}"
+            )
         last_error: Exception | None = None
         for attempt in range(retries):
             try:
-                return await wait_for_zendriver(
-                    self.page.select(selector, timeout=wait_timeout),
-                    timeout=wait_timeout + _SELECTOR_OUTER_TIMEOUT_MARGIN_SECONDS,
+                operation_timeout = deadline.protocol_timeout()
+                element = await wait_for_zendriver(
+                    self.page.query_selector(selector),
+                    timeout=operation_timeout,
                     owner=self.page,
+                )
+                deadline.require_remaining(
+                    "Battle action selector deadline expired during lookup"
                 )
             except Exception as error:
                 if is_browser_generation_error(error):
                     raise
                 last_error = error
-                if attempt + 1 < retries:
-                    await asyncio.sleep(delay)
+            else:
+                if element is not None:
+                    deadline.require_remaining(
+                        "Battle action selector result was accepted after its deadline"
+                    )
+                    return element
+                last_error = LookupError(f"Unable to locate {selector!r}")
+            if attempt + 1 < retries:
+                remaining = deadline.remaining()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(delay, remaining))
         if last_error is not None:
             raise last_error
         raise RuntimeError(f"Unable to locate {selector!r}")
@@ -1138,11 +1181,139 @@ class ElementActionManager:
                 raise
             return fallback, error
 
+    def _main_document_lifecycle(self) -> MainFrameDOMContentLoadedWaiter:
+        return MainFrameDOMContentLoadedWaiter(self.page)
+
+    async def _click_and_reconcile_battle_exit(
+        self,
+        element: Any,
+        *,
+        selector: str,
+        expected_is_isekai: bool,
+        before: _BattleExitState,
+        timeout: float,
+        check_interval: float,
+        probe_timeout: float,
+    ) -> None:
+        """Submit the final click once, then reconcile after lifecycle receipt."""
+        started = asyncio.get_running_loop().time()
+        deadline = SemanticDeadline.after(timeout)
+        lifecycle = self._main_document_lifecycle()
+        click_error: Exception | None = None
+        probe_error: Exception | None = None
+        lifecycle_observed = False
+        last = before
+        try:
+            await lifecycle.enable(deadline=deadline)
+            deadline.require_remaining(
+                "Final battle exit deadline expired during lifecycle setup"
+            )
+            operation_timeout = deadline.protocol_timeout()
+            lifecycle.trigger()
+            try:
+                await self._click(
+                    element,
+                    operation_timeout=operation_timeout,
+                )
+            except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
+                click_error = error
+
+            try:
+                await lifecycle.wait(deadline)
+                deadline.require_remaining(
+                    "Final battle exit deadline expired at lifecycle receipt"
+                )
+                lifecycle_observed = True
+            except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
+                probe_error = error
+
+            while lifecycle_observed:
+                remaining = deadline.remaining()
+                if remaining <= 0:
+                    break
+                try:
+                    current = await self._read_battle_exit_state(
+                        probe_timeout=protocol_timeout(min(probe_timeout, remaining))
+                    )
+                except Exception as error:
+                    if is_browser_generation_error(error):
+                        raise
+                    probe_error = error
+                    if isinstance(error, TimeoutError):
+                        break
+                else:
+                    if deadline.remaining() <= 0:
+                        probe_error = TimeoutError(
+                            "Final battle exit probe returned after its deadline"
+                        )
+                        break
+                    last = current
+                    evidence = _confirmed_battle_exit_evidence(
+                        expected_is_isekai, before, current
+                    )
+                    if evidence is not None:
+                        try:
+                            deadline.require_remaining(
+                                "Final battle exit evidence was accepted after its "
+                                "deadline"
+                            )
+                        except TimeoutError as error:
+                            probe_error = error
+                            break
+                        elapsed = asyncio.get_running_loop().time() - started
+                        if click_error is None and probe_error is None:
+                            logger.debug(
+                                "Final battle completion acknowledged selector=%r "
+                                "evidence=%s elapsed=%.2fs",
+                                selector,
+                                evidence,
+                                elapsed,
+                            )
+                        else:
+                            logger.warning(
+                                "Final battle completion acknowledged after transient "
+                                "error selector=%r evidence=%s elapsed=%.2fs "
+                                "click_error=%s probe_error=%s",
+                                selector,
+                                evidence,
+                                elapsed,
+                                _error_type_name(click_error),
+                                _error_type_name(probe_error),
+                            )
+                        logger.debug("Final battle exit state: %s", current.summary())
+                        return
+                remaining = deadline.remaining()
+                if remaining > 0:
+                    await asyncio.sleep(min(check_interval, remaining))
+
+            logger.error(
+                "Final battle completion acknowledgement outcome unknown "
+                "selector=%r before=(%s) last=(%s)",
+                selector,
+                before.summary(),
+                last.summary(),
+            )
+            unknown = BattleActionOutcomeUnknownError(
+                "Final battle completion acknowledgement lacks positive "
+                "new-document same-realm out-of-battle evidence; "
+                f"selector={selector!r}; last_state={last.summary()}"
+            )
+            cause = click_error or probe_error
+            if cause is not None:
+                raise unknown from cause
+            raise unknown
+        finally:
+            lifecycle.close()
+
     async def click_and_wait_log_locator(
         self,
         selector: str,
         stale_retries: int = 3,
-        timeout: float = 15.0,
+        timeout: float = _ACTION_RECEIPT_DEADLINE_SECONDS,
         check_interval: float = 0.2,
         probe_timeout: float = 3.0,
     ) -> None:
@@ -1151,24 +1322,40 @@ class ElementActionManager:
         Only element lookup is retried.  Once the click begins, an ambiguous
         error is reconciled but the click is never repeated.
         """
-        if timeout <= 0 or check_interval <= 0 or probe_timeout <= 0:
-            raise ValueError("battle action timeouts must be positive")
+        timeout, check_interval, probe_timeout = _validated_receipt_timing(
+            timeout=timeout,
+            check_interval=check_interval,
+            probe_timeout=probe_timeout,
+            operation="battle action",
+        )
 
         async with self._action_lock:
+            preparation_deadline = SemanticDeadline.after(
+                _ACTION_PREPARATION_DEADLINE_SECONDS
+            )
             element = await self._select_for_single_click(
                 selector,
                 retries=stale_retries,
-                wait_timeout=2.0,
+                deadline=preparation_deadline,
                 delay=0.1,
             )
             monitor_id = uuid4().hex
             monitor_cleanup_safe = True
+            deadline: SemanticDeadline | None = None
             try:
                 try:
                     before = await self._read_action_state(
                         monitor_id,
                         arm_monitor=True,
-                        probe_timeout=probe_timeout,
+                        probe_timeout=min(
+                            probe_timeout,
+                            preparation_deadline.require_remaining(
+                                "Battle action preparation deadline expired"
+                            ),
+                        ),
+                    )
+                    preparation_deadline.require_remaining(
+                        "Battle action preparation probe returned after its deadline"
                     )
                 except Exception as error:
                     if is_browser_generation_error(error):
@@ -1180,13 +1367,20 @@ class ElementActionManager:
                 probe_error: Exception | None = None
                 post_click_probe_succeeded = False
                 probe_timed_out = False
-                request_deadline_bound = False
                 receipt_monitor: _ActionMonitorState | None = None
                 started = asyncio.get_running_loop().time()
+                preparation_deadline.require_remaining(
+                    "Battle action preparation deadline expired before submission"
+                )
+                deadline = SemanticDeadline.after(timeout)
                 self._begin_submitted_action(monitor_id)
+                operation_timeout = deadline.protocol_timeout()
                 click_started = True
                 try:
-                    await self._click(element)
+                    await self._click(
+                        element,
+                        operation_timeout=operation_timeout,
+                    )
                 except Exception as error:
                     if is_browser_generation_error(error):
                         # A generation failure makes the click outcome
@@ -1196,21 +1390,14 @@ class ElementActionManager:
                         raise
                     click_error = error
 
-                # A slow CDP click must not consume the XHR's receipt window.
-                # Rebind this provisional post-click deadline to the browser's
-                # first observed XMLHttpRequest.send() timestamp below.
-                deadline = asyncio.get_running_loop().time() + timeout
                 while True:
-                    remaining = deadline - asyncio.get_running_loop().time()
+                    remaining = deadline.remaining()
                     if remaining <= 0:
                         break
                     try:
                         current = await self._read_action_state(
                             monitor_id,
-                            # Keep one CDP probe in flight for at most the
-                            # remaining action deadline.  Short per-probe
-                            # cancellation corrupts Zendriver's response mapper.
-                            probe_timeout=remaining,
+                            probe_timeout=protocol_timeout(remaining),
                         )
                     except Exception as error:
                         if is_browser_generation_error(error):
@@ -1221,26 +1408,26 @@ class ElementActionManager:
                             probe_timed_out = True
                             break
                     else:
+                        if deadline.remaining() <= 0:
+                            probe_timed_out = True
+                            monitor_cleanup_safe = False
+                            break
                         last = current
                         if current.monitor is not None:
                             receipt_monitor = current.monitor
-                            if (
-                                not request_deadline_bound
-                                and current.monitor.sent
-                                and current.monitor.request_age_ms is not None
-                            ):
-                                remaining_request_time = max(
-                                    0.0,
-                                    timeout - current.monitor.request_age_ms / 1_000.0,
-                                )
-                                deadline = (
-                                    asyncio.get_running_loop().time()
-                                    + remaining_request_time
-                                )
-                                request_deadline_bound = True
                         post_click_probe_succeeded = True
                         evidence = _confirmed_action_evidence(before, current)
                         if evidence is not None:
+                            try:
+                                deadline.require_remaining(
+                                    "Battle action evidence was accepted after its "
+                                    "deadline"
+                                )
+                            except TimeoutError as error:
+                                probe_timed_out = True
+                                monitor_cleanup_safe = False
+                                probe_error = error
+                                break
                             elapsed = asyncio.get_running_loop().time() - started
                             status = current.monitor.status if current.monitor else None
                             if click_error is None and probe_error is None:
@@ -1273,59 +1460,64 @@ class ElementActionManager:
                             and not _normal_action_response(monitor)
                         ):
                             break
-                    remaining = deadline - asyncio.get_running_loop().time()
+                    remaining = deadline.remaining()
                     if remaining > 0:
                         await asyncio.sleep(min(check_interval, remaining))
 
-                if not probe_timed_out:
+                remaining = deadline.remaining()
+                if not probe_timed_out and remaining > 0:
                     try:
-                        last, final_error = await self._final_action_probe(
+                        candidate, final_error = await self._final_action_probe(
                             monitor_id,
-                            probe_timeout=probe_timeout,
+                            probe_timeout=min(probe_timeout, remaining),
                             fallback=last,
                         )
                     except Exception as error:
                         if is_browser_generation_error(error):
                             monitor_cleanup_safe = False
                         raise
-                    if final_error is not None:
+                    if deadline.remaining() <= 0:
+                        probe_timed_out = True
+                        monitor_cleanup_safe = False
+                        probe_error = TimeoutError(
+                            "Battle action final probe returned after its deadline"
+                        )
+                    elif final_error is not None:
                         probe_error = final_error
                         if isinstance(final_error, TimeoutError):
                             probe_timed_out = True
                             monitor_cleanup_safe = False
                     else:
+                        last = candidate
                         post_click_probe_succeeded = True
                     if last.monitor is not None:
                         receipt_monitor = last.monitor
                 evidence = _confirmed_action_evidence(before, last)
                 if evidence is not None:
-                    elapsed = asyncio.get_running_loop().time() - started
-                    status = last.monitor.status if last.monitor else None
-                    logger.warning(
-                        "Battle action confirmed during final reconciliation "
-                        "selector=%r evidence=%s elapsed=%.2fs xhr_status=%s "
-                        "click_error=%s probe_error=%s",
-                        selector,
-                        evidence,
-                        elapsed,
-                        status,
-                        _error_type_name(click_error),
-                        _error_type_name(probe_error),
-                    )
-                    return
-
-                if (
-                    click_started
-                    and click_error is None
-                    and post_click_probe_succeeded
-                    and last.document_id == before.document_id
-                    and last.monitor is not None
-                    and not last.monitor.sent
-                ):
-                    raise TimeoutError(
-                        "Battle action was not dispatched after one click; "
-                        f"selector={selector!r}; state={last.summary()}"
-                    ) from click_error
+                    try:
+                        deadline.require_remaining(
+                            "Battle action final evidence was accepted after its "
+                            "deadline"
+                        )
+                    except TimeoutError as error:
+                        probe_timed_out = True
+                        monitor_cleanup_safe = False
+                        probe_error = error
+                    else:
+                        elapsed = asyncio.get_running_loop().time() - started
+                        status = last.monitor.status if last.monitor else None
+                        logger.warning(
+                            "Battle action confirmed during final reconciliation "
+                            "selector=%r evidence=%s elapsed=%.2fs xhr_status=%s "
+                            "click_error=%s probe_error=%s",
+                            selector,
+                            evidence,
+                            elapsed,
+                            status,
+                            _error_type_name(click_error),
+                            _error_type_name(probe_error),
+                        )
+                        return
 
                 logger.error(
                     "Battle action outcome unknown selector=%r before=(%s) last=(%s)",
@@ -1345,7 +1537,7 @@ class ElementActionManager:
                         pre_click_document_id=before.document_id,
                         post_click_document_id=(
                             "unknown"
-                            if probe_timed_out or not post_click_probe_succeeded
+                            if not post_click_probe_succeeded
                             else last.document_id
                         ),
                         dialog_category=dialog_category,
@@ -1364,39 +1556,59 @@ class ElementActionManager:
                 monitor_cleanup_safe = False
                 raise
             finally:
-                if monitor_cleanup_safe:
+                cleanup_remaining = (
+                    deadline.remaining() if deadline is not None else 0.0
+                )
+                if monitor_cleanup_safe and cleanup_remaining > 0:
                     await self._cleanup_action_monitor(
                         monitor_id,
-                        probe_timeout=probe_timeout,
+                        probe_timeout=min(probe_timeout, cleanup_remaining),
                     )
 
     async def click_and_wait_transition_locator(
         self,
         selector: str,
         stale_retries: int = 3,
-        timeout: float = 60.0,
+        timeout: float = _ACTION_RECEIPT_DEADLINE_SECONDS,
         check_interval: float = 0.25,
         probe_timeout: float = 3.0,
     ) -> None:
         """Click a round-transition control once and await a valid next phase."""
-        if timeout <= 0 or check_interval <= 0 or probe_timeout <= 0:
-            raise ValueError("battle transition timeouts must be positive")
+        timeout, check_interval, probe_timeout = _validated_receipt_timing(
+            timeout=timeout,
+            check_interval=check_interval,
+            probe_timeout=probe_timeout,
+            operation="battle transition",
+        )
 
         async with self._action_lock:
+            preparation_deadline = SemanticDeadline.after(
+                _ACTION_PREPARATION_DEADLINE_SECONDS
+            )
             element = await self._select_for_single_click(
                 selector,
                 retries=stale_retries,
-                wait_timeout=2.0,
+                deadline=preparation_deadline,
                 delay=0.1,
             )
             state_id = uuid4().hex
             monitor_cleanup_safe = True
+            deadline: SemanticDeadline | None = None
             try:
                 try:
                     before = await self._read_action_state(
                         state_id,
                         arm_monitor=True,
-                        probe_timeout=probe_timeout,
+                        probe_timeout=min(
+                            probe_timeout,
+                            preparation_deadline.require_remaining(
+                                "Battle transition preparation deadline expired"
+                            ),
+                        ),
+                    )
+                    preparation_deadline.require_remaining(
+                        "Battle transition preparation probe returned after its "
+                        "deadline"
                     )
                 except Exception as error:
                     if is_browser_generation_error(error):
@@ -1410,29 +1622,30 @@ class ElementActionManager:
                 last = before
                 receipt_monitor = before.monitor
                 self._begin_submitted_action(state_id)
+                preparation_deadline.require_remaining(
+                    "Battle transition preparation deadline expired before submission"
+                )
+                deadline = SemanticDeadline.after(timeout)
+                operation_timeout = deadline.protocol_timeout()
                 try:
-                    await self._click(element)
+                    await self._click(
+                        element,
+                        operation_timeout=operation_timeout,
+                    )
                 except Exception as error:
                     if is_browser_generation_error(error):
                         monitor_cleanup_safe = False
                         raise
                     click_error = error
 
-                # A slow CDP click must not consume the transition observation
-                # window used to reconcile its possibly submitted result.
-                deadline = asyncio.get_running_loop().time() + timeout
                 while True:
-                    remaining = deadline - asyncio.get_running_loop().time()
+                    remaining = deadline.remaining()
                     if remaining <= 0:
                         break
                     try:
                         current = await self._read_action_state(
                             state_id,
-                            # A navigation-time probe may be delayed well beyond
-                            # the normal three-second read bound.  Await that one
-                            # command through the transition deadline instead of
-                            # stacking cancellable probes every few seconds.
-                            probe_timeout=remaining,
+                            probe_timeout=protocol_timeout(remaining),
                         )
                     except Exception as error:
                         if is_browser_generation_error(error):
@@ -1443,6 +1656,10 @@ class ElementActionManager:
                             probe_timed_out = True
                             break
                     else:
+                        if deadline.remaining() <= 0:
+                            probe_timed_out = True
+                            monitor_cleanup_safe = False
+                            break
                         last = current
                         post_click_probe_succeeded = True
                         if current.monitor is not None:
@@ -1453,6 +1670,16 @@ class ElementActionManager:
                                 receipt_monitor
                             )
                         ):
+                            try:
+                                deadline.require_remaining(
+                                    "Battle transition evidence was accepted after its "
+                                    "deadline"
+                                )
+                            except TimeoutError as error:
+                                probe_timed_out = True
+                                monitor_cleanup_safe = False
+                                probe_error = error
+                                break
                             elapsed = asyncio.get_running_loop().time() - started
                             if click_error is None and probe_error is None:
                                 logger.debug(
@@ -1477,15 +1704,16 @@ class ElementActionManager:
                                 "Battle transition state: %s", current.summary()
                             )
                             return
-                    remaining = deadline - asyncio.get_running_loop().time()
+                    remaining = deadline.remaining()
                     if remaining > 0:
                         await asyncio.sleep(min(check_interval, remaining))
 
-                if not probe_timed_out:
+                remaining = deadline.remaining()
+                if not probe_timed_out and remaining > 0:
                     try:
-                        last = await self._read_action_state(
+                        candidate = await self._read_action_state(
                             state_id,
-                            probe_timeout=probe_timeout,
+                            probe_timeout=min(probe_timeout, remaining),
                         )
                     except Exception as error:
                         if is_browser_generation_error(error):
@@ -1495,22 +1723,41 @@ class ElementActionManager:
                         if isinstance(error, TimeoutError):
                             probe_timed_out = True
                     else:
-                        post_click_probe_succeeded = True
-                        if last.monitor is not None:
-                            receipt_monitor = last.monitor
+                        if deadline.remaining() <= 0:
+                            probe_timed_out = True
+                            monitor_cleanup_safe = False
+                            probe_error = TimeoutError(
+                                "Battle transition final probe returned after its "
+                                "deadline"
+                            )
+                        else:
+                            last = candidate
+                            post_click_probe_succeeded = True
+                            if last.monitor is not None:
+                                receipt_monitor = last.monitor
                 evidence = _confirmed_transition_evidence(before, last)
                 if evidence is not None and (
                     _transition_receipt_has_at_most_one_dispatch(receipt_monitor)
                 ):
-                    logger.warning(
-                        "Battle transition confirmed during final reconciliation "
-                        "selector=%r evidence=%s click_error=%s probe_error=%s",
-                        selector,
-                        evidence,
-                        _error_type_name(click_error),
-                        _error_type_name(probe_error),
-                    )
-                    return
+                    try:
+                        deadline.require_remaining(
+                            "Battle transition final evidence was accepted after its "
+                            "deadline"
+                        )
+                    except TimeoutError as error:
+                        probe_timed_out = True
+                        monitor_cleanup_safe = False
+                        probe_error = error
+                    else:
+                        logger.warning(
+                            "Battle transition confirmed during final reconciliation "
+                            "selector=%r evidence=%s click_error=%s probe_error=%s",
+                            selector,
+                            evidence,
+                            _error_type_name(click_error),
+                            _error_type_name(probe_error),
+                        )
+                        return
 
                 logger.error(
                     "Battle transition outcome unknown selector=%r before=(%s) "
@@ -1531,7 +1778,7 @@ class ElementActionManager:
                         pre_click_document_id=before.document_id,
                         post_click_document_id=(
                             "unknown"
-                            if probe_timed_out or not post_click_probe_succeeded
+                            if not post_click_probe_succeeded
                             else last.document_id
                         ),
                         dialog_category=dialog_category,
@@ -1549,10 +1796,13 @@ class ElementActionManager:
                 monitor_cleanup_safe = False
                 raise
             finally:
-                if monitor_cleanup_safe:
+                cleanup_remaining = (
+                    deadline.remaining() if deadline is not None else 0.0
+                )
+                if monitor_cleanup_safe and cleanup_remaining > 0:
                     await self._cleanup_action_monitor(
                         state_id,
-                        probe_timeout=probe_timeout,
+                        probe_timeout=min(probe_timeout, cleanup_remaining),
                     )
 
     async def click_and_wait_battle_exit_locator(
@@ -1561,18 +1811,35 @@ class ElementActionManager:
         *,
         expected_is_isekai: bool,
         stale_retries: int = 3,
-        timeout: float = 20.0,
+        timeout: float = _ACTION_RECEIPT_DEADLINE_SECONDS,
         check_interval: float = 0.25,
         probe_timeout: float = 3.0,
     ) -> None:
         """Click final completion once and require a new same-realm page."""
         _expected_realm(expected_is_isekai)
-        if timeout <= 0 or check_interval <= 0 or probe_timeout <= 0:
-            raise ValueError("battle exit timeouts must be positive")
+        timeout, check_interval, probe_timeout = _validated_receipt_timing(
+            timeout=timeout,
+            check_interval=check_interval,
+            probe_timeout=probe_timeout,
+            operation="battle exit",
+        )
 
         async with self._action_lock:
+            preparation_deadline = SemanticDeadline.after(
+                _ACTION_PREPARATION_DEADLINE_SECONDS
+            )
             try:
-                before = await self._read_battle_exit_state(probe_timeout=probe_timeout)
+                before = await self._read_battle_exit_state(
+                    probe_timeout=min(
+                        probe_timeout,
+                        preparation_deadline.require_remaining(
+                            "Final battle exit preparation deadline expired"
+                        ),
+                    )
+                )
+                preparation_deadline.require_remaining(
+                    "Final battle exit pre-click probe returned after its deadline"
+                )
             except Exception as error:
                 if is_browser_generation_error(error):
                     raise
@@ -1597,20 +1864,26 @@ class ElementActionManager:
                 element = await self._select_for_single_click(
                     selector,
                     retries=stale_retries,
-                    wait_timeout=2.0,
+                    deadline=preparation_deadline,
                     delay=0.1,
                 )
             except Exception as select_error:
                 if is_browser_generation_error(select_error):
                     raise
-                last, _ = await self._final_battle_exit_probe(
-                    probe_timeout=probe_timeout,
-                    fallback=before,
-                )
+                remaining = preparation_deadline.remaining()
+                if remaining > 0:
+                    last, _ = await self._final_battle_exit_probe(
+                        probe_timeout=min(probe_timeout, remaining),
+                        fallback=before,
+                    )
+                    if preparation_deadline.remaining() <= 0:
+                        last = before
+                else:
+                    last = before
                 evidence = _confirmed_battle_exit_evidence(
                     expected_is_isekai, before, last
                 )
-                if evidence is not None:
+                if evidence is not None and preparation_deadline.remaining() > 0:
                     logger.warning(
                         "Final battle completion reconciled before click "
                         "selector=%r evidence=%s select_error_type=%s "
@@ -1636,19 +1909,33 @@ class ElementActionManager:
 
             try:
                 selected_state = await self._read_battle_exit_state(
-                    probe_timeout=probe_timeout
+                    probe_timeout=min(
+                        probe_timeout,
+                        preparation_deadline.require_remaining(
+                            "Final battle exit preparation deadline expired"
+                        ),
+                    )
+                )
+                preparation_deadline.require_remaining(
+                    "Final battle exit selection probe returned after its deadline"
                 )
             except Exception as selection_probe_error:
                 if is_browser_generation_error(selection_probe_error):
                     raise
-                last, _ = await self._final_battle_exit_probe(
-                    probe_timeout=probe_timeout,
-                    fallback=before,
-                )
+                remaining = preparation_deadline.remaining()
+                if remaining > 0:
+                    last, _ = await self._final_battle_exit_probe(
+                        probe_timeout=min(probe_timeout, remaining),
+                        fallback=before,
+                    )
+                    if preparation_deadline.remaining() <= 0:
+                        last = before
+                else:
+                    last = before
                 evidence = _confirmed_battle_exit_evidence(
                     expected_is_isekai, before, last
                 )
-                if evidence is not None:
+                if evidence is not None and preparation_deadline.remaining() > 0:
                     logger.warning(
                         "Final battle completion reconciled after selection "
                         "selector=%r evidence=%s selection_probe_error_type=%s "
@@ -1668,7 +1955,7 @@ class ElementActionManager:
             evidence = _confirmed_battle_exit_evidence(
                 expected_is_isekai, before, selected_state
             )
-            if evidence is not None:
+            if evidence is not None and preparation_deadline.remaining() > 0:
                 logger.warning(
                     "Final battle completion already exited before click "
                     "selector=%r evidence=%s no_click_issued=true state=(%s)",
@@ -1696,100 +1983,15 @@ class ElementActionManager:
                     f"selector={selector!r}; state={selected_state.summary()}"
                 )
 
-            started = asyncio.get_running_loop().time()
-            click_error: Exception | None = None
-            probe_error: Exception | None = None
-            probe_timed_out = False
-            last = before
-            try:
-                await self._click(element)
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                click_error = error
-
-            deadline = started + timeout
-            while True:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
-                try:
-                    current = await self._read_battle_exit_state(
-                        probe_timeout=remaining
-                    )
-                except Exception as error:
-                    if is_browser_generation_error(error):
-                        raise
-                    probe_error = error
-                    if isinstance(error, TimeoutError):
-                        probe_timed_out = True
-                        break
-                else:
-                    last = current
-                    evidence = _confirmed_battle_exit_evidence(
-                        expected_is_isekai, before, current
-                    )
-                    if evidence is not None:
-                        elapsed = asyncio.get_running_loop().time() - started
-                        if click_error is None and probe_error is None:
-                            logger.debug(
-                                "Final battle completion acknowledged selector=%r "
-                                "evidence=%s elapsed=%.2fs",
-                                selector,
-                                evidence,
-                                elapsed,
-                            )
-                        else:
-                            logger.warning(
-                                "Final battle completion acknowledged after transient "
-                                "error selector=%r evidence=%s elapsed=%.2fs "
-                                "click_error=%s probe_error=%s",
-                                selector,
-                                evidence,
-                                elapsed,
-                                _error_type_name(click_error),
-                                _error_type_name(probe_error),
-                            )
-                        logger.debug("Final battle exit state: %s", current.summary())
-                        return
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining > 0:
-                    await asyncio.sleep(min(check_interval, remaining))
-
-            if not probe_timed_out:
-                last, final_error = await self._final_battle_exit_probe(
-                    probe_timeout=probe_timeout,
-                    fallback=last,
-                )
-                if final_error is not None:
-                    probe_error = final_error
-            evidence = _confirmed_battle_exit_evidence(expected_is_isekai, before, last)
-            if evidence is not None:
-                logger.warning(
-                    "Final battle completion acknowledged during final "
-                    "reconciliation selector=%r evidence=%s click_error=%s "
-                    "probe_error=%s state=(%s)",
-                    selector,
-                    evidence,
-                    _error_type_name(click_error),
-                    _error_type_name(probe_error),
-                    last.summary(),
-                )
-                return
-
-            logger.error(
-                "Final battle completion acknowledgement outcome unknown "
-                "selector=%r before=(%s) last=(%s)",
-                selector,
-                before.summary(),
-                last.summary(),
+            preparation_deadline.require_remaining(
+                "Final battle exit preparation deadline expired before submission"
             )
-            unknown = BattleActionOutcomeUnknownError(
-                "Final battle completion acknowledgement lacks positive "
-                "new-document same-realm out-of-battle evidence; "
-                f"selector={selector!r}; last_state={last.summary()}"
+            await self._click_and_reconcile_battle_exit(
+                element,
+                selector=selector,
+                expected_is_isekai=expected_is_isekai,
+                before=before,
+                timeout=timeout,
+                check_interval=check_interval,
+                probe_timeout=probe_timeout,
             )
-            cause = click_error or probe_error
-            if cause is not None:
-                raise unknown from cause
-            raise unknown

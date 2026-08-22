@@ -1,6 +1,7 @@
 """Composable recovery boundary for one ambiguous submitted battle action."""
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -8,9 +9,13 @@ from typing import Any, Protocol
 
 from hvbrowser.runtime import is_browser_generation_error, setup_logger
 
+from ._timing import PROTOCOL_TIMEOUT_SECONDS, SemanticDeadline, protocol_timeout
 from .contracts import BattleActionRecoveryEvidence, BattleTurnPhase
 
 logger = setup_logger(__name__)
+
+_MAX_RECOVERY_DEADLINE_SECONDS = 10.0
+_MAX_RECOVERY_OBSERVATION_CHECKS = 40
 
 
 class ActionDialogTracker:
@@ -70,7 +75,7 @@ class _RecoveryActions(Protocol):
         self, *, probe_timeout: float
     ) -> BattleRecoveryState | None: ...
 
-    async def reload_current_page(self, *, operation_timeout: float) -> None: ...
+    async def reload_current_page(self, *, deadline: SemanticDeadline) -> None: ...
 
     async def clear_page_action_state(self, *, probe_timeout: float) -> str | None: ...
 
@@ -148,7 +153,9 @@ class BattleRecoveryCoordinator:
 
     async def _read_probe(self, *, probe_timeout: float) -> _RecoveryProbe:
         try:
-            state = await self._actions.read_recovery_state(probe_timeout=probe_timeout)
+            state = await self._actions.read_recovery_state(
+                probe_timeout=protocol_timeout(probe_timeout)
+            )
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
@@ -169,15 +176,26 @@ class BattleRecoveryCoordinator:
         checks: int,
         check_interval: float,
         probe_timeout: float,
+        deadline: SemanticDeadline,
     ) -> _DocumentObservation:
         confirmed_unchanged = 0
         for check in range(checks):
-            probe = await self._read_probe(probe_timeout=probe_timeout)
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                return _DocumentObservation(_DocumentObservationKind.INDETERMINATE)
+            probe = await self._read_probe(probe_timeout=min(probe_timeout, remaining))
+            if deadline.remaining() <= 0:
+                return _DocumentObservation(_DocumentObservationKind.INDETERMINATE)
             if probe.kind is _RecoveryProbeKind.ERROR:
                 return _DocumentObservation(_DocumentObservationKind.INDETERMINATE)
             if probe.kind is _RecoveryProbeKind.RECONCILIATION_MISMATCH:
                 if check + 1 < checks:
-                    await self._sleep(check_interval)
+                    remaining = deadline.remaining()
+                    if remaining <= 0:
+                        return _DocumentObservation(
+                            _DocumentObservationKind.INDETERMINATE
+                        )
+                    await self._sleep(min(check_interval, remaining))
                 continue
             if probe.state is None:
                 raise RuntimeError("state probe kind requires a recovery state")
@@ -188,8 +206,11 @@ class BattleRecoveryCoordinator:
                 )
             confirmed_unchanged += 1
             if check + 1 < checks:
-                await self._sleep(check_interval)
-        if confirmed_unchanged == checks:
+                remaining = deadline.remaining()
+                if remaining <= 0:
+                    return _DocumentObservation(_DocumentObservationKind.INDETERMINATE)
+                await self._sleep(min(check_interval, remaining))
+        if confirmed_unchanged == checks and deadline.remaining() > 0:
             return _DocumentObservation(_DocumentObservationKind.CONFIRMED_UNCHANGED)
         return _DocumentObservation(_DocumentObservationKind.INDETERMINATE)
 
@@ -199,17 +220,16 @@ class BattleRecoveryCoordinator:
         expected_realm: str,
         *,
         initial_state: BattleRecoveryState | None,
-        timeout: float,
+        deadline: SemanticDeadline,
         stable_checks: int,
         check_interval: float,
         probe_timeout: float,
     ) -> BattleRecoveryState | None:
-        deadline = self._time() + timeout
         last_signature: tuple[object, ...] | None = None
         matching_reads = 0
         state = initial_state
         while True:
-            remaining = deadline - self._time()
+            remaining = deadline.remaining()
             if remaining <= 0:
                 return None
             if state is None:
@@ -225,7 +245,7 @@ class BattleRecoveryCoordinator:
                     state = probe.state
                     if state is None:
                         raise RuntimeError("state probe kind requires a recovery state")
-                if self._time() >= deadline:
+                if deadline.remaining() <= 0:
                     return None
             if state is not None and self._eligible_state(
                 state,
@@ -240,12 +260,16 @@ class BattleRecoveryCoordinator:
                     matching_reads = 1
                 if matching_reads >= stable_checks:
                     if state.phase is not BattleTurnPhase.ACTIVE:
+                        if deadline.remaining() <= 0:
+                            return None
                         return state
-                    remaining = deadline - self._time()
+                    remaining = deadline.remaining()
                     if remaining <= 0:
                         return None
                     try:
-                        snapshot = await self._state_store.inspect(timeout=remaining)
+                        snapshot = await self._state_store.inspect(
+                            timeout=protocol_timeout(remaining)
+                        )
                     except Exception as error:
                         if is_browser_generation_error(error):
                             raise
@@ -260,13 +284,12 @@ class BattleRecoveryCoordinator:
                             )
                             return None
                         logger.debug(
-                            "Reloaded active battle parse probe failed "
-                            "error_type=%s",
+                            "Reloaded active battle parse probe failed error_type=%s",
                             type(error).__name__,
                             exc_info=True,
                         )
                     else:
-                        if self._time() >= deadline:
+                        if deadline.remaining() <= 0:
                             return None
                         if any(monster.alive for monster in snapshot.monsters.values()):
                             return state
@@ -274,7 +297,7 @@ class BattleRecoveryCoordinator:
                 last_signature = None
                 matching_reads = 0
             state = None
-            remaining = deadline - self._time()
+            remaining = deadline.remaining()
             if remaining <= 0:
                 return None
             await self._sleep(min(check_interval, remaining))
@@ -289,25 +312,45 @@ class BattleRecoveryCoordinator:
         stable_checks: int = 2,
         check_interval: float = 0.25,
         probe_timeout: float = 2.0,
-        reload_timeout: float = 15.0,
     ) -> bool:
         """Accept only a verified new state; never replay the submitted action."""
         if expected_realm not in {"persistent", "isekai"}:
             raise ValueError("expected_realm must be persistent or isekai")
-        if auto_reload_checks < 1:
-            raise ValueError("auto_reload_checks must be positive")
-        if stable_checks < 2:
-            raise ValueError("stable_checks must be at least 2")
         if (
-            recovery_timeout <= 0
-            or check_interval <= 0
-            or probe_timeout <= 0
-            or reload_timeout <= 0
+            isinstance(auto_reload_checks, bool)
+            or not isinstance(auto_reload_checks, int)
+            or not 1 <= auto_reload_checks <= _MAX_RECOVERY_OBSERVATION_CHECKS
         ):
-            raise ValueError("battle recovery timeouts must be positive")
+            raise ValueError(
+                "auto_reload_checks must be an integer between 1 and "
+                f"{_MAX_RECOVERY_OBSERVATION_CHECKS}"
+            )
+        if (
+            isinstance(stable_checks, bool)
+            or not isinstance(stable_checks, int)
+            or not 2 <= stable_checks <= _MAX_RECOVERY_OBSERVATION_CHECKS
+        ):
+            raise ValueError(
+                "stable_checks must be an integer between 2 and "
+                f"{_MAX_RECOVERY_OBSERVATION_CHECKS}"
+            )
+        numeric_timeouts = (recovery_timeout, check_interval, probe_timeout)
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+            or value <= 0
+            for value in numeric_timeouts
+        ):
+            raise ValueError("battle recovery timeouts must be finite and positive")
+        if recovery_timeout > _MAX_RECOVERY_DEADLINE_SECONDS:
+            raise ValueError("battle recovery deadline must not exceed 10 seconds")
+        if probe_timeout > PROTOCOL_TIMEOUT_SECONDS:
+            raise ValueError("battle recovery probe timeout must not exceed 5 seconds")
         if not evidence.allows_same_browser_recovery:
             return False
 
+        deadline = SemanticDeadline.after(recovery_timeout, clock=self._time)
         pre_click_document_id = evidence.pre_click_document_id
         stalled_single_xhr = evidence.matches_stalled_single_xhr
         observation = await self._observe_document_change(
@@ -318,6 +361,7 @@ class BattleRecoveryCoordinator:
             checks=1 if stalled_single_xhr else auto_reload_checks,
             check_interval=check_interval,
             probe_timeout=probe_timeout,
+            deadline=deadline,
         )
         if observation.kind is _DocumentObservationKind.INDETERMINATE:
             logger.error(
@@ -338,9 +382,7 @@ class BattleRecoveryCoordinator:
                 ),
             )
             try:
-                await self._actions.reload_current_page(
-                    operation_timeout=reload_timeout
-                )
+                await self._actions.reload_current_page(deadline=deadline)
             except Exception as reload_error:
                 if is_browser_generation_error(reload_error):
                     raise
@@ -358,7 +400,7 @@ class BattleRecoveryCoordinator:
             pre_click_document_id,
             expected_realm,
             initial_state=initial_state,
-            timeout=recovery_timeout,
+            deadline=deadline,
             stable_checks=stable_checks,
             check_interval=check_interval,
             probe_timeout=probe_timeout,
@@ -368,8 +410,12 @@ class BattleRecoveryCoordinator:
             return False
 
         try:
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                logger.error("Battle recovery deadline expired before cleanup")
+                return False
             cleanup_document_id = await self._actions.clear_page_action_state(
-                probe_timeout=probe_timeout
+                probe_timeout=min(probe_timeout, remaining)
             )
         except Exception as cleanup_error:
             if is_browser_generation_error(cleanup_error):
@@ -387,17 +433,30 @@ class BattleRecoveryCoordinator:
             logger.error("Battle document changed during recovery cleanup")
             return False
 
-        final_probe = await self._read_probe(probe_timeout=probe_timeout)
+        remaining = deadline.remaining()
+        if remaining <= 0:
+            logger.error("Battle recovery deadline expired before final verification")
+            return False
+        final_probe = await self._read_probe(
+            probe_timeout=min(probe_timeout, remaining)
+        )
         if (
-            final_probe.kind is not _RecoveryProbeKind.STATE
+            deadline.remaining() <= 0
+            or final_probe.kind is not _RecoveryProbeKind.STATE
             or final_probe.state is None
             or final_probe.state.signature() != stable.signature()
         ):
             logger.error("Battle recovery state changed after final verification")
             return False
+        if deadline.remaining() <= 0:
+            logger.error("Battle recovery deadline expired during final verification")
+            return False
 
         if stable.phase is not BattleTurnPhase.COMPLETE:
             self._state_store.reset()
+        if deadline.remaining() <= 0:
+            logger.error("Battle recovery deadline expired before final acceptance")
+            return False
         logger.warning(
             "Battle action recovery accepted a verified document phase=%s realm=%s",
             stable.phase,

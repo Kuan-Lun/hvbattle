@@ -97,7 +97,7 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 session_module,
                 "preload_ponychart_classifier",
-                side_effect=lambda: events.append("preload"),
+                new=AsyncMock(side_effect=lambda: events.append("preload")),
             ) as preload,
             patch.object(
                 hentaiverse,
@@ -113,7 +113,7 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             async with session as entered:
                 self.assertIs(entered, session)
 
-        preload.assert_called_once_with()
+        preload.assert_awaited_once_with()
         start_session.assert_awaited_once_with(
             on_browser_ready=session._on_browser_ready,
         )
@@ -303,7 +303,7 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 session_module,
                 "preload_ponychart_classifier",
-                side_effect=lambda: events.append("preload"),
+                new=AsyncMock(side_effect=lambda: events.append("preload")),
             ) as preload,
             patch.object(hentaiverse, "start", new=AsyncMock()) as start,
             patch.object(hentaiverse, "__aexit__", new=AsyncMock()) as close,
@@ -313,7 +313,7 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(first, session)
         self.assertIs(second, session)
-        preload.assert_called_once_with()
+        preload.assert_awaited_once_with()
         session._setup_alert_handler.assert_awaited_once_with()
         self.assertEqual(events, ["attach-hooks", "preload"])
         start.assert_not_awaited()
@@ -358,6 +358,7 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             await session.start_ring_of_blood(
                 option,
                 expected_before=snapshot,
+                expected_realm=Realm.ISEKAI,
             ),
             RingOfBloodStartOutcome.SUBMITTED,
         )
@@ -369,6 +370,7 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         session._launcher.start_ring_of_blood.assert_awaited_once_with(
             option,
             expected_before=snapshot,
+            expected_realm=Realm.ISEKAI,
         )
 
 

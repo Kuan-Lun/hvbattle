@@ -159,7 +159,6 @@ class BattleStepIdleReason(StrEnum):
 
     PAUSED = "paused"
     POLICY = "policy"
-    RETRYABLE_TIMEOUT = "retryable-timeout"
     STATE_NOT_READY = "state-not-ready"
     TRANSITION_CONFIRMATION = "transition-confirmation"
 
@@ -324,10 +323,10 @@ class BattleActionRecoveryEvidence:
 
     @property
     def matches_stalled_single_xhr(self) -> bool:
-        """Whether one turn XHR remained pending for at least five seconds."""
+        """Whether one battle-action XHR remained pending for five seconds."""
         return bool(
             self._has_valid_action_envelope
-            and self.action_kind is BattleActionKind.TURN
+            and self.action_kind in {BattleActionKind.TURN, BattleActionKind.NEXT_FLOOR}
             and self.xhr_pending_at_least_five_seconds is True
             and self.pre_click_document_id == self.post_click_document_id
             and self.dialog_action_id is None

@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import math
 import shutil
 import subprocess
 import unittest
@@ -13,6 +14,7 @@ from hvbattle import (
     BattleActionOutcomeUnknownError,
     BattleActionRecoveryEvidence,
 )
+from hvbattle._timing import SemanticDeadline
 from hvbattle.hv_battle_action_manager import (
     _BATTLE_EXIT_STATE_JS,
     _CLEANUP_ACTION_MONITOR_JS,
@@ -219,6 +221,10 @@ battleAction.responseText = JSON.stringify({
 });
 battleAction.dispatch("load");
 battleAction.dispatch("loadend");
+const observerDisconnectedAfterLoadend = firstObserver.disconnected;
+const wrapperRestoredAfterLoadend =
+    FakeXMLHttpRequest.prototype.open === originalOpen
+    && FakeXMLHttpRequest.prototype.send === originalSend;
 const afterBattle = eval(scripts.read);
 const submittedAction = JSON.parse(originalPayloads.at(-2));
 
@@ -265,6 +271,8 @@ console.log(JSON.stringify({
     wrapperSurvivedUnrelated,
     preSendMutationCount,
     observerTakeRecordsCalls: firstObserver.takeRecordsCalls || 0,
+    observerDisconnectedAfterLoadend,
+    wrapperRestoredAfterLoadend,
     originalSendCount: originalPayloads.length,
     submittedAction: {
         type: submittedAction.type,
@@ -418,6 +426,12 @@ def _manager() -> ElementActionManager:
     manager._select_for_single_click = AsyncMock(return_value=object())
     manager._click = AsyncMock()
     manager._cleanup_action_monitor = AsyncMock()
+    lifecycle = Mock()
+    lifecycle.enable = AsyncMock()
+    lifecycle.trigger = Mock()
+    lifecycle.wait = AsyncMock()
+    lifecycle.close = Mock()
+    manager._main_document_lifecycle = Mock(return_value=lifecycle)
     return manager
 
 
@@ -468,7 +482,9 @@ class BattleActionJavaScriptHookTests(unittest.TestCase):
         self.assertFalse(result["unrelatedSent"])
         self.assertTrue(result["wrapperSurvivedUnrelated"])
         self.assertEqual(result["preSendMutationCount"], 1)
-        self.assertEqual(result["observerTakeRecordsCalls"], 1)
+        self.assertEqual(result["observerTakeRecordsCalls"], 2)
+        self.assertTrue(result["observerDisconnectedAfterLoadend"])
+        self.assertTrue(result["wrapperRestoredAfterLoadend"])
         self.assertEqual(result["originalSendCount"], 6)
         self.assertEqual(
             result["submittedAction"],
@@ -1084,14 +1100,38 @@ class BattleActionEvidenceTests(unittest.TestCase):
 
 
 class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
-    def test_turn_action_receipt_deadline_defaults_to_fifteen_seconds(self) -> None:
-        timeout = inspect.signature(
-            ElementActionManager.click_and_wait_log_locator
-        ).parameters["timeout"]
+    async def test_receipt_timing_cannot_exceed_its_semantic_or_protocol_cap(
+        self,
+    ) -> None:
+        manager = _manager()
 
-        self.assertEqual(timeout.default, 15.0)
+        with self.assertRaisesRegex(ValueError, "must not exceed 15 seconds"):
+            await manager.click_and_wait_log_locator("#mkey_1", timeout=15.01)
+        with self.assertRaisesRegex(ValueError, "must not exceed 5 seconds"):
+            await manager.click_and_wait_transition_locator(
+                "#mkey_1",
+                probe_timeout=5.01,
+            )
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                check_interval=math.inf,
+            )
 
-    async def test_default_receipt_window_observes_six_second_xhr_once(self) -> None:
+    def test_all_action_receipt_deadlines_default_to_fifteen_seconds(self) -> None:
+        methods = (
+            ElementActionManager.click_and_wait_log_locator,
+            ElementActionManager.click_and_wait_transition_locator,
+            ElementActionManager.click_and_wait_battle_exit_locator,
+        )
+
+        for method in methods:
+            with self.subTest(method=method.__name__):
+                timeout = inspect.signature(method).parameters["timeout"]
+                self.assertEqual(timeout.default, 15.0)
+
+    async def test_six_second_xhr_completes_with_five_second_protocol_cap(self) -> None:
         manager = _manager()
         before = _state(monitor=_pending_monitor())
         clock = Mock()
@@ -1168,7 +1208,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         select_calls = 0
 
         class _HangingPage:
-            async def select(self, selector: str, timeout: float) -> object:
+            async def query_selector(self, selector: str) -> object:
                 nonlocal select_calls
                 select_calls += 1
                 await asyncio.Event().wait()
@@ -1178,7 +1218,10 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ZendriverOperationTimeout):
             await manager._select_for_single_click(
-                "#mkey_1", retries=2, wait_timeout=0.02, delay=0
+                "#mkey_1",
+                retries=2,
+                deadline=SemanticDeadline.after(0.02),
+                delay=0,
             )
 
         self.assertEqual(select_calls, 1)
@@ -1191,16 +1234,76 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         target = object()
 
         class _RespondingPage:
-            async def select(self, selector: str, timeout: float) -> object:
+            async def query_selector(self, selector: str) -> object:
                 return target
 
         manager.hvdriver.page = _RespondingPage()
 
         result = await manager._select_for_single_click(
-            "#mkey_1", retries=1, wait_timeout=1.0, delay=0
+            "#mkey_1",
+            retries=1,
+            deadline=SemanticDeadline.after(1.0),
+            delay=0,
         )
 
         self.assertIs(result, target)
+
+    async def test_selector_retry_count_is_strictly_bounded(self) -> None:
+        manager = object.__new__(ElementActionManager)
+        manager.hvdriver = Mock()
+        manager.hvdriver.page = Mock()
+
+        for retries in (True, 0, 51):
+            with (
+                self.subTest(retries=retries),
+                self.assertRaisesRegex(ValueError, "between 1 and 50"),
+            ):
+                await manager._select_for_single_click(
+                    "#mkey_1",
+                    retries=retries,
+                    deadline=SemanticDeadline.after(1.0),
+                    delay=0,
+                )
+
+        manager.hvdriver.page.query_selector.assert_not_called()
+
+    async def test_missing_selector_retries_share_one_absolute_deadline(self) -> None:
+        manager = object.__new__(ElementActionManager)
+        manager.hvdriver = Mock()
+        now = 0.0
+        query_starts: list[float] = []
+
+        class _MissingPage:
+            async def query_selector(self, selector: str) -> object | None:
+                nonlocal now
+                del selector
+                query_starts.append(now)
+                now += 2.0
+                return None
+
+        async def advance(delay: float) -> None:
+            nonlocal now
+            now += delay
+
+        manager.hvdriver.page = _MissingPage()
+        deadline = SemanticDeadline(expires_at=5.0, _clock=lambda: now)
+
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.sleep",
+                side_effect=advance,
+            ),
+            self.assertRaises(TimeoutError),
+        ):
+            await manager._select_for_single_click(
+                "#missing",
+                retries=20,
+                deadline=deadline,
+                delay=1.0,
+            )
+
+        self.assertEqual(now, 5.0)
+        self.assertEqual(query_starts, [0.0, 3.0])
 
     async def test_select_timeout_releases_action_lock_without_hanging(
         self,
@@ -1217,13 +1320,20 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         manager.hvdriver = Mock()
 
         class _HangingPage:
-            async def select(self, selector: str, timeout: float) -> object:
+            async def query_selector(self, selector: str) -> object:
                 await asyncio.Event().wait()
                 raise AssertionError("unreachable")
 
         manager.hvdriver.page = _HangingPage()
 
-        with self.assertRaises(ZendriverOperationTimeout):
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager."
+                "_ACTION_PREPARATION_DEADLINE_SECONDS",
+                0.02,
+            ),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
             await asyncio.wait_for(
                 manager.click_and_wait_log_locator(
                     "#mkey_1", stale_retries=1, timeout=1
@@ -1257,7 +1367,9 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
             events.append("arm" if arm_monitor else "probe")
             return before if arm_monitor else current
 
-        async def click(_element: object) -> None:
+        async def click(_element: object, *, operation_timeout: float) -> None:
+            self.assertGreater(operation_timeout, 0)
+            self.assertLessEqual(operation_timeout, 1)
             events.append("click")
 
         manager._select_for_single_click = AsyncMock(side_effect=select)
@@ -1269,7 +1381,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[:3], ["select", "arm", "click"])
         manager._click.assert_awaited_once()
 
-    async def test_request_age_rebinds_the_post_click_receipt_deadline(self) -> None:
+    async def test_click_time_consumes_total_receipt_deadline(self) -> None:
         manager = _manager()
         before = _state(monitor=_pending_monitor())
         aged_pending = _state(
@@ -1283,7 +1395,8 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         confirmed = _state(monitor=_monitor(request_age_ms=200.0))
         post_click_probe_timeouts: list[float] = []
 
-        async def slow_click(_element: object) -> None:
+        async def slow_click(_element: object, *, operation_timeout: float) -> None:
+            self.assertLessEqual(operation_timeout, 0.2)
             await asyncio.sleep(0.05)
 
         async def read(
@@ -1309,8 +1422,9 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(post_click_probe_timeouts), 2)
-        self.assertGreater(post_click_probe_timeouts[0], 0.12)
-        self.assertLess(post_click_probe_timeouts[1], 0.1)
+        self.assertGreater(post_click_probe_timeouts[0], 0.1)
+        self.assertLess(post_click_probe_timeouts[0], 0.18)
+        self.assertLessEqual(post_click_probe_timeouts[1], post_click_probe_timeouts[0])
         manager._click.assert_awaited_once()
 
     async def test_monitor_arm_timeout_does_not_stack_cleanup_or_click(self) -> None:
@@ -1398,6 +1512,11 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         manager._click.assert_awaited_once()
         manager._cleanup_action_monitor.assert_awaited_once()
+        cleanup_timeout = manager._cleanup_action_monitor.await_args.kwargs[
+            "probe_timeout"
+        ]
+        self.assertGreater(cleanup_timeout, 0)
+        self.assertLessEqual(cleanup_timeout, 1)
         self.assertTrue(
             any(
                 call.args[0].startswith("Battle action confirmed selector=")
@@ -1468,24 +1587,310 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
                 manager._click.assert_awaited_once()
                 manager._cleanup_action_monitor.assert_not_awaited()
 
-    async def test_no_dispatch_raises_retryable_timeout(self) -> None:
+    async def test_delayed_dispatch_after_receipt_deadline_is_outcome_unknown(
+        self,
+    ) -> None:
+        """A click handler may dispatch after 15s, so the click is never retryable."""
+
         manager = _manager()
         before = _state(monitor=_pending_monitor())
+        clock = Mock()
+        clock.now = 0.0
+        clock.time.side_effect = lambda: clock.now
 
         async def read_state(*_args: object, **_kwargs: object) -> _BattleActionState:
             return before
 
+        async def advance_clock(delay: float) -> None:
+            clock.now += delay
+
         manager._read_action_state = AsyncMock(side_effect=read_state)
 
-        with self.assertRaisesRegex(TimeoutError, "was not dispatched"):
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.get_running_loop",
+                return_value=clock,
+            ),
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.sleep",
+                side_effect=advance_clock,
+            ),
+            self.assertRaises(BattleActionOutcomeUnknownError) as raised,
+        ):
             await manager.click_and_wait_log_locator(
                 "#mkey_1",
-                timeout=1e-9,
-                check_interval=1e-9,
+                timeout=15.0,
+                check_interval=15.0,
+            )
+
+        self.assertFalse(raised.exception.recovery_evidence.xhr_sent)
+        self.assertEqual(clock.now, 15.0)
+        manager._click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
+    async def test_turn_probe_result_at_exact_deadline_is_not_accepted(self) -> None:
+        manager = _manager()
+        before = _state(monitor=_pending_monitor())
+        confirmed = _state(log_revision="log-2", monitor=_monitor())
+        clock = Mock()
+        clock.now = 0.0
+        clock.time.side_effect = lambda: clock.now
+
+        async def read_state(
+            _monitor_id: str,
+            *,
+            arm_monitor: bool = False,
+            probe_timeout: float = 3.0,
+        ) -> _BattleActionState:
+            del probe_timeout
+            if arm_monitor:
+                return before
+            clock.now = 15.0
+            return confirmed
+
+        manager._read_action_state = AsyncMock(side_effect=read_state)
+
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.get_running_loop",
+                return_value=clock,
+            ),
+            self.assertRaises(BattleActionOutcomeUnknownError),
+        ):
+            await manager.click_and_wait_log_locator("#mkey_1", timeout=15.0)
+
+        manager._click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
+    async def test_turn_evidence_classified_after_deadline_is_not_accepted(
+        self,
+    ) -> None:
+        manager = _manager()
+        before = _state(monitor=_pending_monitor())
+        confirmed = _state(log_revision="log-2", monitor=_monitor())
+        clock = Mock()
+        clock.now = 0.0
+        clock.time.side_effect = lambda: clock.now
+
+        async def read_state(
+            _monitor_id: str,
+            *,
+            arm_monitor: bool = False,
+            probe_timeout: float = 3.0,
+        ) -> _BattleActionState:
+            del probe_timeout
+            return before if arm_monitor else confirmed
+
+        def classify_late(
+            _before: _BattleActionState,
+            _current: _BattleActionState,
+        ) -> str:
+            clock.now = 15.0
+            return "battle-log-changed"
+
+        manager._read_action_state = AsyncMock(side_effect=read_state)
+
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.get_running_loop",
+                return_value=clock,
+            ),
+            patch(
+                "hvbattle.hv_battle_action_manager._confirmed_action_evidence",
+                side_effect=classify_late,
+            ),
+            self.assertRaises(BattleActionOutcomeUnknownError),
+        ):
+            await manager.click_and_wait_log_locator("#mkey_1", timeout=15.0)
+
+        manager._click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
+    async def test_transition_probe_result_at_exact_deadline_is_not_accepted(
+        self,
+    ) -> None:
+        manager = _manager()
+        before = _state(
+            round_text="Initializing Grindfest (Round 1 / 10)",
+            next_floor_present=True,
+            action_controls=0,
+            monitor=_pending_monitor(),
+        )
+        advanced = _state(
+            round_text="Initializing Grindfest (Round 2 / 10)",
+            next_floor_present=False,
+            action_controls=3,
+            monitor=_monitor(),
+        )
+        clock = Mock()
+        clock.now = 0.0
+        clock.time.side_effect = lambda: clock.now
+
+        async def read_state(
+            _monitor_id: str,
+            *,
+            arm_monitor: bool = False,
+            probe_timeout: float = 3.0,
+        ) -> _BattleActionState:
+            del probe_timeout
+            if arm_monitor:
+                return before
+            clock.now = 15.0
+            return advanced
+
+        manager._read_action_state = AsyncMock(side_effect=read_state)
+
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.get_running_loop",
+                return_value=clock,
+            ),
+            self.assertRaises(BattleActionOutcomeUnknownError),
+        ):
+            await manager.click_and_wait_transition_locator("#btcp", timeout=15.0)
+
+        manager._click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
+    async def test_transition_evidence_classified_after_deadline_is_not_accepted(
+        self,
+    ) -> None:
+        manager = _manager()
+        before = _state(
+            round_text="Initializing Grindfest (Round 1 / 10)",
+            next_floor_present=True,
+            action_controls=0,
+            monitor=_pending_monitor(),
+        )
+        advanced = _state(
+            round_text="Initializing Grindfest (Round 2 / 10)",
+            next_floor_present=False,
+            action_controls=3,
+            monitor=_monitor(),
+        )
+        clock = Mock()
+        clock.now = 0.0
+        clock.time.side_effect = lambda: clock.now
+
+        async def read_state(
+            _monitor_id: str,
+            *,
+            arm_monitor: bool = False,
+            probe_timeout: float = 3.0,
+        ) -> _BattleActionState:
+            del probe_timeout
+            return before if arm_monitor else advanced
+
+        def classify_late(
+            _before: _BattleActionState,
+            _current: _BattleActionState,
+        ) -> str:
+            clock.now = 15.0
+            return "battle-round-advanced"
+
+        manager._read_action_state = AsyncMock(side_effect=read_state)
+
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.get_running_loop",
+                return_value=clock,
+            ),
+            patch(
+                "hvbattle.hv_battle_action_manager._confirmed_transition_evidence",
+                side_effect=classify_late,
+            ),
+            self.assertRaises(BattleActionOutcomeUnknownError),
+        ):
+            await manager.click_and_wait_transition_locator("#btcp", timeout=15.0)
+
+        manager._click.assert_awaited_once()
+        manager._cleanup_action_monitor.assert_not_awaited()
+
+    async def test_final_exit_probe_result_at_exact_deadline_is_not_accepted(
+        self,
+    ) -> None:
+        manager = _manager()
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        clock = Mock()
+        clock.now = 0.0
+        clock.time.side_effect = lambda: clock.now
+
+        async def read_exit(*, probe_timeout: float = 3.0) -> _BattleExitState:
+            del probe_timeout
+            clock.now = 15.0
+            return exited
+
+        manager._read_battle_exit_state = AsyncMock(side_effect=read_exit)
+
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.get_running_loop",
+                return_value=clock,
+            ),
+            self.assertRaises(BattleActionOutcomeUnknownError),
+        ):
+            await manager._click_and_reconcile_battle_exit(
+                object(),
+                selector='#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                before=before,
+                timeout=15.0,
+                check_interval=0.25,
+                probe_timeout=3.0,
             )
 
         manager._click.assert_awaited_once()
-        manager._cleanup_action_monitor.assert_awaited_once()
+
+    async def test_final_exit_evidence_classified_after_deadline_is_not_accepted(
+        self,
+    ) -> None:
+        manager = _manager()
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        clock = Mock()
+        clock.now = 0.0
+        clock.time.side_effect = lambda: clock.now
+        manager._read_battle_exit_state = AsyncMock(return_value=exited)
+
+        def classify_late(
+            _expected_is_isekai: bool,
+            _before: _BattleExitState,
+            _current: _BattleExitState,
+        ) -> str:
+            clock.now = 15.0
+            return "new-document+same-realm-ready+battle-controls-absent"
+
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.get_running_loop",
+                return_value=clock,
+            ),
+            patch(
+                "hvbattle.hv_battle_action_manager._confirmed_battle_exit_evidence",
+                side_effect=classify_late,
+            ),
+            self.assertRaises(BattleActionOutcomeUnknownError),
+        ):
+            await manager._click_and_reconcile_battle_exit(
+                object(),
+                selector='#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                before=before,
+                timeout=15.0,
+                check_interval=0.25,
+                probe_timeout=3.0,
+            )
+
+        manager._click.assert_awaited_once()
 
     async def test_click_error_is_terminal_even_when_monitor_saw_no_dispatch(
         self,
@@ -1499,7 +1904,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
             await manager.click_and_wait_log_locator(
                 "#mkey_1",
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 
@@ -1533,7 +1938,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleActionOutcomeUnknownError):
             await manager.click_and_wait_log_locator(
                 "#mkey_1",
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 
@@ -1563,7 +1968,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
             await manager.click_and_wait_log_locator(
                 "#mkey_1",
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 
@@ -1637,7 +2042,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
             await manager.click_and_wait_log_locator(
                 "#mkey_1",
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 
@@ -1654,6 +2059,13 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_final_reconciliation_accepts_late_battle_completion(self) -> None:
         manager = _manager()
         before = _state(monitor=_pending_monitor())
+        rejected = _state(
+            monitor=_monitor(
+                status=503,
+                response_has_textlog=False,
+                response_has_pane_completion=False,
+            )
+        )
         final = _state(
             completion_present=True,
             battle_complete_present=True,
@@ -1666,13 +2078,13 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
                 response_has_pane_completion=True,
             ),
         )
-        manager._read_action_state = AsyncMock(return_value=before)
+        manager._read_action_state = AsyncMock(side_effect=[before, rejected])
         manager._final_action_probe = AsyncMock(return_value=(final, None))
 
         with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
             await manager.click_and_wait_log_locator(
                 "#mkey_1",
-                timeout=1e-9,
+                timeout=1,
                 check_interval=1e-9,
             )
 
@@ -1804,7 +2216,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleActionOutcomeUnknownError):
             await manager.click_and_wait_transition_locator(
                 "#btcp",
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 
@@ -2011,7 +2423,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         action_logger.info.assert_not_called()
 
-    async def test_final_completion_reconciliation_warns(self) -> None:
+    async def test_final_completion_deadline_has_no_out_of_budget_probe(self) -> None:
         manager = _manager()
         before = _exit_state()
         exited = _exit_state(
@@ -2022,7 +2434,10 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
         manager._read_battle_exit_state = AsyncMock(side_effect=[before, before])
         manager._final_battle_exit_probe = AsyncMock(return_value=(exited, None))
 
-        with patch("hvbattle.hv_battle_action_manager.logger") as action_logger:
+        with (
+            patch("hvbattle.hv_battle_action_manager.logger"),
+            self.assertRaises(TimeoutError),
+        ):
             await manager.click_and_wait_battle_exit_locator(
                 '#pane_completion img[src*="finishbattle.png"]',
                 expected_is_isekai=False,
@@ -2030,13 +2445,8 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
                 check_interval=1e-9,
             )
 
-        manager._click.assert_awaited_once()
-        manager._final_battle_exit_probe.assert_awaited_once()
-        action_logger.warning.assert_called_once()
-        self.assertIn(
-            "during final reconciliation", action_logger.warning.call_args.args[0]
-        )
-        action_logger.info.assert_not_called()
+        manager._click.assert_not_awaited()
+        manager._final_battle_exit_probe.assert_not_awaited()
 
     async def test_final_completion_unknown_never_retries_click(self) -> None:
         manager = _manager()
@@ -2049,7 +2459,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
             await manager.click_and_wait_battle_exit_locator(
                 '#pane_completion img[src*="finishbattle.png"]',
                 expected_is_isekai=False,
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 
@@ -2089,7 +2499,7 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
             await manager.click_and_wait_battle_exit_locator(
                 '#pane_completion img[src*="finishbattle.png"]',
                 expected_is_isekai=False,
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 

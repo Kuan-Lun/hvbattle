@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import AsyncMock, Mock, call, patch
 
+from hvbrowser import MaintenanceNavigationBlocker, Realm
+
 from hvbattle import (
     ArenaOption,
     GrindfestOption,
@@ -18,7 +20,15 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         client = Mock()
         client.page = Mock()
         launcher = BattleLauncher(client, Mock())
-        launcher._path_prefix = AsyncMock(return_value="")
+        lifecycle = Mock()
+        lifecycle.enable = AsyncMock()
+        lifecycle.trigger = Mock()
+        lifecycle.wait = AsyncMock()
+        lifecycle.close = Mock()
+        launcher._main_document_lifecycle = Mock(return_value=lifecycle)
+        launcher._confirm_battle_form_receipt = AsyncMock(
+            return_value=MaintenanceNavigationBlocker.ACTIVE
+        )
         return launcher, client.page
 
     @staticmethod
@@ -96,24 +106,23 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                 "https://hentaiverse.org/?s=Battle&ss=gr",
             ),
         )
-        current_url = "https://hentaiverse.org/"
-
         for kind, method_name, option, expected_url in cases:
             with self.subTest(kind=kind):
                 launcher, page = self._launcher()
-                page.evaluate = AsyncMock(return_value=current_url)
+                page.evaluate = AsyncMock(return_value="unexpected-page")
 
                 with patch("hvbattle.battle_launcher.logger") as launcher_logger:
-                    submitted = await getattr(launcher, method_name)(option)
+                    submitted = await getattr(launcher, method_name)(
+                        option,
+                        expected_realm=Realm.PERSISTENT,
+                    )
 
                 self.assertFalse(submitted)
-                page.evaluate.assert_awaited_once_with("window.location.href")
+                page.evaluate.assert_awaited_once()
                 launcher_logger.debug.assert_called_once_with(
                     f"Battle form submission skipped kind={kind} id=%s "
-                    "reason=unexpected-page expected=%s current=%s",
+                    "reason=unexpected-page",
                     option.battle_id,
-                    expected_url,
-                    current_url,
                 )
                 launcher_logger.info.assert_not_called()
                 launcher_logger.warning.assert_not_called()
@@ -140,15 +149,19 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         for kind, method_name, option, expected_url in cases:
             with self.subTest(kind=kind):
                 launcher, page = self._launcher()
-                page.evaluate = AsyncMock(side_effect=[expected_url, False])
+                page.evaluate = AsyncMock(return_value="form-unavailable")
 
                 with patch("hvbattle.battle_launcher.logger") as launcher_logger:
-                    submitted = await getattr(launcher, method_name)(option)
+                    submitted = await getattr(launcher, method_name)(
+                        option,
+                        expected_realm=Realm.PERSISTENT,
+                    )
 
                 self.assertFalse(submitted)
                 launcher_logger.warning.assert_called_once_with(
-                    f"Battle form was not submitted kind={kind} id=%s",
+                    f"Battle form was not submitted kind={kind} id=%s reason=%s",
                     option.battle_id,
+                    "form-unavailable",
                 )
                 launcher_logger.info.assert_not_called()
                 self.assertNotIn(
@@ -177,13 +190,19 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                 submission_error = RuntimeError(
                     "submission failed with secret-arena-token"
                 )
-                page.evaluate = AsyncMock(side_effect=[expected_url, submission_error])
+                launcher._confirm_battle_form_receipt.side_effect = TimeoutError(
+                    "receipt missing"
+                )
+                page.evaluate = AsyncMock(side_effect=submission_error)
 
                 with (
                     patch("hvbattle.battle_launcher.logger") as launcher_logger,
                     self.assertRaises(RuntimeError) as raised,
                 ):
-                    await getattr(launcher, method_name)(option)
+                    await getattr(launcher, method_name)(
+                        option,
+                        expected_realm=Realm.PERSISTENT,
+                    )
 
                 self.assertIs(raised.exception, submission_error)
                 launcher_logger.error.assert_called_once_with(
@@ -217,10 +236,13 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         for method_name, option, expected_url, message in cases:
             with self.subTest(method=method_name):
                 launcher, page = self._launcher()
-                page.evaluate = AsyncMock(side_effect=[expected_url, True])
+                page.evaluate = AsyncMock(return_value="submitted")
 
                 with patch("hvbattle.battle_launcher.logger") as launcher_logger:
-                    submitted = await getattr(launcher, method_name)(option)
+                    submitted = await getattr(launcher, method_name)(
+                        option,
+                        expected_realm=Realm.PERSISTENT,
+                    )
 
                 self.assertTrue(submitted)
                 launcher_logger.info.assert_called_once_with(
@@ -238,24 +260,22 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         launcher, page = self._launcher()
         option, snapshot, _payload = self._ring_values()
         secret = "secret-current-url-detail"
-        current_url = f"https://hentaiverse.org/?private={secret}"
-        expected_url = "https://hentaiverse.org/?s=Battle&ss=rb"
-        page.evaluate = AsyncMock(return_value=current_url)
+        page.evaluate = AsyncMock(return_value="unexpected-page")
 
         with patch("hvbattle.battle_launcher.logger") as launcher_logger:
             outcome = await launcher.start_ring_of_blood(
                 option,
                 expected_before=snapshot,
+                expected_realm=Realm.PERSISTENT,
             )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
-        launcher_logger.debug.assert_called_once_with(
+        launcher_logger.debug.assert_any_call(
             "Ring of Blood pre-submit check id=%s reason=unexpected-page",
             option.battle_id,
         )
         launcher_logger.info.assert_not_called()
         launcher_logger.warning.assert_not_called()
-        self.assertNotIn(expected_url, repr(launcher_logger.method_calls))
         self.assertNotIn(secret, repr(launcher_logger.method_calls))
 
     async def test_ring_inspection_logs_all_parsed_challenge_details(self) -> None:
@@ -308,35 +328,20 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ring_success_logs_precheck_and_atomic_submission(self) -> None:
         launcher, page = self._launcher()
-        option, snapshot, payload = self._ring_values()
-        page.evaluate = AsyncMock(
-            side_effect=[
-                "https://hentaiverse.org/?s=Battle&ss=rb",
-                payload,
-                "submitted",
-            ]
-        )
+        option, snapshot, _payload = self._ring_values()
+        page.evaluate = AsyncMock(return_value="submitted")
 
         with patch("hvbattle.battle_launcher.logger") as launcher_logger:
             outcome = await launcher.start_ring_of_blood(
                 option,
                 expected_before=snapshot,
+                expected_realm=Realm.PERSISTENT,
             )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.SUBMITTED)
         self.assertEqual(
             launcher_logger.debug.call_args_list,
             [
-                *self._ring_inspection_calls(option),
-                call(
-                    "Ring of Blood pre-submit check id=%s action_present=%s "
-                    "snapshot_matches=%s required=%s available=%s",
-                    option.battle_id,
-                    True,
-                    True,
-                    option.entry_cost,
-                    snapshot.tokens_of_blood,
-                ),
                 call(
                     "Ring of Blood atomic submission check id=%s result=%s",
                     option.battle_id,
@@ -353,30 +358,21 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ring_precheck_logs_when_target_action_disappears(self) -> None:
         launcher, page = self._launcher()
-        option, snapshot, payload = self._ring_values()
-        payload["rows"] = []
-        page.evaluate = AsyncMock(
-            side_effect=[
-                "https://hentaiverse.org/?s=Battle&ss=rb",
-                payload,
-            ]
-        )
+        option, snapshot, _payload = self._ring_values()
+        page.evaluate = AsyncMock(return_value="option-unavailable")
 
         with patch("hvbattle.battle_launcher.logger") as launcher_logger:
             outcome = await launcher.start_ring_of_blood(
                 option,
                 expected_before=snapshot,
+                expected_realm=Realm.PERSISTENT,
             )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
         launcher_logger.debug.assert_any_call(
-            "Ring of Blood pre-submit check id=%s action_present=%s "
-            "snapshot_matches=%s required=%s available=%s",
+            "Ring of Blood atomic submission check id=%s result=%s",
             option.battle_id,
-            False,
-            False,
-            option.entry_cost,
-            snapshot.tokens_of_blood,
+            "option-unavailable",
         )
         launcher_logger.debug.assert_any_call(
             "Ring of Blood option is unavailable id=%s",
@@ -396,19 +392,14 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         for atomic_result in results:
             with self.subTest(atomic_result=atomic_result):
                 launcher, page = self._launcher()
-                option, snapshot, payload = self._ring_values()
-                page.evaluate = AsyncMock(
-                    side_effect=[
-                        "https://hentaiverse.org/?s=Battle&ss=rb",
-                        payload,
-                        atomic_result,
-                    ]
-                )
+                option, snapshot, _payload = self._ring_values()
+                page.evaluate = AsyncMock(return_value=atomic_result)
 
                 with patch("hvbattle.battle_launcher.logger") as launcher_logger:
                     outcome = await launcher.start_ring_of_blood(
                         option,
                         expected_before=snapshot,
+                        expected_realm=Realm.PERSISTENT,
                     )
 
                 expected_reason = (
@@ -433,12 +424,15 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                     option.battle_id,
                     expected_reason,
                 )
-                launcher_logger.warning.assert_called_once_with(
-                    "Battle form was not submitted kind=ring-of-blood id=%s "
-                    "reason=%s",
-                    option.battle_id,
-                    expected_reason,
-                )
+                if expected_reason == "unexpected-page":
+                    launcher_logger.warning.assert_not_called()
+                else:
+                    launcher_logger.warning.assert_called_once_with(
+                        "Battle form was not submitted kind=ring-of-blood id=%s "
+                        "reason=%s",
+                        option.battle_id,
+                        expected_reason,
+                    )
                 if expected_reason == "unexpected-result":
                     self.assertNotIn(
                         repr(atomic_result),
@@ -447,16 +441,13 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ring_submission_exception_logs_only_error_type(self) -> None:
         launcher, page = self._launcher()
-        option, snapshot, payload = self._ring_values()
+        option, snapshot, _payload = self._ring_values()
         secret_detail = "server rejected private response detail"
         submission_error = RuntimeError(secret_detail)
-        page.evaluate = AsyncMock(
-            side_effect=[
-                "https://hentaiverse.org/?s=Battle&ss=rb",
-                payload,
-                submission_error,
-            ]
+        launcher._confirm_battle_form_receipt.side_effect = TimeoutError(
+            "receipt missing"
         )
+        page.evaluate = AsyncMock(side_effect=submission_error)
 
         with (
             patch("hvbattle.battle_launcher.logger") as launcher_logger,
@@ -465,6 +456,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             await launcher.start_ring_of_blood(
                 option,
                 expected_before=snapshot,
+                expected_realm=Realm.PERSISTENT,
             )
 
         self.assertIs(raised.exception, submission_error)
@@ -475,21 +467,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             "RuntimeError",
         )
         launcher_logger.exception.assert_not_called()
-        self.assertEqual(
-            launcher_logger.debug.call_args_list,
-            [
-                *self._ring_inspection_calls(option),
-                call(
-                    "Ring of Blood pre-submit check id=%s action_present=%s "
-                    "snapshot_matches=%s required=%s available=%s",
-                    option.battle_id,
-                    True,
-                    True,
-                    option.entry_cost,
-                    snapshot.tokens_of_blood,
-                ),
-            ],
-        )
+        launcher_logger.debug.assert_not_called()
         launcher_logger.info.assert_not_called()
         self.assertNotIn(secret_detail, repr(launcher_logger.method_calls))
 

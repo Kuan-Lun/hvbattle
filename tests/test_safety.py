@@ -2,6 +2,7 @@ import ast
 import asyncio
 import inspect
 import json
+import math
 import shutil
 import subprocess
 import unittest
@@ -9,9 +10,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
-from hvbrowser import Realm
+from hvbrowser import MaintenanceNavigationBlocker, Realm
 from hvbrowser.runtime import ZendriverOperationTimeout
 
+import hvbattle.battle_launcher as battle_launcher_module
 import hvbattle.hv_battle_ponychart as ponychart_module
 import hvbattle.session as session_module
 from hvbattle import (
@@ -38,11 +40,45 @@ from hvbattle import (
     RingOfBloodStartOutcome,
     TurnDecision,
 )
+from hvbattle._timing import SemanticDeadline
 from hvbattle.battle_launcher import BattleLauncher
 from hvbattle.battle_state import BattleStateStore, CombatLogTracker
 from hvbattle.hv_battle_buff_manager import BuffManager
 from hvbattle.hv_battle_ponychart import PonyChart
 from hvbattle.recovery import ActionDialogTracker
+
+
+def _stub_form_lifecycle(
+    launcher: BattleLauncher,
+    *,
+    stub_receipt: bool = True,
+) -> Mock:
+    lifecycle = Mock()
+    lifecycle.enable = AsyncMock()
+    lifecycle.trigger = Mock()
+    lifecycle.wait = AsyncMock()
+    lifecycle.close = Mock()
+    launcher._main_document_lifecycle = Mock(return_value=lifecycle)
+    if stub_receipt:
+        launcher._confirm_battle_form_receipt = AsyncMock(
+            return_value=MaintenanceNavigationBlocker.ACTIVE
+        )
+    return lifecycle
+
+
+def _presence(
+    *,
+    ponychart: bool = False,
+    completion: bool = False,
+    next_floor: bool = False,
+    battle_main: bool = False,
+) -> object:
+    return session_module._BattlePresenceObservation(
+        ponychart=ponychart,
+        completion=completion,
+        next_floor=next_floor,
+        battle_main=battle_main,
+    )
 
 
 class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
@@ -143,6 +179,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.is_ponychart_present = AsyncMock(return_value=True)
         session._read_battle_phase = AsyncMock()
         session._has_battle_marker = AsyncMock()
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(ponychart=True)
+        )
         session.battle_state = Mock()
         session.battle_state.inspect = AsyncMock(
             side_effect=AssertionError("ordinary parser ran before PonyChart")
@@ -161,9 +200,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         operation_timeout = ZendriverOperationTimeout(timeout_seconds=10.0)
         session = object.__new__(BattleSession)
         session._completion_observed = False
-        session._has_battle_marker = AsyncMock(return_value=True)
-        session._read_battle_phase = AsyncMock(return_value="active")
-        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.update = AsyncMock(side_effect=operation_timeout)
 
@@ -171,15 +210,83 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
             await BattleSession.prepare_turn_state(session)
 
         self.assertIs(raised.exception, operation_timeout)
-        session.battle_state.update.assert_awaited_once_with()
-        session.is_ponychart_present.assert_awaited_once_with()
-        session._read_battle_phase.assert_awaited_once_with()
+        session.battle_state.update.assert_awaited_once()
+        session._read_battle_presence_observation.assert_awaited_once()
+
+    async def test_bounded_prepare_uses_atomic_presence_and_remaining_content_budget(
+        self,
+    ) -> None:
+        session = object.__new__(BattleSession)
+        session.turn = -1
+        session.round = -1
+        session._completion_observed = False
+        session._read_battle_presence_observation = AsyncMock(
+            side_effect=[
+                _presence(battle_main=True),
+                _presence(battle_main=True),
+            ]
+        )
+        session.battle_state = Mock()
+        session.battle_state.update = AsyncMock()
+        session.battle_state.snap = SimpleNamespace(
+            warnings=[],
+            player=SimpleNamespace(
+                hp_percent=100.0,
+                mp_percent=100.0,
+                sp_percent=100.0,
+                overcharge_value=0,
+            ),
+        )
+        session.battle_state.overview_monsters.alive_monster = [0]
+        session.battle_state.log_entries.current_round = 1
+        session.battle_state.log_entries.total_round = 1
+        session.battle_state.log_entries.current_lines = []
+
+        state = await BattleSession.prepare_turn_state(session, timeout=1.0)
+
+        self.assertIs(state.phase, BattleTurnPhase.ACTIVE)
+        self.assertEqual(session._read_battle_presence_observation.await_count, 2)
+        for presence_call in session._read_battle_presence_observation.await_args_list:
+            self.assertGreater(presence_call.kwargs["timeout"], 0)
+            self.assertLessEqual(presence_call.kwargs["timeout"], 1.0)
+        content_timeout = session.battle_state.update.await_args.kwargs["timeout"]
+        self.assertGreater(content_timeout, 0)
+        self.assertLessEqual(content_timeout, 1.0)
+
+    async def test_bounded_prepare_starts_no_final_probe_after_content_expiry(
+        self,
+    ) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(battle_main=True)
+        )
+        session.battle_state = Mock()
+
+        async def expire_content(*, timeout: float) -> None:
+            self.assertGreater(timeout, 0)
+            await asyncio.sleep(0.02)
+
+        session.battle_state.update = AsyncMock(side_effect=expire_content)
+
+        with self.assertRaisesRegex(TimeoutError, "content probe"):
+            await BattleSession.prepare_turn_state(session, timeout=0.01)
+
+        session._read_battle_presence_observation.assert_awaited_once()
+
+    async def test_prepare_timeout_cannot_exceed_protocol_lane(self) -> None:
+        session = object.__new__(BattleSession)
+
+        for invalid in (0, -1, 5.01, math.inf, math.nan, True):
+            with self.subTest(timeout=invalid):
+                with self.assertRaisesRegex(ValueError, r"range \(0, 5\]"):
+                    await BattleSession.prepare_turn_state(session, timeout=invalid)
 
     async def test_non_battle_transition_does_not_increment_turn(self) -> None:
         session = object.__new__(BattleSession)
         session.turn = 4
         session.round = 3
-        session._has_battle_marker = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(return_value=_presence())
 
         state = await BattleSession.prepare_turn_state(session)
 
@@ -193,9 +300,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.turn = -1
         session.round = -1
         session._completion_observed = False
-        session._has_battle_marker = AsyncMock(return_value=True)
-        session._read_battle_phase = AsyncMock(return_value="active")
-        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.update = AsyncMock()
         session.battle_state.snap = SimpleNamespace(
@@ -233,9 +340,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.turn = -1
         session.round = -1
         session._completion_observed = False
-        session._has_battle_marker = AsyncMock(return_value=True)
-        session._read_battle_phase = AsyncMock(return_value="active")
-        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.update = AsyncMock()
         session.battle_state.snap = SimpleNamespace(
@@ -341,9 +448,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.turn = -1
         session.round = -1
         session._completion_observed = False
-        session._has_battle_marker = AsyncMock(return_value=True)
-        session._read_battle_phase = AsyncMock(return_value="active")
-        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.update = AsyncMock()
         session.battle_state.snap = SimpleNamespace(
@@ -425,9 +532,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.turn = 0
         session.round = 1
         session._completion_observed = False
-        session._has_battle_marker = AsyncMock(return_value=True)
-        session._read_battle_phase = AsyncMock(return_value="active")
-        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.update = AsyncMock()
         session.battle_state.snap = SimpleNamespace(warnings=[])
@@ -450,9 +557,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.turn = 0
         session.round = 1
         session._completion_observed = False
-        session._has_battle_marker = AsyncMock(return_value=True)
-        session._read_battle_phase = AsyncMock(return_value="complete")
-        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(completion=True, battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.update = AsyncMock()
         session.battle_state.snap = SimpleNamespace(warnings=[])
@@ -478,9 +585,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.turn = 2
         session.round = 1
         session._completion_observed = False
-        session._has_battle_marker = AsyncMock(return_value=True)
-        session._read_battle_phase = AsyncMock(return_value="next-floor")
-        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(next_floor=True, battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.update = AsyncMock(
             side_effect=AssertionError("parser must not run during transition")
@@ -498,9 +605,12 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.turn = 2
         session.round = 1
         session._completion_observed = False
-        session._has_battle_marker = AsyncMock(return_value=True)
-        session._read_battle_phase = AsyncMock(side_effect=["active", "complete"])
-        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(
+            side_effect=[
+                _presence(battle_main=True),
+                _presence(completion=True, battle_main=True),
+            ]
+        )
         session.battle_state = Mock()
         session.battle_state.update = AsyncMock(
             side_effect=TimeoutError("monsters disappeared during parse")
@@ -526,9 +636,9 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
         session.turn = 2
         session.round = 1
         session._completion_observed = False
-        session._has_battle_marker = AsyncMock(return_value=True)
-        session._read_battle_phase = AsyncMock(return_value="active")
-        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.update = AsyncMock(side_effect=parser_error)
 
@@ -536,16 +646,19 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
             await BattleSession.prepare_turn_state(session)
 
         self.assertIs(raised.exception, parser_error)
-        session.battle_state.update.assert_awaited_once_with()
+        session.battle_state.update.assert_awaited_once()
 
     async def test_completion_after_parse_is_debug_detail(self) -> None:
         session = object.__new__(BattleSession)
         session.turn = 2
         session.round = 1
         session._completion_observed = False
-        session._has_battle_marker = AsyncMock(return_value=True)
-        session._read_battle_phase = AsyncMock(side_effect=["active", "complete"])
-        session.is_ponychart_present = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(
+            side_effect=[
+                _presence(battle_main=True),
+                _presence(completion=True, battle_main=True),
+            ]
+        )
         session.battle_state = Mock()
         session.battle_state.update = AsyncMock()
 
@@ -557,7 +670,7 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(state.actionable)
         self.assertTrue(session.battle_completion_observed)
-        session.battle_state.update.assert_awaited_once_with()
+        session.battle_state.update.assert_awaited_once()
         info.assert_not_called()
         debug.assert_called_once_with(
             "Final battle completion control appeared after parsing."
@@ -631,8 +744,13 @@ console.log(JSON.stringify({
     async def test_final_control_wins_when_btcp_is_also_present(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
-        session.is_ponychart_present = AsyncMock(return_value=False)
-        session._read_battle_phase = AsyncMock(return_value="complete")
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(
+                completion=True,
+                next_floor=True,
+                battle_main=True,
+            )
+        )
 
         active = await BattleSession.is_in_battle(session)
 
@@ -642,8 +760,9 @@ console.log(JSON.stringify({
     async def test_completion_presence_is_distinct_from_absence(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
-        session.is_ponychart_present = AsyncMock(return_value=False)
-        session._read_battle_phase = AsyncMock(return_value="complete")
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(completion=True)
+        )
 
         presence = await BattleSession.inspect_battle_presence(session)
 
@@ -653,9 +772,7 @@ console.log(JSON.stringify({
     async def test_no_active_battle_probe_is_debug_detail(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
-        session.is_ponychart_present = AsyncMock(return_value=False)
-        session._read_battle_phase = AsyncMock(return_value="active")
-        session._has_battle_marker = AsyncMock(return_value=False)
+        session._read_battle_presence_observation = AsyncMock(return_value=_presence())
 
         with (
             patch.object(session_module.logger, "info") as info,
@@ -670,9 +787,9 @@ console.log(JSON.stringify({
     async def test_presence_marker_never_runs_the_snapshot_parser(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
-        session.is_ponychart_present = AsyncMock(return_value=False)
-        session._read_battle_phase = AsyncMock(return_value="active")
-        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.inspect = AsyncMock(
             side_effect=AssertionError("presence must not parse turn state")
@@ -722,9 +839,9 @@ console.log(JSON.stringify({
     async def test_completion_phase_wins_without_snapshot_parsing(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
-        session.is_ponychart_present = AsyncMock(return_value=False)
-        session._read_battle_phase = AsyncMock(return_value="complete")
-        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(completion=True, battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.inspect = AsyncMock(
             side_effect=ValueError("monsters disappeared during inspect")
@@ -739,9 +856,9 @@ console.log(JSON.stringify({
     async def test_next_floor_phase_wins_without_snapshot_parsing(self) -> None:
         session = object.__new__(BattleSession)
         session._completion_observed = False
-        session.is_ponychart_present = AsyncMock(return_value=False)
-        session._read_battle_phase = AsyncMock(return_value="next-floor")
-        session._has_battle_marker = AsyncMock(return_value=True)
+        session._read_battle_presence_observation = AsyncMock(
+            return_value=_presence(next_floor=True, battle_main=True)
+        )
         session.battle_state = Mock()
         session.battle_state.inspect = AsyncMock(
             side_effect=TimeoutError("inspect raced with transition")
@@ -752,15 +869,15 @@ console.log(JSON.stringify({
         self.assertIs(presence, BattlePresence.ACTIVE)
         session.battle_state.inspect.assert_not_awaited()
 
-    async def test_live_zendriver_timeout_during_marker_probe_propagates(
+    async def test_live_zendriver_timeout_during_atomic_presence_probe_propagates(
         self,
     ) -> None:
         operation_timeout = ZendriverOperationTimeout(timeout_seconds=10.0)
         session = object.__new__(BattleSession)
         session._completion_observed = False
-        session.is_ponychart_present = AsyncMock(return_value=False)
-        session._read_battle_phase = AsyncMock(return_value="active")
-        session._has_battle_marker = AsyncMock(side_effect=operation_timeout)
+        session._read_battle_presence_observation = AsyncMock(
+            side_effect=operation_timeout
+        )
         session.battle_state = Mock()
         session.battle_state.inspect = AsyncMock(side_effect=operation_timeout)
 
@@ -769,8 +886,45 @@ console.log(JSON.stringify({
 
         self.assertIs(raised.exception, operation_timeout)
         session.battle_state.inspect.assert_not_awaited()
-        session.is_ponychart_present.assert_awaited_once_with()
-        session._read_battle_phase.assert_awaited_once_with()
+        session._read_battle_presence_observation.assert_awaited_once_with()
+
+    async def test_presence_uses_one_atomic_typed_page_read(self) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.page = Mock()
+        session.page.evaluate = AsyncMock(
+            return_value={
+                "ponychart": False,
+                "completion": False,
+                "nextFloor": True,
+                "battleMain": True,
+            }
+        )
+
+        presence = await BattleSession.inspect_battle_presence(session)
+
+        self.assertIs(presence, BattlePresence.ACTIVE)
+        session.page.evaluate.assert_awaited_once_with(
+            session_module._BATTLE_PRESENCE_JS
+        )
+
+    async def test_presence_rejects_malformed_atomic_payload(self) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.page = Mock()
+        session.page.evaluate = AsyncMock(
+            return_value={
+                "ponychart": False,
+                "completion": False,
+                "nextFloor": False,
+                "battleMain": "false",
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Invalid battle presence"):
+            await BattleSession.inspect_battle_presence(session)
+
+        session.page.evaluate.assert_awaited_once()
 
     async def test_page_diagnostic_is_delegated_to_browser_owner(self) -> None:
         path = Path("diagnostics/battle_state_not_ready_1.html")
@@ -829,7 +983,12 @@ class _FakeSession:
         self.turn = -1
         self.battle_completion_observed = False
 
-    async def prepare_turn_state(self) -> BattleTurnState:
+    async def prepare_turn_state(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> BattleTurnState:
+        del timeout
         if not self._active:
             return BattleTurnState(BattleTurnPhase.ABSENT)
         self.turn += 1
@@ -987,10 +1146,15 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_page_exit_without_completion_evidence_is_interrupted(self) -> None:
         session = _FakeSession(active=True)
         strategy = Mock()
+        now = 0.0
 
         async def leave_page(_session: object) -> TurnDecision:
             session._active = False
             return TurnDecision.ACTED
+
+        async def advance_clock(delay: float) -> None:
+            nonlocal now
+            now += delay
 
         strategy.take_turn = AsyncMock(side_effect=leave_page)
 
@@ -998,8 +1162,8 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             await BattleRunner(
                 session,  # type: ignore[arg-type]
                 strategy,
-                transition_checks=2,
-                sleep=AsyncMock(),
+                sleep=AsyncMock(side_effect=advance_clock),
+                clock=lambda: now,
             ).run_current()
 
         strategy.take_turn.assert_awaited_once_with(session)
@@ -1032,7 +1196,9 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         session.prepare_turn_state.assert_awaited_once()
         strategy.take_turn.assert_awaited_once_with(session)
 
-    async def test_read_timeout_is_attempted_three_times(self) -> None:
+    async def test_read_timeout_is_not_retried_without_a_typed_receipt_lane(
+        self,
+    ) -> None:
         session = _FakeSession(active=True)
         session.prepare_turn_state = AsyncMock(
             side_effect=TimeoutError("read timed out")
@@ -1048,43 +1214,22 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             await BattleRunner(
                 session,  # type: ignore[arg-type]
                 strategy,
-                timeout_retries=3,
                 sleep=retry_sleep,
             ).run_current()
 
         self.assertIsInstance(raised.exception.__cause__, TimeoutError)
-        self.assertEqual(
-            runner_logger.warning.call_args_list,
-            [
-                call(
-                    "Battle turn timed out; retrying (%d/%d) error_type=%s",
-                    1,
-                    3,
-                    "TimeoutError",
-                ),
-                call(
-                    "Battle turn timed out; retrying (%d/%d) error_type=%s",
-                    2,
-                    3,
-                    "TimeoutError",
-                ),
-            ],
-        )
-        self.assertEqual(
-            runner_logger.debug.call_args_list,
-            [
-                call("Battle turn timeout error detail", exc_info=True),
-                call("Battle turn timeout error detail", exc_info=True),
-            ],
+        runner_logger.warning.assert_not_called()
+        runner_logger.debug.assert_called_once_with(
+            "Battle turn timeout error detail",
+            exc_info=True,
         )
         runner_logger.error.assert_called_once_with(
-            "Battle turn timed out; retry limit reached (%d/%d) error_type=%s",
-            3,
-            3,
+            "Battle turn timed out; no unclassified timeout is retried "
+            "error_type=%s",
             "TimeoutError",
         )
-        self.assertEqual(session.prepare_turn_state.await_count, 3)
-        self.assertEqual(retry_sleep.await_count, 2)
+        session.prepare_turn_state.assert_awaited_once()
+        retry_sleep.assert_not_awaited()
         strategy.take_turn.assert_not_awaited()
 
     async def test_live_zendriver_timeout_is_never_retried(self) -> None:
@@ -1099,12 +1244,11 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             await BattleRunner(
                 session,  # type: ignore[arg-type]
                 strategy,
-                timeout_retries=3,
                 sleep=retry_sleep,
             ).run_current()
 
         self.assertIs(raised.exception.__cause__, operation_timeout)
-        session.prepare_turn_state.assert_awaited_once_with()
+        session.prepare_turn_state.assert_awaited_once()
         retry_sleep.assert_not_awaited()
         strategy.take_turn.assert_not_awaited()
 
@@ -1336,42 +1480,366 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, BattleStopped)
         strategy.take_turn.assert_awaited_once_with(session)
 
-    async def test_battle_launcher_uses_composed_realm_navigator(self) -> None:
+    async def test_battle_form_routes_cover_both_realms_without_extra_probe(
+        self,
+    ) -> None:
         browser = Mock()
         browser.page = Mock()
         realm = Mock()
         realm.current = AsyncMock(return_value=Realm.ISEKAI)
         launcher = BattleLauncher(browser, realm)
 
-        self.assertEqual(await launcher._path_prefix(), "/isekai")
-
-        realm.current.return_value = Realm.PERSISTENT
-        self.assertEqual(await launcher._path_prefix(), "")
+        self.assertEqual(
+            launcher._battle_route_url(Realm.PERSISTENT, "ar"),
+            "https://hentaiverse.org/?s=Battle&ss=ar",
+        )
+        self.assertEqual(
+            launcher._battle_route_url(Realm.ISEKAI, "ar"),
+            "https://hentaiverse.org/isekai/?s=Battle&ss=ar",
+        )
+        realm.current.assert_not_awaited()
 
     async def test_false_submission_result_is_not_reported_as_started(self) -> None:
         client = Mock()
         client.page = Mock()
         launcher = BattleLauncher(client, Mock())
-        arena_url = "https://hentaiverse.org/?s=Battle&ss=ar"
-        launcher._path_prefix = AsyncMock(return_value="")
-        client.page.evaluate = AsyncMock(side_effect=[arena_url, False])
+        lifecycle = _stub_form_lifecycle(launcher, stub_receipt=False)
+        client.page.evaluate = AsyncMock(return_value="form-unavailable")
 
-        started = await launcher.start_arena(ArenaOption(12))
+        started = await launcher.start_arena(
+            ArenaOption(12),
+            expected_realm=Realm.PERSISTENT,
+        )
 
         self.assertFalse(started)
+        lifecycle.enable.assert_awaited_once()
+        lifecycle.trigger.assert_called_once_with()
+        lifecycle.wait.assert_not_awaited()
+        lifecycle.close.assert_called_once_with()
+
+    async def test_form_prearm_and_mutation_share_one_five_second_budget(
+        self,
+    ) -> None:
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client, Mock())
+        lifecycle = _stub_form_lifecycle(launcher, stub_receipt=False)
+        now = 0.0
+        receipt_deadline = SemanticDeadline(expires_at=15.0, _clock=lambda: now)
+        events: list[str] = []
+        mutation_timeouts: list[float] = []
+
+        async def enable(*, deadline: SemanticDeadline) -> None:
+            nonlocal now
+            events.append("enable")
+            self.assertEqual(deadline.expires_at, 5.0)
+            self.assertEqual(deadline.remaining(), 5.0)
+            now = 4.75
+
+        async def evaluate(_script: str) -> object:
+            if "const expectedUrl" in _script:
+                events.append("evaluate-submit")
+                return "submitted"
+            events.append("evaluate-marker")
+            return {
+                "url": "https://hentaiverse.org/?s=Battle&ss=ba",
+                "challenge": False,
+                "completion": False,
+                "nextFloor": False,
+                "active": True,
+                "routeReady": False,
+            }
+
+        async def protocol_wait(
+            awaitable: object,
+            *,
+            timeout: float,
+            owner: object,
+        ) -> object:
+            self.assertIs(owner, client.page)
+            mutation_timeouts.append(timeout)
+            return await awaitable  # type: ignore[misc]
+
+        async def wait(deadline: SemanticDeadline) -> tuple[str, str]:
+            events.append("wait")
+            self.assertIs(deadline, receipt_deadline)
+            self.assertEqual(deadline.remaining(), 10.25)
+            return ("main", "new-loader")
+
+        lifecycle.enable.side_effect = enable
+        lifecycle.trigger.side_effect = lambda: events.append("trigger")
+        lifecycle.wait.side_effect = wait
+        lifecycle.close.side_effect = lambda: events.append("close")
+        client.page.evaluate = AsyncMock(side_effect=evaluate)
+
+        with (
+            patch.object(
+                SemanticDeadline,
+                "after",
+                return_value=receipt_deadline,
+            ),
+            patch.object(
+                battle_launcher_module,
+                "wait_for_zendriver",
+                side_effect=protocol_wait,
+            ),
+        ):
+            started = await launcher.start_arena(
+                ArenaOption(12),
+                expected_realm=Realm.PERSISTENT,
+            )
+
+        self.assertTrue(started)
+        self.assertEqual(
+            events,
+            [
+                "enable",
+                "trigger",
+                "evaluate-submit",
+                "wait",
+                "evaluate-marker",
+                "close",
+            ],
+        )
+        self.assertEqual(len(mutation_timeouts), 2)
+        self.assertAlmostEqual(mutation_timeouts[0], 0.25)
+        self.assertEqual(mutation_timeouts[1], 5.0)
+        self.assertEqual(client.page.evaluate.await_count, 2)
+
+    async def test_form_deadline_expiry_after_lifecycle_starts_no_marker_probe(
+        self,
+    ) -> None:
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client, Mock())
+        lifecycle = _stub_form_lifecycle(launcher, stub_receipt=False)
+        now = 0.0
+        receipt_deadline = SemanticDeadline(expires_at=15.0, _clock=lambda: now)
+        client.page.evaluate = AsyncMock(return_value="submitted")
+
+        async def wait(_deadline: SemanticDeadline) -> tuple[str, str]:
+            nonlocal now
+            now = 15.0
+            return ("main", "new-loader")
+
+        lifecycle.wait.side_effect = wait
+
+        with (
+            patch.object(
+                SemanticDeadline,
+                "after",
+                return_value=receipt_deadline,
+            ),
+            self.assertRaisesRegex(TimeoutError, "before marker observation"),
+        ):
+            await launcher.start_arena(
+                ArenaOption(12),
+                expected_realm=Realm.PERSISTENT,
+            )
+
+        client.page.evaluate.assert_awaited_once()
+        lifecycle.close.assert_called_once_with()
+
+    async def test_submitted_form_without_trusted_battle_marker_is_unknown(
+        self,
+    ) -> None:
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client, Mock())
+        _stub_form_lifecycle(launcher, stub_receipt=False)
+        client.page.evaluate = AsyncMock(
+            side_effect=[
+                "submitted",
+                {
+                    "url": "https://hentaiverse.org/?s=Battle&ss=ba",
+                    "challenge": False,
+                    "completion": False,
+                    "nextFloor": False,
+                    "active": False,
+                    "routeReady": False,
+                },
+            ]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "trusted battle marker"):
+            await launcher.start_arena(
+                ArenaOption(12),
+                expected_realm=Realm.PERSISTENT,
+            )
+
+        self.assertEqual(client.page.evaluate.await_count, 2)
+
+    async def test_current_battle_receipt_is_one_bounded_atomic_observation(
+        self,
+    ) -> None:
+        client = Mock()
+        client.page = Mock()
+        client.page.evaluate = AsyncMock(
+            return_value={
+                "url": "https://hentaiverse.org/?s=Battle&ss=ba&encounter=token",
+                "challenge": False,
+                "completion": False,
+                "nextFloor": False,
+                "active": True,
+                "routeReady": False,
+            }
+        )
+        launcher = BattleLauncher(client, Mock())
+
+        blocker = await launcher.confirm_current_battle_receipt(
+            expected_realm=Realm.PERSISTENT,
+            timeout=5.0,
+        )
+
+        self.assertIs(blocker, MaintenanceNavigationBlocker.ACTIVE)
+        client.page.evaluate.assert_awaited_once()
+
+    async def test_current_battle_receipt_rejects_overlong_command_budget(
+        self,
+    ) -> None:
+        launcher = BattleLauncher(Mock(), Mock())
+
+        with self.assertRaisesRegex(ValueError, r"\(0, 5\]"):
+            await launcher.confirm_current_battle_receipt(
+                expected_realm=Realm.PERSISTENT,
+                timeout=5.01,
+            )
+
+    async def test_submitted_form_marker_must_match_expected_realm_and_path(
+        self,
+    ) -> None:
+        invalid_urls = (
+            "https://hentaiverse.org/isekai/?s=Battle&ss=ba",
+            "https://hentaiverse.org/unexpected?s=Battle&ss=ba",
+        )
+        for invalid_url in invalid_urls:
+            with self.subTest(invalid_url=invalid_url):
+                client = Mock()
+                client.page = Mock()
+                launcher = BattleLauncher(client, Mock())
+                _stub_form_lifecycle(launcher, stub_receipt=False)
+                client.page.evaluate = AsyncMock(
+                    side_effect=[
+                        "submitted",
+                        {
+                            "url": invalid_url,
+                            "challenge": False,
+                            "completion": False,
+                            "nextFloor": False,
+                            "active": True,
+                            "routeReady": False,
+                        },
+                    ]
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "trusted battle marker"):
+                    await launcher.start_arena(
+                        ArenaOption(12),
+                        expected_realm=Realm.PERSISTENT,
+                    )
+
+                self.assertEqual(client.page.evaluate.await_count, 2)
+
+    async def test_safe_acknowledgement_error_reconciles_without_resubmission(
+        self,
+    ) -> None:
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client, Mock())
+        _stub_form_lifecycle(launcher, stub_receipt=False)
+        acknowledgement_error = ValueError("navigation replaced execution context")
+        client.page.evaluate = AsyncMock(
+            side_effect=[
+                acknowledgement_error,
+                {
+                    "url": "https://hentaiverse.org/?s=Battle&ss=ba",
+                    "challenge": True,
+                    "completion": False,
+                    "nextFloor": False,
+                    "active": False,
+                    "routeReady": False,
+                },
+            ]
+        )
+
+        with patch("hvbattle.battle_launcher.logger") as launcher_logger:
+            started = await launcher.start_arena(
+                ArenaOption(12),
+                expected_realm=Realm.PERSISTENT,
+            )
+
+        self.assertTrue(started)
+        self.assertEqual(client.page.evaluate.await_count, 2)
+        submission_script = client.page.evaluate.await_args_list[0].args[0]
+        marker_script = client.page.evaluate.await_args_list[1].args[0]
+        self.assertIn("initform.submit()", submission_script)
+        self.assertNotIn("initform.submit()", marker_script)
+        launcher_logger.warning.assert_called_once()
+
+    async def test_submitted_form_lifecycle_failure_is_unknown_and_not_retried(
+        self,
+    ) -> None:
+        client = Mock()
+        client.page = Mock()
+        launcher = BattleLauncher(client, Mock())
+        lifecycle = _stub_form_lifecycle(launcher)
+        lifecycle.wait.side_effect = TimeoutError("new document missing")
+        client.page.evaluate = AsyncMock(return_value="submitted")
+
+        with self.assertRaisesRegex(TimeoutError, "new document missing"):
+            await launcher.start_arena(
+                ArenaOption(12),
+                expected_realm=Realm.PERSISTENT,
+            )
+
+        client.page.evaluate.assert_awaited_once()
+        lifecycle.wait.assert_awaited_once()
+        lifecycle.close.assert_called_once_with()
+
+    async def test_form_validates_only_the_caller_expected_realm(self) -> None:
+        client = Mock()
+        client.page = Mock()
+        realm = Mock()
+        realm.current = AsyncMock(return_value=Realm.PERSISTENT)
+        launcher = BattleLauncher(client, realm)
+        _stub_form_lifecycle(launcher)
+        client.page.evaluate = AsyncMock(return_value="form-unavailable")
+
+        started = await launcher.start_arena(
+            ArenaOption(12),
+            expected_realm=Realm.ISEKAI,
+        )
+
+        self.assertFalse(started)
+        script = client.page.evaluate.await_args.args[0]
+        self.assertIn(
+            'const expectedUrl = "https://hentaiverse.org/isekai/?s=Battle&ss=ar"',
+            script,
+        )
+        self.assertIn("window.location.href !== expectedUrl", script)
+        self.assertNotIn(
+            '"https://hentaiverse.org/?s=Battle&ss=ar"',
+            script,
+        )
+        realm.current.assert_not_awaited()
 
     async def test_arena_submission_exception_propagates_as_unknown(self) -> None:
         client = Mock()
         client.page = Mock()
         launcher = BattleLauncher(client, Mock())
-        arena_url = "https://hentaiverse.org/?s=Battle&ss=ar"
-        launcher._path_prefix = AsyncMock(return_value="")
+        _stub_form_lifecycle(launcher)
+        launcher._confirm_battle_form_receipt.side_effect = TimeoutError(
+            "receipt missing"
+        )
         client.page.evaluate = AsyncMock(
-            side_effect=[arena_url, ValueError("navigation destroyed context")]
+            side_effect=ValueError("navigation destroyed context")
         )
 
         with self.assertRaisesRegex(ValueError, "destroyed context"):
-            await launcher.start_arena(ArenaOption(12))
+            await launcher.start_arena(
+                ArenaOption(12),
+                expected_realm=Realm.PERSISTENT,
+            )
 
     async def test_arena_options_are_returned_without_selecting_the_last(self) -> None:
         client = Mock()
@@ -1461,14 +1929,17 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         client = Mock()
         client.page = Mock()
         launcher = BattleLauncher(client, Mock())
-        grindfest_url = "https://hentaiverse.org/?s=Battle&ss=gr"
-        launcher._path_prefix = AsyncMock(return_value="")
-        client.page.evaluate = AsyncMock(
-            side_effect=[grindfest_url, ValueError("bad form")]
+        _stub_form_lifecycle(launcher)
+        launcher._confirm_battle_form_receipt.side_effect = TimeoutError(
+            "receipt missing"
         )
+        client.page.evaluate = AsyncMock(side_effect=ValueError("bad form"))
 
         with self.assertRaisesRegex(ValueError, "bad form"):
-            await launcher.start_grindfest(GrindfestOption(12))
+            await launcher.start_grindfest(
+                GrindfestOption(12),
+                expected_realm=Realm.PERSISTENT,
+            )
 
 
 class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
@@ -1477,7 +1948,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
         client = Mock()
         client.page = Mock()
         launcher = BattleLauncher(client, Mock())
-        launcher._path_prefix = AsyncMock(return_value="")
+        _stub_form_lifecycle(launcher)
         return launcher, client.page
 
     @staticmethod
@@ -1648,58 +2119,46 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
         snapshot = RingOfBloodSnapshot(3, (option,))
-        page.evaluate = AsyncMock(
-            side_effect=[
-                "https://hentaiverse.org/?s=Battle&ss=rb",
-                self._payload(tokens="You have 3 tokens of blood."),
-            ]
-        )
+        page.evaluate = AsyncMock(return_value="insufficient-tokens")
 
         outcome = await launcher.start_ring_of_blood(
             option,
             expected_before=snapshot,
+            expected_realm=Realm.PERSISTENT,
         )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.INSUFFICIENT_TOKENS)
-        self.assertEqual(page.evaluate.await_count, 2)
+        page.evaluate.assert_awaited_once()
 
     async def test_start_returns_unavailable_when_option_disappears(self) -> None:
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
         snapshot = RingOfBloodSnapshot(20, (option,))
-        page.evaluate = AsyncMock(
-            side_effect=[
-                "https://hentaiverse.org/?s=Battle&ss=rb",
-                self._payload(tokens="You have 20 tokens of blood.", rows=[]),
-            ]
-        )
+        page.evaluate = AsyncMock(return_value="option-unavailable")
 
         outcome = await launcher.start_ring_of_blood(
             option,
             expected_before=snapshot,
+            expected_realm=Realm.PERSISTENT,
         )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.OPTION_UNAVAILABLE)
-        self.assertEqual(page.evaluate.await_count, 2)
+        page.evaluate.assert_awaited_once()
 
     async def test_start_returns_state_changed_before_submission(self) -> None:
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
         snapshot = RingOfBloodSnapshot(20, (option,))
-        page.evaluate = AsyncMock(
-            side_effect=[
-                "https://hentaiverse.org/?s=Battle&ss=rb",
-                self._payload(tokens="You have 19 tokens of blood."),
-            ]
-        )
+        page.evaluate = AsyncMock(return_value="state-changed")
 
         outcome = await launcher.start_ring_of_blood(
             option,
             expected_before=snapshot,
+            expected_realm=Realm.PERSISTENT,
         )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.STATE_CHANGED)
-        self.assertEqual(page.evaluate.await_count, 2)
+        page.evaluate.assert_awaited_once()
 
     async def test_start_submits_existing_form_without_copying_hidden_state(
         self,
@@ -1707,25 +2166,28 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
         snapshot = RingOfBloodSnapshot(20, (option,))
-        page.evaluate = AsyncMock(
-            side_effect=[
-                "https://hentaiverse.org/?s=Battle&ss=rb",
-                self._payload(tokens="You have 20 tokens of blood."),
-                "submitted",
-            ]
-        )
+        page.evaluate = AsyncMock(return_value="submitted")
 
         outcome = await launcher.start_ring_of_blood(
             option,
             expected_before=snapshot,
+            expected_realm=Realm.PERSISTENT,
         )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.SUBMITTED)
         submission_script = page.evaluate.await_args_list[-1].args[0]
         self.assertIn("initform.submit()", submission_script)
         self.assertIn("window.location.href !== expectedUrl", submission_script)
-        self.assertIn("Number(match[1]) === expectedId", submission_script)
-        self.assertIn("Number(match[2]) === expectedCost", submission_script)
+        self.assertIn(
+            'const expectedUrl = "https://hentaiverse.org/?s=Battle&ss=rb"',
+            submission_script,
+        )
+        self.assertNotIn(
+            '"https://hentaiverse.org/isekai/?s=Battle&ss=rb"',
+            submission_script,
+        )
+        self.assertIn("challenge.actionId === expectedId", submission_script)
+        self.assertIn("selected.entryCost !== expectedCost", submission_script)
         self.assertIn("const expectedId = 112", submission_script)
         self.assertIn("const expectedCost = 10", submission_script)
         for result in (
@@ -1733,7 +2195,10 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
             "missing-table",
             "missing-initid",
             "missing-initform",
-            "missing-exact-action",
+            "invalid-state",
+            "option-unavailable",
+            "state-changed",
+            "insufficient-tokens",
             "submitted",
         ):
             with self.subTest(atomic_result=result):
@@ -1742,26 +2207,20 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_start_submits_from_exact_isekai_ring_url(self) -> None:
         launcher, page = self._launcher()
-        launcher._path_prefix = AsyncMock(return_value="/isekai")
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
         snapshot = RingOfBloodSnapshot(20, (option,))
-        page.evaluate = AsyncMock(
-            side_effect=[
-                "https://hentaiverse.org/isekai/?s=Battle&ss=rb",
-                self._payload(tokens="You have 20 tokens of blood."),
-                "submitted",
-            ]
-        )
+        page.evaluate = AsyncMock(return_value="submitted")
 
         outcome = await launcher.start_ring_of_blood(
             option,
             expected_before=snapshot,
+            expected_realm=Realm.ISEKAI,
         )
 
         self.assertIs(outcome, RingOfBloodStartOutcome.SUBMITTED)
         submission_script = page.evaluate.await_args_list[-1].args[0]
         self.assertIn(
-            'const expectedUrl = "https://hentaiverse.org/isekai/' '?s=Battle&ss=rb";',
+            '"https://hentaiverse.org/isekai/?s=Battle&ss=rb"',
             submission_script,
         )
 
@@ -1785,42 +2244,35 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
                     10,
                 )
                 snapshot = RingOfBloodSnapshot(20, (option,))
-                page.evaluate = AsyncMock(
-                    side_effect=[
-                        "https://hentaiverse.org/?s=Battle&ss=rb",
-                        self._payload(tokens="You have 20 tokens of blood."),
-                        atomic_result,
-                    ]
-                )
+                page.evaluate = AsyncMock(return_value=atomic_result)
 
                 outcome = await launcher.start_ring_of_blood(
                     option,
                     expected_before=snapshot,
+                    expected_realm=Realm.PERSISTENT,
                 )
 
                 self.assertIs(
                     outcome,
                     RingOfBloodStartOutcome.OPTION_UNAVAILABLE,
                 )
-                self.assertEqual(page.evaluate.await_count, 3)
+                page.evaluate.assert_awaited_once()
 
     async def test_start_submission_exception_propagates(self) -> None:
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
         snapshot = RingOfBloodSnapshot(20, (option,))
         submission_error = ValueError("navigation destroyed context")
-        page.evaluate = AsyncMock(
-            side_effect=[
-                "https://hentaiverse.org/?s=Battle&ss=rb",
-                self._payload(tokens="You have 20 tokens of blood."),
-                submission_error,
-            ]
+        launcher._confirm_battle_form_receipt.side_effect = TimeoutError(
+            "receipt missing"
         )
+        page.evaluate = AsyncMock(side_effect=submission_error)
 
         with self.assertRaises(ValueError) as raised:
             await launcher.start_ring_of_blood(
                 option,
                 expected_before=snapshot,
+                expected_realm=Realm.PERSISTENT,
             )
 
         self.assertIs(raised.exception, submission_error)
@@ -1833,18 +2285,24 @@ class PonyChartResolutionTests(unittest.IsolatedAsyncioTestCase):
         driver = Mock()
         driver.headless = True
         driver.page = Mock()
-        driver.page.xpath = AsyncMock(return_value=[])
-        driver.page.select = AsyncMock(side_effect=LookupError("no fallback"))
         challenge = PonyChart(driver)
         challenge._check = AsyncMock(return_value=True)
         challenge._capture_pony_chart_image = AsyncMock(return_value=b"pony")
-        challenge._auto_answer = AsyncMock()
+        challenge._predict_labels = AsyncMock(return_value=("Twilight",))
+        challenge._arm_challenge_receipt_monitor = AsyncMock(return_value=True)
+        challenge._select_and_submit_answer = AsyncMock(return_value=True)
+        challenge._wait_for_challenge_receipt = AsyncMock(
+            side_effect=PonyChartResolutionError("still present")
+        )
 
         with (
             patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
             self.assertRaises(PonyChartResolutionError),
         ):
             await challenge.check()
+
+        challenge._select_and_submit_answer.assert_awaited_once()
+        challenge._wait_for_challenge_receipt.assert_awaited_once()
 
 
 class BattleLogTests(unittest.TestCase):
@@ -1886,7 +2344,73 @@ class BattleLogTests(unittest.TestCase):
         self.assertIsNone(state_store.snap)
 
 
+class BattleStateDeadlineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_content_timeout_cannot_exceed_protocol_lane(self) -> None:
+        driver = Mock()
+        state_store = BattleStateStore(driver)
+
+        for invalid in (5.01, float("inf"), 0, True):
+            with (
+                self.subTest(timeout=invalid),
+                self.assertRaisesRegex(ValueError, "finite and in"),
+            ):
+                await state_store.inspect(timeout=invalid)
+
+        driver.page.get_content.assert_not_called()
+
+    async def test_late_content_result_is_not_accepted(self) -> None:
+        driver = Mock()
+        state_store = BattleStateStore(driver)
+        loop = SimpleNamespace(time=Mock(side_effect=(0.0, 0.0, 5.0)))
+
+        with (
+            patch(
+                "hvbattle.battle_state.asyncio.get_running_loop",
+                return_value=loop,
+            ),
+            patch(
+                "hvbattle.battle_state.wait_for_zendriver",
+                new=AsyncMock(return_value="<html></html>"),
+            ),
+            self.assertRaisesRegex(TimeoutError, "arrived after"),
+        ):
+            await state_store.inspect(timeout=5.0)
+
+    async def test_parse_result_is_not_accepted_after_deadline(self) -> None:
+        driver = Mock()
+        state_store = BattleStateStore(driver)
+        loop = SimpleNamespace(time=Mock(side_effect=(0.0, 0.0, 1.0, 5.0)))
+
+        with (
+            patch(
+                "hvbattle.battle_state.asyncio.get_running_loop",
+                return_value=loop,
+            ),
+            patch(
+                "hvbattle.battle_state.wait_for_zendriver",
+                new=AsyncMock(return_value="<html></html>"),
+            ),
+            patch("hvbattle.battle_state.parse_snapshot", return_value=Mock()),
+            self.assertRaisesRegex(TimeoutError, "parsing exceeded"),
+        ):
+            await state_store.inspect(timeout=5.0)
+
+
 class ArchitectureTests(unittest.TestCase):
+    def test_presence_flow_is_one_atomic_page_observation(self) -> None:
+        source = inspect.getsource(BattleSession.inspect_battle_presence)
+
+        self.assertEqual(
+            source.count("await self._read_battle_presence_observation()"),
+            1,
+        )
+        for forbidden in (
+            "is_ponychart_present",
+            "_read_battle_phase",
+            "_has_battle_marker",
+        ):
+            self.assertNotIn(forbidden, source)
+
     def test_hvbattle_uses_hvbrowser_boundary_not_hbrowser_directly(self) -> None:
         source_root = Path(__file__).parents[1] / "src" / "hvbattle"
         imported_modules: set[str] = set()
@@ -1934,6 +2458,125 @@ class ArchitectureTests(unittest.TestCase):
 
         self.assertEqual(violations, [])
 
+    def test_every_production_zendriver_wait_uses_protocol_cap(self) -> None:
+        source_root = Path(__file__).parents[1] / "src" / "hvbattle"
+        violations: list[str] = []
+
+        def numeric_value(
+            expression: ast.expr,
+            constants: dict[str, float],
+        ) -> float | None:
+            if (
+                isinstance(expression, ast.Constant)
+                and isinstance(expression.value, (int, float))
+                and not isinstance(expression.value, bool)
+            ):
+                return float(expression.value)
+            if isinstance(expression, ast.Name):
+                return constants.get(expression.id)
+            if isinstance(expression, ast.BinOp):
+                left = numeric_value(expression.left, constants)
+                right = numeric_value(expression.right, constants)
+                if left is None or right is None:
+                    return None
+                if isinstance(expression.op, ast.Add):
+                    return left + right
+                if isinstance(expression.op, ast.Sub):
+                    return left - right
+            return None
+
+        def capped_expression(
+            expression: ast.expr,
+            constants: dict[str, float],
+            capped_names: set[str],
+        ) -> bool:
+            if isinstance(expression, ast.Call):
+                return bool(
+                    (
+                        isinstance(expression.func, ast.Name)
+                        and expression.func.id == "protocol_timeout"
+                    )
+                    or (
+                        isinstance(expression.func, ast.Attribute)
+                        and expression.func.attr == "protocol_timeout"
+                    )
+                )
+            if isinstance(expression, ast.Name):
+                value = constants.get(expression.id)
+                return expression.id in capped_names or (
+                    value is not None and value <= 5.0
+                )
+            if isinstance(expression, ast.IfExp):
+                return capped_expression(
+                    expression.body, constants, capped_names
+                ) and capped_expression(expression.orelse, constants, capped_names)
+            value = numeric_value(expression, constants)
+            return value is not None and value <= 5.0
+
+        for source_file in source_root.glob("*.py"):
+            tree = ast.parse(source_file.read_text(), filename=str(source_file))
+            constants = {"PROTOCOL_TIMEOUT_SECONDS": 5.0}
+            for statement in tree.body:
+                if not (
+                    isinstance(statement, ast.Assign)
+                    and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name)
+                ):
+                    continue
+                value = numeric_value(statement.value, constants)
+                if value is not None:
+                    constants[statement.targets[0].id] = value
+
+            capped_names: set[str] = set()
+            assignments = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ]
+            changed = True
+            while changed:
+                changed = False
+                for assignment in assignments:
+                    name = assignment.targets[0].id
+                    if name in capped_names or not capped_expression(
+                        assignment.value,
+                        constants,
+                        capped_names,
+                    ):
+                        continue
+                    capped_names.add(name)
+                    changed = True
+
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "wait_for_zendriver"
+                ):
+                    continue
+                timeout = next(
+                    (
+                        keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg == "timeout"
+                    ),
+                    None,
+                )
+                if timeout is None:
+                    violations.append(f"{source_file.name}:{node.lineno}:missing")
+                    continue
+                if capped_expression(timeout, constants, capped_names):
+                    continue
+                value = numeric_value(timeout, constants)
+                if value is None or value > 5.0:
+                    violations.append(
+                        f"{source_file.name}:{node.lineno}:{ast.unparse(timeout)}"
+                    )
+
+        self.assertEqual(violations, [])
+
     def test_production_never_awaits_zendriver_protocol_methods_directly(
         self,
     ) -> None:
@@ -1962,6 +2605,7 @@ class ArchitectureTests(unittest.TestCase):
             "xpath",
         }
         formal_high_level_calls = {
+            ("lifecycle", "wait"),
             ("self._action", "click"),
             ("self.browser", "get"),
             ("self.browser", "wait"),

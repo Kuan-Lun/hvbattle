@@ -1,477 +1,667 @@
 import asyncio
+import socket
 import threading
+import time
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 from hvbattle import BaseControlPanel, ControlPanel, NullControlPanel
 from hvbattle.control_panel import (
+    _IPC_HEADER,
+    ControlPanelProcessOwnershipError,
     _allocate_checklist_column,
     _checklist_choice_layout,
     _checklist_grid_position,
-    _checklist_render_state,
     _checklist_text_wraplength,
     _checklist_viewport_wraplength,
     _close_gui,
     _commit_integer_control,
+    _ControlPanelLifecycle,
     _invoke_callback,
+    _merge_checklist_replacement,
+    _parse_gui_child_arguments,
     _parse_integer,
     _publish_boolean,
     _publish_checklist_selection,
+    _receive_exact,
+    _receive_frame,
     _render_pause_button,
     _run_gui_callback_fail_closed,
+    _send_frame,
     _set_paused,
 )
 
 
-def _control_panel_without_process_start(*, alive: bool = True) -> ControlPanel:
+def _owned_panel(*, alive: bool = True) -> ControlPanel:
     panel = object.__new__(ControlPanel)
-    panel._destroyed = False
-    panel._manager = Mock()
+    panel._state = _ControlPanelLifecycle.OPEN
+    panel._state_lock = threading.Lock()
+    panel._rpc_lock = threading.Lock()
+    panel._shutdown_lock = threading.Lock()
+    panel._request_id = 0
+    panel._channel = Mock(spec=socket.socket)
+    panel._listener = None
     panel._process = Mock()
-    panel._process.is_alive.return_value = alive
-    panel._pause_flag = Mock()
-    panel._cmd_queue = Mock()
-    panel._checklist_lock = threading.RLock()
-    panel._checklist_observed_revisions = {}
+    panel._process.poll.return_value = None if alive else 1
+    panel._process.shutdown.return_value = 0
     return panel
 
 
-def _partial_startup_manager() -> tuple[Mock, Mock]:
-    manager = Mock()
-    manager.Event.side_effect = lambda: Mock()
-    manager.dict.side_effect = lambda: {}
-    manager.RLock.side_effect = threading.RLock
-    command_queue = Mock()
-    manager.Queue.return_value = command_queue
-    return manager, command_queue
-
-
 class ControlPanelLifecycleTests(unittest.TestCase):
-    def test_proxy_creation_failure_shuts_down_partial_manager(self) -> None:
-        manager, _command_queue = _partial_startup_manager()
-        manager.dict.side_effect = ({}, RuntimeError("proxy secret"))
+    def test_invalid_aclose_deadline_does_not_poison_open_state(self) -> None:
+        panel = _owned_panel()
+
+        with self.assertRaisesRegex(ValueError, "finite monotonic"):
+            asyncio.run(panel.aclose(expires_at=float("inf")))
+
+        self.assertIs(panel._state, _ControlPanelLifecycle.OPEN)
+        panel._process.shutdown.assert_not_called()
+
+    def test_expired_aclose_deadline_rejects_cached_closed_state(self) -> None:
+        panel = _owned_panel(alive=False)
+        panel._state = _ControlPanelLifecycle.CLOSED
+
+        with self.assertRaisesRegex(
+            ControlPanelProcessOwnershipError,
+            "before ownership proof",
+        ):
+            asyncio.run(panel.aclose(expires_at=time.monotonic() - 1))
+
+    def test_aclose_deadline_includes_state_lock_wait(self) -> None:
+        panel = _owned_panel()
+        panel._state_lock.acquire()
+        try:
+            with self.assertRaisesRegex(
+                ControlPanelProcessOwnershipError,
+                "state ownership",
+            ):
+                asyncio.run(panel.aclose(expires_at=time.monotonic() + 0.01))
+        finally:
+            panel._state_lock.release()
+
+        self.assertIs(panel._state, _ControlPanelLifecycle.OPEN)
+        panel._process.shutdown.assert_not_called()
+
+    def test_shutdown_lock_completion_after_deadline_is_rejected(self) -> None:
+        panel = _owned_panel()
+        clock = Mock(side_effect=(0.0, 0.0, 2.0))
+
+        with self.assertRaisesRegex(
+            ControlPanelProcessOwnershipError,
+            "serialization completed after",
+        ):
+            panel._shutdown_owned(expires_at=1.0, clock=clock)
+
+        panel._process.shutdown.assert_not_called()
+
+    def test_aclose_rejects_cleanup_result_delivered_after_deadline(self) -> None:
+        panel = _owned_panel()
+        expires_at = time.monotonic() + 1.0
 
         with (
             patch(
-                "hvbattle.control_panel.multiprocessing.Manager", return_value=manager
+                "hvbattle.control_panel._remaining",
+                side_effect=(1.0, 1.0, 1.0, 0.0),
             ),
-            patch("hvbattle.control_panel.multiprocessing.Process") as process,
-            self.assertRaisesRegex(RuntimeError, "proxy secret"),
+            patch.object(panel, "_shutdown_owned"),
+            self.assertRaisesRegex(
+                ControlPanelProcessOwnershipError,
+                "completed after",
+            ),
         ):
-            ControlPanel()
+            asyncio.run(panel.aclose(expires_at=expires_at))
 
-        process.assert_not_called()
-        manager.shutdown.assert_called_once_with()
+    def test_frame_send_rejects_completion_after_absolute_deadline(self) -> None:
+        now = 0.0
+        channel = Mock(spec=socket.socket)
 
-    def test_process_start_failure_reaps_process_and_manager(self) -> None:
-        manager, _command_queue = _partial_startup_manager()
-        process = Mock()
-        process.start.side_effect = RuntimeError("start secret")
-        process.is_alive.return_value = False
+        def finish_late(_frame: bytes) -> None:
+            nonlocal now
+            now = 2.0
+
+        channel.sendall.side_effect = finish_late
+        with self.assertRaisesRegex(TimeoutError, "completed after"):
+            _send_frame(
+                channel,
+                ("request",),
+                expires_at=1.0,
+                clock=lambda: now,
+            )
+
+    def test_frame_receive_rejects_chunk_completed_after_deadline(self) -> None:
+        now = 0.0
+        channel = Mock(spec=socket.socket)
+
+        def finish_late(_size: int) -> bytes:
+            nonlocal now
+            now = 2.0
+            return b"x"
+
+        channel.recv.side_effect = finish_late
+        with self.assertRaisesRegex(TimeoutError, "completed after"):
+            _receive_exact(
+                channel,
+                1,
+                expires_at=1.0,
+                clock=lambda: now,
+            )
+
+    def test_frame_receive_rejects_deserialize_completed_after_deadline(self) -> None:
+        now = 0.0
+
+        def decode_late(_payload: bytes) -> object:
+            nonlocal now
+            now = 2.0
+            return ("response",)
 
         with (
             patch(
-                "hvbattle.control_panel.multiprocessing.Manager", return_value=manager
+                "hvbattle.control_panel._receive_exact",
+                side_effect=(_IPC_HEADER.pack(1), b"x"),
             ),
             patch(
-                "hvbattle.control_panel.multiprocessing.Process", return_value=process
+                "hvbattle.control_panel.pickle.loads",
+                side_effect=decode_late,
             ),
-            self.assertRaisesRegex(RuntimeError, "start secret"),
+            self.assertRaisesRegex(TimeoutError, "decoded after"),
         ):
-            ControlPanel()
+            _receive_frame(
+                Mock(spec=socket.socket),
+                expires_at=1.0,
+                clock=lambda: now,
+            )
 
-        process.join.assert_called_once_with(timeout=3.0)
-        manager.shutdown.assert_called_once_with()
-
-    def test_ready_failure_terminates_process_before_manager_shutdown(self) -> None:
-        manager, command_queue = _partial_startup_manager()
-        process = Mock()
-        process.is_alive.side_effect = (True, True, False)
-
-        with (
-            patch(
-                "hvbattle.control_panel.multiprocessing.Manager", return_value=manager
-            ),
-            patch(
-                "hvbattle.control_panel.multiprocessing.Process", return_value=process
-            ),
-            patch.object(
-                ControlPanel,
-                "_wait_until_ready",
-                side_effect=RuntimeError("ready secret"),
-            ),
-            self.assertRaisesRegex(RuntimeError, "ready secret"),
-        ):
-            ControlPanel()
-
-        command_queue.put.assert_called_once_with(("destroy", None))
-        process.terminate.assert_called_once_with()
-        self.assertEqual(process.join.call_count, 2)
-        manager.shutdown.assert_called_once_with()
-
-    def test_destroy_exhausts_cleanup_and_logs_only_fixed_reason_codes(self) -> None:
-        panel = _control_panel_without_process_start()
-        secret = "raw DOM and credential secret"
-        panel._process.is_alive.side_effect = (
-            RuntimeError(secret),
-            RuntimeError(secret),
-            RuntimeError(secret),
+    def test_child_cli_requires_a_valid_loopback_token(self) -> None:
+        token = "ab" * 32
+        self.assertEqual(
+            _parse_gui_child_arguments(("41321", token)),
+            (41_321, token),
         )
-        panel._cmd_queue.put.side_effect = RuntimeError(secret)
-        panel._process.join.side_effect = RuntimeError(secret)
-        panel._process.terminate.side_effect = RuntimeError(secret)
-        panel._manager.shutdown.side_effect = RuntimeError(secret)
+        for arguments in (("0", token), ("41321", "short"), ("41321", "zz" * 32)):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                _parse_gui_child_arguments(arguments)
 
-        with patch("hvbattle.control_panel.logger") as control_logger:
+    @staticmethod
+    def _startup_transport() -> tuple[Mock, Mock]:
+        listener = Mock(spec=socket.socket)
+        channel = Mock(spec=socket.socket)
+        listener.getsockname.return_value = ("127.0.0.1", 41_321)
+        listener.accept.return_value = (channel, ("127.0.0.1", 41_322))
+        return listener, channel
+
+    def test_startup_uses_supervised_module_process_and_authenticated_ipc(
+        self,
+    ) -> None:
+        started_at = time.monotonic()
+        listener, channel = self._startup_transport()
+        owner = Mock()
+        owner.poll.return_value = None
+        owner.shutdown.return_value = 0
+        auth_token = "ab" * 32
+
+        with (
+            patch("hvbattle.control_panel.socket.socket", return_value=listener),
+            patch(
+                "hvbattle.control_panel.secrets.token_hex",
+                return_value=auth_token,
+            ),
+            patch(
+                "hvbattle.control_panel.start_owned_process",
+                return_value=owner,
+            ) as start_process,
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                return_value=("ready", auth_token),
+            ),
+        ):
+            panel = ControlPanel()
+
+        parameters = start_process.call_args.args[1]
+        self.assertEqual(parameters[0].rsplit("/", maxsplit=1)[-1], "control_panel.py")
+        self.assertEqual(parameters[1:], ["41321", auth_token])
+        self.assertLessEqual(start_process.call_args.kwargs["startup_timeout"], 5.0)
+        self.assertLessEqual(
+            start_process.call_args.kwargs["deadline"],
+            started_at + 10.1,
+        )
+        self.assertGreater(
+            start_process.call_args.kwargs["deadline"],
+            started_at,
+        )
+        listener.bind.assert_called_once_with(("127.0.0.1", 0))
+        listener.listen.assert_called_once_with(1)
+        listener.close.assert_called_once_with()
+        self.assertIs(panel._channel, channel)
+        self.assertIs(panel._state, _ControlPanelLifecycle.OPEN)
+
+        with (
+            patch("hvbattle.control_panel._send_frame"),
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                return_value=("response", 1, True, None),
+            ),
+        ):
             panel.destroy()
 
-        panel._cmd_queue.put.assert_called_once_with(("destroy", None))
-        self.assertEqual(panel._process.join.call_count, 2)
-        panel._process.terminate.assert_called_once_with()
-        panel._manager.shutdown.assert_called_once_with()
-        control_logger.warning.assert_called_once_with(
-            "Battle control panel cleanup incomplete phase=%s reason_codes=%s",
-            "destroy",
-            "process-state-unavailable,destroy-command-failed,"
-            "process-join-failed,process-terminate-failed,"
-            "manager-shutdown-failed",
-        )
-        self.assertNotIn(secret, repr(control_logger.mock_calls))
+    def test_startup_rejects_open_state_committed_after_work_deadline(self) -> None:
+        listener, channel = self._startup_transport()
+        owner = Mock()
+        owner.poll.return_value = None
+        auth_token = "ab" * 32
 
-        panel.destroy()
-        self.assertEqual(panel._process.join.call_count, 2)
+        with (
+            patch("hvbattle.control_panel.socket.socket", return_value=listener),
+            patch(
+                "hvbattle.control_panel.secrets.token_hex",
+                return_value=auth_token,
+            ),
+            patch(
+                "hvbattle.control_panel.start_owned_process",
+                return_value=owner,
+            ),
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                return_value=("ready", auth_token),
+            ),
+            patch.object(ControlPanel, "_shutdown_owned") as shutdown,
+            patch(
+                "hvbattle.control_panel._remaining",
+                side_effect=(5.0, 5.0, 5.0, 5.0, 0.0),
+            ),
+            self.assertRaisesRegex(TimeoutError, "work deadline"),
+        ):
+            ControlPanel()
+
+        shutdown.assert_called_once()
+        self.assertGreater(
+            shutdown.call_args.kwargs["expires_at"],
+            time.monotonic(),
+        )
+        listener.close.assert_called_once_with()
+        channel.close.assert_not_called()
+
+    def test_supervisor_start_failure_closes_listener_without_orphan_handle(
+        self,
+    ) -> None:
+        listener, _channel = self._startup_transport()
+        with (
+            patch("hvbattle.control_panel.socket.socket", return_value=listener),
+            patch(
+                "hvbattle.control_panel.start_owned_process",
+                side_effect=RuntimeError("start failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "start failed"),
+        ):
+            ControlPanel()
+
+        listener.close.assert_called_once_with()
+
+    def test_ready_failure_shuts_owner_down_inside_original_startup_deadline(
+        self,
+    ) -> None:
+        listener, channel = self._startup_transport()
+        owner = Mock()
+        owner.poll.return_value = None
+        owner.shutdown.return_value = 1
+        started_at = time.monotonic()
+
+        with (
+            patch("hvbattle.control_panel.socket.socket", return_value=listener),
+            patch(
+                "hvbattle.control_panel.start_owned_process",
+                return_value=owner,
+            ) as start_process,
+            patch("hvbattle.control_panel._send_frame") as send_frame,
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                side_effect=(
+                    RuntimeError("ready failed"),
+                    ("response", 1, True, None),
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "ready failed"),
+        ):
+            ControlPanel()
+
+        self.assertEqual(send_frame.call_args.args[1], ("request", 1, "destroy", None))
+        self.assertLessEqual(
+            owner.shutdown.call_args.kwargs["deadline"], started_at + 10.1
+        )
+        self.assertEqual(
+            owner.shutdown.call_args.kwargs["deadline"],
+            start_process.call_args.kwargs["deadline"],
+        )
+        owner.shutdown.assert_called_once()
+        channel.close.assert_called_once_with()
+        listener.close.assert_called_once_with()
+
+    def test_destroy_closes_only_after_owner_returns_exitcode_proof(self) -> None:
+        panel = _owned_panel()
+        owner = panel._process
+
+        with (
+            patch("hvbattle.control_panel._send_frame"),
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                return_value=("response", 1, True, None),
+            ),
+        ):
+            panel.destroy()
+
+        owner.shutdown.assert_called_once()
+        self.assertIsNone(panel._process)
+        self.assertIsNone(panel._channel)
+        self.assertIs(panel._state, _ControlPanelLifecycle.CLOSED)
+
+    def test_destroy_delegates_all_phases_to_one_owner_deadline(self) -> None:
+        panel = _owned_panel()
+        owner = panel._process
+        started_at = time.monotonic()
+
+        with (
+            patch("hvbattle.control_panel._send_frame"),
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                return_value=("response", 1, True, None),
+            ),
+        ):
+            panel.destroy()
+
+        shutdown = owner.shutdown.call_args.kwargs
+        self.assertEqual(shutdown["graceful_timeout"], 1.5)
+        self.assertEqual(shutdown["terminate_timeout"], 1.0)
+        self.assertEqual(shutdown["kill_timeout"], 1.0)
+        self.assertEqual(shutdown["cleanup_timeout"], 1.0)
+        self.assertLessEqual(shutdown["deadline"], started_at + 5.1)
+
+    def test_unresolved_owner_is_retained_and_destroy_raises(self) -> None:
+        panel = _owned_panel()
+        owner = panel._process
+        owner.shutdown.side_effect = RuntimeError("raw secret")
+
+        with (
+            patch("hvbattle.control_panel._send_frame"),
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                return_value=("response", 1, True, None),
+            ),
+            self.assertRaisesRegex(
+                ControlPanelProcessOwnershipError,
+                "process-tree-ownership-unresolved",
+            ) as raised,
+        ):
+            panel.destroy()
+
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertIs(panel._process, owner)
+        self.assertIs(panel._state, _ControlPanelLifecycle.CLOSING)
+        panel._channel.close.assert_not_called()
+
+        with self.assertRaisesRegex(RuntimeError, "closing"):
+            panel.is_paused()
+
+    def test_destroy_can_retry_retained_owner(self) -> None:
+        panel = _owned_panel()
+        owner = panel._process
+        owner.shutdown.side_effect = (RuntimeError("first failure"), 0)
+
+        with (
+            patch("hvbattle.control_panel._send_frame"),
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                side_effect=(
+                    ("response", 1, True, None),
+                    ("response", 2, True, None),
+                ),
+            ),
+        ):
+            with self.assertRaises(ControlPanelProcessOwnershipError):
+                panel.destroy()
+            panel.destroy()
+
+        self.assertEqual(owner.shutdown.call_count, 2)
+        self.assertIs(panel._state, _ControlPanelLifecycle.CLOSED)
+
+    def test_aclose_finishes_ownership_proof_before_repeated_cancellation(
+        self,
+    ) -> None:
+        async def exercise() -> None:
+            panel = _owned_panel()
+            started = threading.Event()
+            release = threading.Event()
+            completed = threading.Event()
+            captured_deadlines: list[float] = []
+
+            def close_owned(*, expires_at: float) -> None:
+                captured_deadlines.append(expires_at)
+                started.set()
+                if not release.wait(timeout=1.0):
+                    raise TimeoutError("test did not release cleanup")
+                panel._process = None
+                panel._channel = None
+                with panel._state_lock:
+                    panel._state = _ControlPanelLifecycle.CLOSED
+                completed.set()
+
+            called_at = time.monotonic()
+            with patch.object(panel, "_shutdown_owned", side_effect=close_owned):
+                closing = asyncio.create_task(panel.aclose())
+                while not started.is_set():
+                    await asyncio.sleep(0)
+                closing.cancel()
+                await asyncio.sleep(0)
+                closing.cancel()
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await closing
+
+            self.assertTrue(completed.is_set())
+            self.assertIs(panel._state, _ControlPanelLifecycle.CLOSED)
+            self.assertLessEqual(captured_deadlines[0], called_at + 5.1)
+
+        asyncio.run(exercise())
+
+    def test_aclose_surfaces_ownership_failure_even_when_cancelled(self) -> None:
+        async def exercise() -> None:
+            panel = _owned_panel()
+            started = threading.Event()
+            release = threading.Event()
+
+            def fail_close(*, expires_at: float) -> None:
+                del expires_at
+                started.set()
+                if not release.wait(timeout=1.0):
+                    raise TimeoutError("test did not release cleanup")
+                raise ControlPanelProcessOwnershipError("owner unresolved")
+
+            with patch.object(panel, "_shutdown_owned", side_effect=fail_close):
+                closing = asyncio.create_task(panel.aclose())
+                while not started.is_set():
+                    await asyncio.sleep(0)
+                closing.cancel()
+                release.set()
+                with self.assertRaisesRegex(
+                    ControlPanelProcessOwnershipError,
+                    "owner unresolved",
+                ):
+                    await closing
+
+            self.assertIs(panel._state, _ControlPanelLifecycle.CLOSING)
+
+        asyncio.run(exercise())
+
+    def test_frames_round_trip_without_manager_or_queue(self) -> None:
+        sender, receiver = socket.socketpair()
+        try:
+            expires_at = time.monotonic() + 1.0
+            _send_frame(
+                sender, ("request", 7, "is_paused", None), expires_at=expires_at
+            )
+            self.assertEqual(
+                _receive_frame(receiver, expires_at=expires_at),
+                ("request", 7, "is_paused", None),
+            )
+        finally:
+            sender.close()
+            receiver.close()
+
+    def test_rpc_requires_matching_ack_and_marks_transport_failure_closing(
+        self,
+    ) -> None:
+        panel = _owned_panel()
+        with (
+            patch("hvbattle.control_panel._send_frame") as send_frame,
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                return_value=("response", 99, True, False),
+            ),
+            self.assertRaisesRegex(
+                ControlPanelProcessOwnershipError,
+                "mismatched IPC",
+            ),
+        ):
+            panel.get_toggle("arena")
+
+        self.assertEqual(
+            send_frame.call_args.args[1],
+            ("request", 1, "get_toggle", "arena"),
+        )
+        self.assertIs(panel._state, _ControlPanelLifecycle.CLOSING)
+
+    def test_rpc_rejects_ack_that_finishes_after_its_deadline(self) -> None:
+        panel = _owned_panel()
+        with (
+            patch(
+                "hvbattle.control_panel.time.monotonic",
+                side_effect=(0.0, 0.0, 6.0),
+            ),
+            patch("hvbattle.control_panel._send_frame"),
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                return_value=("response", 1, True, False),
+            ),
+            self.assertRaisesRegex(
+                ControlPanelProcessOwnershipError,
+                "arrived after",
+            ),
+        ):
+            panel.get_toggle("arena")
+
+        self.assertIs(panel._state, _ControlPanelLifecycle.CLOSING)
+
+    def test_remote_domain_error_does_not_forfeit_process_ownership(self) -> None:
+        panel = _owned_panel()
+        with (
+            patch("hvbattle.control_panel._send_frame"),
+            patch(
+                "hvbattle.control_panel._receive_frame",
+                return_value=(
+                    "response",
+                    1,
+                    False,
+                    ("KeyError", "Unknown integer control: lottery"),
+                ),
+            ),
+            self.assertRaisesRegex(KeyError, "Unknown integer control"),
+        ):
+            panel.get_integer("lottery")
+
+        self.assertIs(panel._state, _ControlPanelLifecycle.OPEN)
 
 
 class ControlPanelStateTests(unittest.TestCase):
-    def test_toggle_default_is_available_before_gui_processes_command(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._toggle_dict = {}
-        panel._cmd_queue = Mock()
+    def test_toggle_mutation_and_read_are_acknowledged(self) -> None:
+        panel = _owned_panel()
+        with patch.object(panel, "_rpc", side_effect=(None, True)) as rpc:
+            panel.register_toggle("arena", "Arena", default=True, group="Campaign")
+            self.assertTrue(panel.get_toggle("arena"))
 
-        panel.register_toggle(
-            "auto_next_arena_battle",
-            "Arena",
-            default=True,
-            group="Auto Next Battle",
+        self.assertEqual(
+            rpc.call_args_list,
+            [
+                call("register_toggle", ("arena", "Arena", True, "Campaign")),
+                call("get_toggle", "arena"),
+            ],
         )
 
-        self.assertTrue(panel.get_toggle("auto_next_arena_battle"))
-        panel._cmd_queue.put.assert_called_once_with(
-            (
-                "register_toggle",
-                (
-                    "auto_next_arena_battle",
-                    "Arena",
-                    True,
-                    "Auto Next Battle",
-                ),
+    def test_integer_mutation_and_read_validate_rpc_types(self) -> None:
+        panel = _owned_panel()
+        with patch.object(panel, "_rpc", side_effect=(None, 1_000)) as rpc:
+            panel.register_integer(
+                "lottery_target",
+                "Lottery target",
+                default=1_000,
+                minimum=0,
             )
-        )
+            self.assertEqual(panel.get_integer("lottery_target"), 1_000)
 
-    def test_toggle_reads_live_shared_state(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._toggle_dict = {"auto_next_arena_battle": True}
+        self.assertEqual(rpc.call_count, 2)
 
-        panel._toggle_dict["auto_next_arena_battle"] = False
-
-        self.assertFalse(panel.get_toggle("auto_next_arena_battle"))
-
-    def test_forbidden_skills_are_available_before_gui_processes_command(
-        self,
-    ) -> None:
-        panel = _control_panel_without_process_start()
-        panel._skill_dict = {}
-        panel._cmd_queue = Mock()
-
-        panel.set_skills(
-            {"Debuffs": ["imperil", "weaken"]},
-            forbidden={"imperil"},
-        )
-
-        self.assertEqual(panel.get_forbidden_skills(), frozenset({"imperil"}))
-        panel._cmd_queue.put.assert_called_once()
-
-    def test_integer_default_is_available_before_gui_processes_command(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._integer_dict = {}
-        panel._cmd_queue = Mock()
-
-        panel.register_integer(
-            "lottery_target",
-            "Lottery target",
-            default=1_000,
-            minimum=0,
-            group="Between Battles",
-        )
-
-        self.assertEqual(panel.get_integer("lottery_target"), 1_000)
-        panel._cmd_queue.put.assert_called_once_with(
-            (
-                "register_integer",
-                (
-                    "lottery_target",
-                    "Lottery target",
-                    1_000,
-                    0,
-                    None,
-                    "Between Battles",
-                ),
+    def test_checklist_rpc_uses_normalized_selection_order(self) -> None:
+        panel = _owned_panel()
+        choices = (("first", "First"), ("second", "Second"))
+        with patch.object(
+            panel,
+            "_rpc",
+            side_effect=((1, ("first", "second")), (2, ("second",))),
+        ) as rpc:
+            panel.set_checklist(
+                "ring",
+                "Ring of Blood",
+                choices,
+                ("second", "first"),
             )
-        )
+            self.assertEqual(panel.get_checklist_selection("ring"), ("second",))
 
-    def test_integer_parser_keeps_only_valid_values(self) -> None:
-        self.assertEqual(_parse_integer("250", 0, 1_000), 250)
-        self.assertIsNone(_parse_integer("", 0, 1_000))
-        self.assertIsNone(_parse_integer("tickets", 0, 1_000))
-        self.assertIsNone(_parse_integer("-1", 0, 1_000))
-        self.assertIsNone(_parse_integer("1001", 0, 1_000))
-
-    def test_integer_reads_only_committed_shared_state(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._integer_dict = {"lottery_target": 1_000}
-
-        panel._integer_dict["lottery_target"] = 500
-
-        self.assertEqual(panel.get_integer("lottery_target"), 500)
-
-    def test_checklist_selection_is_available_before_gui_command(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._checklist_dict = {}
-        panel._cmd_queue = Mock()
-
-        panel.set_checklist(
-            "ring",
-            "Ring of Blood",
-            (("first", "First Challenge"), ("second", "Second Challenge")),
-            ("second", "first"),
-            status="10 Tokens of Blood",
-        )
-
-        self.assertEqual(panel.get_checklist_selection("ring"), ("first", "second"))
-        panel._cmd_queue.put.assert_called_once_with(
-            (
-                "set_checklist",
-                (
-                    "ring",
-                    "Ring of Blood",
+        self.assertEqual(
+            rpc.call_args_list,
+            [
+                call(
+                    "set_checklist",
                     (
-                        ("first", "First Challenge"),
-                        ("second", "Second Challenge"),
+                        "ring",
+                        "Ring of Blood",
+                        choices,
+                        ("first", "second"),
+                        None,
                     ),
-                    1,
-                    ("first", "second"),
-                    "10 Tokens of Blood",
                 ),
-            )
+                call("get_checklist", "ring"),
+            ],
         )
 
-    def test_checklist_replacement_removes_stale_shared_selection(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._checklist_dict = {}
-        panel._cmd_queue = Mock()
-        panel.set_checklist(
-            "arena",
-            "The Arena",
-            (("old", "Old Challenge"), ("keep", "Kept Challenge")),
-            ("old", "keep"),
-        )
+    def test_skill_mutation_and_read_are_acknowledged(self) -> None:
+        panel = _owned_panel()
+        groups = {"Debuffs": ["imperil", "weaken"]}
+        with patch.object(
+            panel,
+            "_rpc",
+            side_effect=(None, ("imperil",)),
+        ) as rpc:
+            panel.set_skills(groups, {"imperil"})
+            self.assertEqual(panel.get_forbidden_skills(), frozenset({"imperil"}))
 
-        panel.set_checklist(
-            "arena",
-            "The Arena",
-            (("new", "New Challenge"), ("keep", "Kept Challenge")),
-            ("keep",),
-        )
+        self.assertEqual(rpc.call_count, 2)
 
-        self.assertEqual(panel.get_checklist_selection("arena"), ("keep",))
-        self.assertEqual(panel._cmd_queue.put.call_count, 2)
-        self.assertEqual(
-            panel._cmd_queue.put.call_args.args[0][1][2],
-            (("new", "New Challenge"), ("keep", "Kept Challenge")),
-        )
-
-    def test_checklist_replacement_merges_click_after_last_observation(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._checklist_dict = {}
-        panel._cmd_queue = Mock()
-        panel.set_checklist(
-            "arena",
-            "The Arena",
-            (("old", "Old Challenge"), ("keep", "Kept Challenge")),
-            ("old", "keep"),
-        )
-        self.assertEqual(panel.get_checklist_selection("arena"), ("old", "keep"))
-
-        unchecked = Mock()
-        unchecked.get.return_value = False
-        _publish_checklist_selection(
-            panel._checklist_dict,
-            panel._checklist_lock,
-            "arena",
-            1,
-            "keep",
-            unchecked,
-        )
-        panel.set_checklist(
-            "arena",
-            "The Arena",
-            (("new", "New Challenge"), ("keep", "Kept Challenge")),
-            ("new", "keep"),
-        )
-
-        # The new row gets its proposed default, the live cancellation wins
-        # for the common row, and the removed old row cannot survive.
-        self.assertEqual(panel.get_checklist_selection("arena"), ("new",))
-
-    def test_old_frame_cancellation_after_replace_updates_render_state(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._checklist_dict = {}
-        panel._cmd_queue = Mock()
-        panel.set_checklist(
-            "arena",
-            "The Arena",
-            (("old", "Old Challenge"), ("keep", "Kept Challenge")),
-            ("old", "keep"),
-        )
-        self.assertEqual(panel.get_checklist_selection("arena"), ("old", "keep"))
-        panel.set_checklist(
-            "arena",
-            "The Arena",
-            (("new", "New Challenge"), ("keep", "Kept Challenge")),
-            ("new", "keep"),
-        )
-        _command, arguments = panel._cmd_queue.put.call_args.args[0]
-        name, _label, choices, command_revision, proposed, _status = arguments
-
-        unchecked = Mock()
-        unchecked.get.return_value = False
-        _publish_checklist_selection(
-            panel._checklist_dict,
-            panel._checklist_lock,
-            "arena",
-            1,
-            "keep",
-            unchecked,
-        )
-
-        keys = tuple(key for key, _choice_label in choices)
-        render_state = _checklist_render_state(
-            panel._checklist_dict,
-            panel._checklist_lock,
-            name,
-            command_revision,
-            keys,
-            proposed,
-        )
-        self.assertEqual(render_state, (3, ("new",)))
-        self.assertEqual(panel.get_checklist_selection("arena"), ("new",))
-
-    def test_old_frame_check_after_replace_preserves_new_default(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._checklist_dict = {}
-        panel._cmd_queue = Mock()
-        panel.set_checklist(
-            "ring",
-            "Ring of Blood",
-            (("old", "Old Challenge"), ("keep", "Kept Challenge")),
-        )
-        self.assertEqual(panel.get_checklist_selection("ring"), ())
-        panel.set_checklist(
-            "ring",
-            "Ring of Blood",
-            (("new", "New Challenge"), ("keep", "Kept Challenge")),
-            ("new",),
-        )
-
-        checked = Mock()
-        checked.get.return_value = True
-        _publish_checklist_selection(
-            panel._checklist_dict,
-            panel._checklist_lock,
-            "ring",
-            1,
-            "keep",
-            checked,
-        )
-
-        self.assertEqual(
-            panel.get_checklist_selection("ring"),
-            ("new", "keep"),
-        )
-        _revision, keys, _selected = panel._checklist_dict["ring"]
-        self.assertEqual(keys, ("new", "keep"))
-
-    def test_checklist_reads_one_live_atomic_tuple(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._checklist_dict = {"arena": (1, ("low", "high"), ("low", "high"))}
-
-        panel._checklist_dict["arena"] = (2, ("low", "high"), ("high",))
-
-        self.assertEqual(panel.get_checklist_selection("arena"), ("high",))
-
-    def test_empty_checklist_has_an_empty_selection(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._checklist_dict = {}
-        panel._cmd_queue = Mock()
-
-        panel.set_checklist(
-            "arena",
-            "The Arena",
-            (),
-            status="No currently available challenges",
-        )
-
-        self.assertEqual(panel.get_checklist_selection("arena"), ())
-        self.assertEqual(
-            panel._cmd_queue.put.call_args.args[0],
-            (
-                "set_checklist",
-                (
-                    "arena",
-                    "The Arena",
-                    (),
-                    1,
-                    (),
-                    "No currently available challenges",
-                ),
-            ),
-        )
-
-    def test_checklist_namespace_is_independent_from_other_controls(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._toggle_dict = {}
-        panel._integer_dict = {}
-        panel._checklist_dict = {}
-        panel._cmd_queue = Mock()
-
-        panel.register_toggle("activity", "Activity", default=True)
-        panel.register_integer("activity", "Activity count", default=3)
-        panel.set_checklist(
-            "activity",
-            "Activity choices",
-            (("challenge", "Challenge"),),
-            ("challenge",),
-        )
-
-        self.assertTrue(panel.get_toggle("activity"))
-        self.assertEqual(panel.get_integer("activity"), 3)
-        self.assertEqual(panel.get_checklist_selection("activity"), ("challenge",))
-
-    def test_programmatic_pause_blocks_until_pause_flag_is_cleared(self) -> None:
+    def test_programmatic_pause_waits_for_acknowledged_resume(self) -> None:
         async def exercise() -> None:
-            panel = _control_panel_without_process_start()
-            panel._pause_flag = asyncio.Event()
-            panel._cmd_queue = Mock()
-
-            with patch("hvbattle.control_panel.logger") as control_logger:
+            panel = _owned_panel()
+            with (
+                patch.object(
+                    panel,
+                    "_rpc",
+                    side_effect=(None, True, False),
+                ) as rpc,
+                patch("hvbattle.control_panel.asyncio.sleep", new_callable=AsyncMock),
+                patch("hvbattle.control_panel.logger") as control_logger,
+            ):
                 panel.pause()
-                self.assertTrue(panel.is_paused())
-                waiter = asyncio.create_task(panel.wait_if_paused())
-                await asyncio.sleep(0)
-                self.assertFalse(waiter.done())
-                panel._pause_flag.clear()
-                await asyncio.wait_for(waiter, timeout=1)
+                await panel.wait_if_paused()
 
+            self.assertEqual(
+                rpc.call_args_list,
+                [call("pause"), call("is_paused"), call("is_paused")],
+            )
             self.assertEqual(
                 control_logger.info.call_args_list,
                 [
@@ -480,115 +670,39 @@ class ControlPanelStateTests(unittest.TestCase):
                     call("Battle control panel resumed"),
                 ],
             )
-            panel._cmd_queue.put.assert_called_once_with(("pause", None))
 
         asyncio.run(exercise())
 
-    def test_unpaused_wait_does_not_report_a_resume(self) -> None:
-        async def exercise() -> None:
-            panel = _control_panel_without_process_start()
-            panel._pause_flag = asyncio.Event()
-
-            with patch("hvbattle.control_panel.logger") as control_logger:
-                await panel.wait_if_paused()
-
-            control_logger.info.assert_not_called()
-
-        asyncio.run(exercise())
-
-    def test_live_reads_fail_closed_after_gui_process_exits(self) -> None:
-        panel = _control_panel_without_process_start(alive=False)
-        panel._toggle_dict = {"toggle": True}
-        panel._integer_dict = {"integer": 7}
-        panel._checklist_dict = {"checklist": (1, ("choice",), ("choice",))}
-        panel._skill_dict = {"skill": False}
-
-        live_reads = (
-            lambda: panel.get_toggle("toggle"),
-            lambda: panel.get_integer("integer"),
-            lambda: panel.get_checklist_selection("checklist"),
-            panel.get_forbidden_skills,
-            panel.is_paused,
-        )
-        for read in live_reads:
-            with (
-                self.subTest(read=read),
-                self.assertRaisesRegex(RuntimeError, "GUI process is not running"),
-            ):
-                read()
-
-        self.assertEqual(panel._pause_flag.set.call_count, len(live_reads))
-
-    def test_mutations_fail_closed_after_gui_process_exits(self) -> None:
-        panel = _control_panel_without_process_start(alive=False)
-        panel._toggle_dict = {}
-        panel._integer_dict = {}
-        panel._checklist_dict = {}
-        panel._skill_dict = {}
-        panel._cmd_queue = Mock()
-
-        mutations = (
-            lambda: panel.set_title("Title"),
-            lambda: panel.register_toggle("toggle", "Toggle"),
-            lambda: panel.register_integer("integer", "Integer"),
-            lambda: panel.set_checklist("checklist", "Checklist", ()),
-            panel.pause,
-            lambda: panel.set_skills({"Skills": ["skill"]}, ()),
-        )
-        for mutation in mutations:
-            with (
-                self.subTest(mutation=mutation),
-                self.assertRaisesRegex(RuntimeError, "GUI process is not running"),
-            ):
-                mutation()
-
-        self.assertEqual(panel._pause_flag.set.call_count, len(mutations))
-        panel._cmd_queue.put.assert_not_called()
-
-    def test_unpaused_wait_fails_closed_after_gui_process_exits(self) -> None:
-        async def exercise() -> None:
-            panel = _control_panel_without_process_start(alive=False)
-            panel._pause_flag.is_set.return_value = False
-
-            with self.assertRaisesRegex(RuntimeError, "GUI process is not running"):
-                await panel.wait_if_paused()
-
-            panel._pause_flag.set.assert_called_once_with()
-            panel._pause_flag.is_set.assert_not_called()
-
-        asyncio.run(exercise())
-
-    def test_live_read_rechecks_gui_after_shared_state_access(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._process.is_alive.side_effect = (True, False)
-        panel._toggle_dict = {"toggle": True}
-
-        with self.assertRaisesRegex(RuntimeError, "GUI process is not running"):
-            panel.get_toggle("toggle")
-
-        panel._pause_flag.set.assert_called_once_with()
-
-    def test_pause_read_rechecks_gui_after_shared_state_access(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._process.is_alive.side_effect = (True, False)
-        panel._pause_flag.is_set.return_value = False
-
-        with self.assertRaisesRegex(RuntimeError, "GUI process is not running"):
+    def test_invalid_rpc_value_fails_closed(self) -> None:
+        panel = _owned_panel()
+        with (
+            patch.object(panel, "_rpc", return_value=object()),
+            self.assertRaisesRegex(RuntimeError, "invalid pause state"),
+        ):
             panel.is_paused()
 
-        panel._pause_flag.set.assert_called_once_with()
-
-    def test_pause_read_fails_closed_on_invalid_shared_state(self) -> None:
-        panel = _control_panel_without_process_start()
-        panel._pause_flag.is_set.return_value = object()
-
-        with self.assertRaisesRegex(RuntimeError, "invalid pause state"):
-            panel.is_paused()
-
-        panel._pause_flag.set.assert_called_once_with()
+        self.assertIs(panel._state, _ControlPanelLifecycle.CLOSING)
 
 
 class GuiCallbackTests(unittest.TestCase):
+    def test_checklist_replacement_preserves_live_common_choice(self) -> None:
+        self.assertEqual(
+            _merge_checklist_replacement(
+                ("old", "keep"),
+                ("old",),
+                ("new", "keep"),
+                ("new", "keep"),
+            ),
+            ("new",),
+        )
+
+    def test_integer_parser_rejects_partial_and_out_of_range_values(self) -> None:
+        self.assertEqual(_parse_integer("250", 0, 1_000), 250)
+        self.assertIsNone(_parse_integer("", 0, 1_000))
+        self.assertIsNone(_parse_integer("tickets", 0, 1_000))
+        self.assertIsNone(_parse_integer("-1", 0, 1_000))
+        self.assertIsNone(_parse_integer("1001", 0, 1_000))
+
     def test_checklist_columns_stay_stable_across_frame_rebuilds(self) -> None:
         columns: dict[str, int] = {}
 
@@ -817,6 +931,7 @@ class NullControlPanelTests(unittest.TestCase):
         panel.pause()
         self.assertFalse(panel.is_paused())
         asyncio.run(panel.wait_if_paused())
+        asyncio.run(panel.aclose())
         panel.destroy()
 
     def test_headless_checklist_replace_preserves_choice_order(self) -> None:
@@ -959,6 +1074,10 @@ class NullControlPanelTests(unittest.TestCase):
                 return False
 
             async def wait_if_paused(self) -> None:
+                return
+
+            async def aclose(self, *, expires_at: float | None = None) -> None:
+                del expires_at
                 return
 
             def destroy(self) -> None:

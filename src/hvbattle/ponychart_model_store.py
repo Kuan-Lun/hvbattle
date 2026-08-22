@@ -33,7 +33,12 @@ _COMPATIBILITY_ORIGIN = ("https", "www.csie.ntu.edu.tw", 443)
 _GENERATION_SCHEMA = 1
 _POINTER_SCHEMA = 1
 _COPY_BUFFER_SIZE = 1024 * 1024
-_DEFAULT_TRANSFER_TIMEOUT = 120.0
+_DEFAULT_CONNECT_TIMEOUT = 5.0
+_DEFAULT_READ_IDLE_TIMEOUT = 5.0
+_DEFAULT_REFRESH_TIMEOUT = 120.0
+_METADATA_SNAPSHOT_TIMEOUT = 5.0
+_PROCESS_LOCK_TIMEOUT = 5.0
+_PROCESS_LOCK_RETRY_INTERVAL = 0.05
 _DEFAULT_MAX_MODEL_BYTES = 512 * 1024 * 1024
 _DEFAULT_MAX_THRESHOLDS_BYTES = 4 * 1024 * 1024
 _ETAG_PATTERN = re.compile(r'^(?:W/)?"[\x21\x23-\x7e\x80-\xff]*"$')
@@ -50,20 +55,12 @@ class PonyChartArtifactError(RuntimeError):
     """Raised when a model generation cannot be downloaded or committed safely."""
 
 
-class _PredictionResult(Protocol):
-    @property
-    def labels(self) -> frozenset[str]: ...
-
-
 class _ClassifierCandidate(Protocol):
     def load(self) -> None: ...
-
-    def predict_bytes(self, image: bytes) -> _PredictionResult: ...
 
 
 type _CandidateFactory = Callable[[Path, Path], _ClassifierCandidate]
 type _UrlOpen = Callable[..., AbstractContextManager[Any]]
-type Predictor = Callable[[bytes], _PredictionResult]
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,18 +87,32 @@ class _CurrentPointer:
 
 @dataclass(frozen=True, slots=True)
 class LoadedPonyChartGeneration:
-    """A fully validated, prewarmed classifier generation."""
+    """Pickle-safe descriptor for a fully validated immutable generation."""
 
     generation: str
-    predictor: Predictor
+    model_path: Path
+    thresholds_path: Path
 
 
 @dataclass(frozen=True, slots=True)
 class PonyChartStoreRefresh:
-    """Store-level refresh result and optional newly prepared predictor."""
+    """Store-level refresh result and optional validated descriptor."""
 
     outcome: PonyChartRefreshOutcome
     loaded: LoadedPonyChartGeneration | None
+
+
+@dataclass(frozen=True, slots=True)
+class PonyChartStoreConfig:
+    """Pickle-safe construction inputs for the isolated artifact store."""
+
+    root: Path | None = None
+    base_url: str = _DEFAULT_BASE_URL
+    connect_timeout: float = _DEFAULT_CONNECT_TIMEOUT
+    read_idle_timeout: float = _DEFAULT_READ_IDLE_TIMEOUT
+    refresh_timeout: float = _DEFAULT_REFRESH_TIMEOUT
+    max_model_bytes: int = _DEFAULT_MAX_MODEL_BYTES
+    max_thresholds_bytes: int = _DEFAULT_MAX_THRESHOLDS_BYTES
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +163,9 @@ def _is_missing_subject_key_identifier(error: URLError) -> bool:
     )
 
 
-def _fsync_directory(path: Path) -> None:
+def _fsync_directory(path: Path, *, deadline: float | None = None) -> None:
+    if deadline is not None:
+        _remaining(deadline, message="PonyChart filesystem deadline expired")
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     try:
         descriptor = os.open(path, flags)
@@ -162,7 +175,17 @@ def _fsync_directory(path: Path) -> None:
         raise
     try:
         try:
+            if deadline is not None:
+                _remaining(
+                    deadline,
+                    message="PonyChart filesystem deadline expired before fsync",
+                )
             os.fsync(descriptor)
+            if deadline is not None:
+                _remaining(
+                    deadline,
+                    message="PonyChart filesystem deadline expired during fsync",
+                )
         except OSError as error:
             if not _directory_fsync_is_unsupported(error):
                 raise
@@ -182,11 +205,19 @@ def _directory_fsync_is_unsupported(error: OSError) -> bool:
     return error.errno in unsupported
 
 
-def _acquire_windows_file_lock(descriptor: int) -> None:
+def _remaining(deadline: float, *, message: str) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(message)
+    return remaining
+
+
+def _acquire_windows_file_lock(descriptor: int, *, deadline: float) -> None:
     import msvcrt
 
     retryable = {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
     while True:
+        _remaining(deadline, message="PonyChart update lock deadline expired")
         os.lseek(descriptor, 0, os.SEEK_SET)
         try:
             msvcrt.locking(  # type: ignore[attr-defined]
@@ -198,7 +229,30 @@ def _acquire_windows_file_lock(descriptor: int) -> None:
         except OSError as error:
             if error.errno not in retryable:
                 raise
-            time.sleep(0.1)
+            remaining = _remaining(
+                deadline,
+                message="PonyChart update lock deadline expired",
+            )
+            time.sleep(min(_PROCESS_LOCK_RETRY_INTERVAL, remaining))
+
+
+def _acquire_posix_file_lock(descriptor: int, *, deadline: float) -> None:
+    import fcntl
+
+    retryable = {errno.EACCES, errno.EAGAIN}
+    while True:
+        _remaining(deadline, message="PonyChart update lock deadline expired")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as error:
+            if error.errno not in retryable:
+                raise
+            remaining = _remaining(
+                deadline,
+                message="PonyChart update lock deadline expired",
+            )
+            time.sleep(min(_PROCESS_LOCK_RETRY_INTERVAL, remaining))
 
 
 def _release_windows_file_lock(descriptor: int) -> None:
@@ -212,28 +266,63 @@ def _release_windows_file_lock(descriptor: int) -> None:
     )
 
 
-def _write_bytes_fsynced(path: Path, content: bytes) -> None:
+def _write_bytes_fsynced(
+    path: Path,
+    content: bytes,
+    *,
+    deadline: float | None = None,
+) -> None:
+    if deadline is not None:
+        _remaining(deadline, message="PonyChart filesystem deadline expired")
     with path.open("wb") as stream:
         stream.write(content)
         stream.flush()
+        if deadline is not None:
+            _remaining(
+                deadline,
+                message="PonyChart filesystem deadline expired before fsync",
+            )
         os.fsync(stream.fileno())
+    if deadline is not None:
+        _remaining(
+            deadline,
+            message="PonyChart filesystem deadline expired during fsync",
+        )
 
 
-def _write_json_fsynced(path: Path, content: Mapping[str, object]) -> None:
+def _write_json_fsynced(
+    path: Path,
+    content: Mapping[str, object],
+    *,
+    deadline: float | None = None,
+) -> None:
     encoded = (
         json.dumps(content, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode()
-    _write_bytes_fsynced(path, encoded)
+    _write_bytes_fsynced(path, encoded, deadline=deadline)
 
 
-def _hash_file(path: Path) -> tuple[str, int]:
+def _hash_file(path: Path, *, deadline: float | None = None) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as stream:
-        while chunk := stream.read(_COPY_BUFFER_SIZE):
+        while True:
+            if deadline is not None:
+                _remaining(
+                    deadline,
+                    message="PonyChart validation deadline expired while hashing",
+                )
+            chunk = stream.read(_COPY_BUFFER_SIZE)
+            if not chunk:
+                break
             digest.update(chunk)
             size += len(chunk)
+    if deadline is not None:
+        _remaining(
+            deadline,
+            message="PonyChart validation deadline expired while hashing",
+        )
     return digest.hexdigest(), size
 
 
@@ -290,17 +379,38 @@ class PonyChartGenerationStore:
         *,
         root: Path,
         base_url: str = _DEFAULT_BASE_URL,
-        timeout: float = 30.0,
-        transfer_timeout: float = _DEFAULT_TRANSFER_TIMEOUT,
+        connect_timeout: float = _DEFAULT_CONNECT_TIMEOUT,
+        read_idle_timeout: float = _DEFAULT_READ_IDLE_TIMEOUT,
+        refresh_timeout: float = _DEFAULT_REFRESH_TIMEOUT,
         max_model_bytes: int = _DEFAULT_MAX_MODEL_BYTES,
         max_thresholds_bytes: int = _DEFAULT_MAX_THRESHOLDS_BYTES,
         candidate_factory: _CandidateFactory = _default_candidate_factory,
         urlopen: _UrlOpen = urllib.request.urlopen,
     ) -> None:
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("timeout must be a finite positive number")
-        if not math.isfinite(transfer_timeout) or transfer_timeout <= 0:
-            raise ValueError("transfer_timeout must be a finite positive number")
+        if (
+            isinstance(connect_timeout, bool)
+            or not isinstance(connect_timeout, int | float)
+            or not math.isfinite(connect_timeout)
+            or connect_timeout <= 0
+            or connect_timeout > _DEFAULT_CONNECT_TIMEOUT
+        ):
+            raise ValueError("connect_timeout must be finite and in (0, 5]")
+        if (
+            isinstance(read_idle_timeout, bool)
+            or not isinstance(read_idle_timeout, int | float)
+            or not math.isfinite(read_idle_timeout)
+            or read_idle_timeout <= 0
+            or read_idle_timeout > _DEFAULT_READ_IDLE_TIMEOUT
+        ):
+            raise ValueError("read_idle_timeout must be finite and in (0, 5]")
+        if (
+            isinstance(refresh_timeout, bool)
+            or not isinstance(refresh_timeout, int | float)
+            or not math.isfinite(refresh_timeout)
+            or refresh_timeout <= 0
+            or refresh_timeout > _DEFAULT_REFRESH_TIMEOUT
+        ):
+            raise ValueError("refresh_timeout must be finite and in (0, 120]")
         if max_model_bytes <= 0 or max_thresholds_bytes <= 0:
             raise ValueError("artifact size limits must be positive")
         parsed_base_url = urlsplit(base_url)
@@ -310,8 +420,9 @@ class PonyChartGenerationStore:
         self._generations = root / "generations"
         self._current_path = root / _CURRENT_FILENAME
         self._base_url = base_url.rstrip("/")
-        self._timeout = timeout
-        self._transfer_timeout = transfer_timeout
+        self._connect_timeout = connect_timeout
+        self._read_idle_timeout = read_idle_timeout
+        self._refresh_timeout = refresh_timeout
         self._max_artifact_bytes = {
             _MODEL_FILENAME: max_model_bytes,
             _THRESHOLDS_FILENAME: max_thresholds_bytes,
@@ -331,91 +442,271 @@ class PonyChartGenerationStore:
     def default(cls) -> PonyChartGenerationStore:
         """Build the store beside ponychart-classifier's canonical cache files."""
 
-        from ponychart_classifier.inference import artifacts
+        return cls.from_config(cls.default_config())
 
-        return cls(root=artifacts.DEFAULT_ARTIFACT_DIR)
+    @classmethod
+    def default_config(cls) -> PonyChartStoreConfig:
+        """Describe the production store without importing the ML package."""
 
-    def load_or_bootstrap(self) -> LoadedPonyChartGeneration:
+        return PonyChartStoreConfig()
+
+    @classmethod
+    def from_config(cls, config: PonyChartStoreConfig) -> PonyChartGenerationStore:
+        """Construct a store from data that can cross a spawn boundary."""
+
+        root = config.root
+        if root is None:
+            from ponychart_classifier.inference import artifacts
+
+            root = artifacts.DEFAULT_ARTIFACT_DIR
+        return cls(
+            root=root,
+            base_url=config.base_url,
+            connect_timeout=config.connect_timeout,
+            read_idle_timeout=config.read_idle_timeout,
+            refresh_timeout=config.refresh_timeout,
+            max_model_bytes=config.max_model_bytes,
+            max_thresholds_bytes=config.max_thresholds_bytes,
+        )
+
+    def load_or_bootstrap(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> LoadedPonyChartGeneration:
         """Load the committed pointer or safely create the first generation."""
 
-        with self._process_lock():
-            return self._load_or_bootstrap_locked()
-
-    def _load_or_bootstrap_locked(self) -> LoadedPonyChartGeneration:
-        pointer = self._read_pointer()
+        deadline = self._bounded_operation_deadline(deadline)
+        pointer = self._read_pointer_serialized(deadline=deadline)
         if pointer is not None:
-            return self._load_pointer(pointer)
+            return self._load_pointer(pointer, deadline=deadline)
 
-        return self._download_and_commit_locked()
+        return self._bootstrap(deadline=deadline)
 
-    def _download_and_commit_locked(self) -> LoadedPonyChartGeneration:
-        remote_before = self._remote_metadata()
-        prepared, remote_after = self._prepare_download_stage(remote_before)
-        loaded = self._install_prepared(prepared)
-        self._commit_pointer(
-            _CurrentPointer(generation=loaded.generation, remote=remote_after)
+    def _bootstrap(self, *, deadline: float) -> LoadedPonyChartGeneration:
+        remote_before = self._remote_metadata(deadline=deadline)
+        self._require_refresh_budget(
+            deadline,
+            "PonyChart bootstrap deadline expired after metadata snapshot",
+        )
+        prepared, effective_remote = self._prepare_download_stage(
+            remote_before,
+            deadline=deadline,
+        )
+        _, loaded = self._publish_prepared(
+            prepared,
+            effective_remote,
+            expected_pointer=None,
+            deadline=deadline,
         )
         return loaded
 
-    def refresh(self, published_generation: str | None) -> PonyChartStoreRefresh:
+    def refresh(
+        self,
+        published_generation: str | None,
+        *,
+        deadline: float | None = None,
+    ) -> PonyChartStoreRefresh:
         """Adopt a peer commit or safely check and install a remote generation."""
 
-        with self._process_lock():
-            pointer = self._read_pointer()
-            if pointer is None:
-                loaded = self._load_or_bootstrap_locked()
-                return PonyChartStoreRefresh(PonyChartRefreshOutcome.UPDATED, loaded)
-            if pointer.generation != published_generation:
-                return PonyChartStoreRefresh(
-                    PonyChartRefreshOutcome.UPDATED,
-                    self._load_pointer(pointer),
-                )
-
-            self._validate_generation(
-                self._generations / pointer.generation,
-                pointer.generation,
-            )
-
-            remote_before = self._remote_metadata()
-            if (
-                pointer.remote.is_complete
-                and remote_before.is_complete
-                and pointer.remote == remote_before
-            ):
-                return PonyChartStoreRefresh(PonyChartRefreshOutcome.CURRENT, None)
-
-            prepared, remote_after = self._prepare_download_stage(remote_before)
-            loaded = self._install_prepared(prepared)
-            self._commit_pointer(
-                _CurrentPointer(generation=loaded.generation, remote=remote_after)
-            )
-            if loaded.generation == pointer.generation:
-                return PonyChartStoreRefresh(PonyChartRefreshOutcome.CURRENT, None)
+        deadline = self._bounded_operation_deadline(deadline)
+        pointer = self._read_pointer_serialized(deadline=deadline)
+        if pointer is None:
+            loaded = self._bootstrap(deadline=deadline)
             return PonyChartStoreRefresh(PonyChartRefreshOutcome.UPDATED, loaded)
+        if pointer.generation != published_generation:
+            return PonyChartStoreRefresh(
+                PonyChartRefreshOutcome.UPDATED,
+                self._load_pointer(pointer, deadline=deadline),
+            )
+
+        self._validate_generation(
+            self._generations / pointer.generation,
+            pointer.generation,
+            deadline=deadline,
+        )
+        remote_before = self._remote_metadata(deadline=deadline)
+        self._require_refresh_budget(
+            deadline,
+            "PonyChart refresh deadline expired after metadata snapshot",
+        )
+
+        # A peer may have committed while this process checked the remote. This
+        # lock protects only the pointer decision; no network, hashing, or model
+        # loading occurs while it is held.
+        current = self._read_pointer_serialized(deadline=deadline)
+        if current is None:
+            raise PonyChartArtifactError(
+                "PonyChart current pointer disappeared during refresh"
+            )
+        if current != pointer:
+            return self._adopt_pointer(
+                current,
+                published_generation=published_generation,
+                deadline=deadline,
+            )
+        if (
+            pointer.remote.is_complete
+            and remote_before.is_complete
+            and pointer.remote == remote_before
+        ):
+            return PonyChartStoreRefresh(PonyChartRefreshOutcome.CURRENT, None)
+
+        prepared, effective_remote = self._prepare_download_stage(
+            remote_before,
+            deadline=deadline,
+        )
+        committed_pointer, loaded = self._publish_prepared(
+            prepared,
+            effective_remote,
+            expected_pointer=pointer,
+            deadline=deadline,
+        )
+        if committed_pointer.generation == published_generation:
+            return PonyChartStoreRefresh(PonyChartRefreshOutcome.CURRENT, None)
+        return PonyChartStoreRefresh(PonyChartRefreshOutcome.UPDATED, loaded)
+
+    def _bounded_operation_deadline(self, deadline: float | None) -> float:
+        local_deadline = time.monotonic() + self._refresh_timeout
+        if deadline is None:
+            return local_deadline
+        if not math.isfinite(deadline):
+            raise ValueError("PonyChart operation deadline must be finite")
+        bounded = min(deadline, local_deadline)
+        self._require_refresh_budget(
+            bounded,
+            "PonyChart artifact operation deadline expired before it started",
+        )
+        return bounded
+
+    def _adopt_pointer(
+        self,
+        pointer: _CurrentPointer,
+        *,
+        published_generation: str | None,
+        deadline: float,
+    ) -> PonyChartStoreRefresh:
+        if pointer.generation == published_generation:
+            return PonyChartStoreRefresh(PonyChartRefreshOutcome.CURRENT, None)
+        loaded = self._load_pointer(pointer, deadline=deadline)
+        return PonyChartStoreRefresh(PonyChartRefreshOutcome.UPDATED, loaded)
+
+    def _publish_prepared(
+        self,
+        prepared: _PreparedStage,
+        remote: _RemoteMetadata,
+        *,
+        expected_pointer: _CurrentPointer | None,
+        deadline: float,
+    ) -> tuple[_CurrentPointer, LoadedPonyChartGeneration]:
+        """Publish a stage without holding the process lock during validation."""
+
+        try:
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired before generation promotion",
+            )
+            # Atomic rename makes this directory immutable. Promotion, directory
+            # fsync, expensive hashes, and candidate loading therefore all happen
+            # before the short compare-and-commit pointer lock.
+            self._promote_prepared(prepared, deadline=deadline)
+            loaded = self._load_generation(prepared.generation, deadline=deadline)
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired before pointer commit",
+            )
+            pointer = _CurrentPointer(generation=loaded.generation, remote=remote)
+            with self._process_lock(deadline=deadline) as lock_deadline:
+                current = self._read_pointer()
+                if current == expected_pointer:
+                    self._require_refresh_budget(
+                        lock_deadline,
+                        "PonyChart refresh deadline expired before pointer commit",
+                    )
+                    self._commit_pointer(pointer, deadline=lock_deadline)
+                    peer_pointer = None
+                else:
+                    peer_pointer = current
+
+            if peer_pointer is not None:
+                peer_loaded = self._load_pointer(peer_pointer, deadline=deadline)
+                return peer_pointer, peer_loaded
+            if current != expected_pointer:
+                raise PonyChartArtifactError(
+                    "PonyChart current pointer disappeared during commit"
+                )
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired during pointer commit",
+            )
+            return pointer, loaded
+        finally:
+            if prepared.path.exists():
+                self._discard_stage(prepared.path)
+
+    def _read_pointer_serialized(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> _CurrentPointer | None:
+        with self._process_lock(deadline=deadline):
+            return self._read_pointer()
+
+    @staticmethod
+    def _require_refresh_budget(deadline: float, message: str) -> float:
+        return _remaining(deadline, message=message)
 
     @contextmanager
-    def _process_lock(self) -> Iterator[None]:
-        """Serialize pointer decisions across processes on one stable inode."""
+    def _process_lock(self, *, deadline: float | None = None) -> Iterator[float]:
+        """Yield a deadline bounding setup, acquisition, and the critical section."""
 
-        self._prepare_directories()
+        now = time.monotonic()
+        lock_deadline = now + _PROCESS_LOCK_TIMEOUT
+        if deadline is not None:
+            if not math.isfinite(deadline):
+                raise ValueError("process lock deadline must be finite")
+            lock_deadline = min(lock_deadline, deadline)
+        _remaining(
+            lock_deadline,
+            message="PonyChart update lock deadline expired",
+        )
+        self._prepare_directories(deadline=lock_deadline)
+        _remaining(
+            lock_deadline,
+            message="PonyChart update lock deadline expired",
+        )
         lock_path = self._root / _LOCK_FILENAME
         created = not lock_path.exists()
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             if os.fstat(descriptor).st_size == 0:
                 os.write(descriptor, b"\0")
+                _remaining(
+                    lock_deadline,
+                    message="PonyChart update lock deadline expired before fsync",
+                )
                 os.fsync(descriptor)
+                _remaining(
+                    lock_deadline,
+                    message="PonyChart update lock deadline expired during fsync",
+                )
             if created:
-                _fsync_directory(self._root)
+                _fsync_directory(self._root, deadline=lock_deadline)
             os.lseek(descriptor, 0, os.SEEK_SET)
             if os.name == "nt":
-                _acquire_windows_file_lock(descriptor)
+                _acquire_windows_file_lock(descriptor, deadline=lock_deadline)
             else:
-                import fcntl
-
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                _acquire_posix_file_lock(descriptor, deadline=lock_deadline)
             try:
-                yield
+                _remaining(
+                    lock_deadline,
+                    message="PonyChart update lock deadline expired after acquisition",
+                )
+                yield lock_deadline
+                _remaining(
+                    lock_deadline,
+                    message="PonyChart update lock deadline expired while held",
+                )
             finally:
                 os.lseek(descriptor, 0, os.SEEK_SET)
                 if os.name == "nt":
@@ -427,39 +718,59 @@ class PonyChartGenerationStore:
         finally:
             os.close(descriptor)
 
-    def _prepare_directories(self) -> None:
+    def _prepare_directories(self, *, deadline: float | None = None) -> None:
+        if deadline is not None:
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired before directory preparation",
+            )
         root_existed = self._root.exists()
+        generations_existed = self._generations.exists()
         self._root.mkdir(parents=True, exist_ok=True)
         if not root_existed:
-            _fsync_directory(self._root.parent)
+            _fsync_directory(self._root.parent, deadline=deadline)
         self._generations.mkdir(exist_ok=True)
-        _fsync_directory(self._root)
+        if not generations_existed:
+            _fsync_directory(self._root, deadline=deadline)
 
-    def _new_stage(self) -> Path:
-        self._prepare_directories()
+    def _new_stage(self, *, deadline: float) -> Path:
+        self._prepare_directories(deadline=deadline)
         stage = self._generations / f".staging-{uuid.uuid4().hex}"
         stage.mkdir(mode=0o700)
-        _fsync_directory(self._generations)
+        _fsync_directory(self._generations, deadline=deadline)
         return stage
 
     def _prepare_download_stage(
         self,
         remote_before: _RemoteMetadata,
+        *,
+        deadline: float,
     ) -> tuple[_PreparedStage, _RemoteMetadata]:
-        stage = self._new_stage()
-        transfer_deadline = time.monotonic() + self._transfer_timeout
+        self._require_refresh_budget(
+            deadline,
+            "PonyChart refresh deadline expired before staging",
+        )
+        stage = self._new_stage(deadline=deadline)
         try:
             model_response_etag = self._download(
                 _MODEL_FILENAME,
                 stage / _MODEL_FILENAME,
-                deadline=transfer_deadline,
+                deadline=deadline,
             )
             thresholds_response_etag = self._download(
                 _THRESHOLDS_FILENAME,
                 stage / _THRESHOLDS_FILENAME,
-                deadline=transfer_deadline,
+                deadline=deadline,
             )
-            remote_after = self._remote_metadata()
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired before final metadata snapshot",
+            )
+            remote_after = self._remote_metadata(deadline=deadline)
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired after final metadata snapshot",
+            )
             self._assert_stable_etags(
                 remote_before.model_etag,
                 model_response_etag,
@@ -479,7 +790,12 @@ class PonyChartGenerationStore:
                 model_etag=model_response_etag,
                 thresholds_etag=thresholds_response_etag,
             )
-            return self._validate_stage(stage), effective_remote
+            prepared = self._validate_stage(stage, deadline=deadline)
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired during stage validation",
+            )
+            return prepared, effective_remote
         except BaseException:
             self._discard_stage(stage)
             raise
@@ -499,9 +815,16 @@ class PonyChartGenerationStore:
                 raise TimeoutError("artifact bundle transfer deadline expired")
             with self._open_verified(
                 request,
-                timeout=min(self._timeout, remaining),
+                deadline=deadline,
             ) as response:
                 self._assert_https_response(response, requested_url=requested_url)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("artifact bundle transfer deadline expired")
+                self._set_response_read_idle_timeout(
+                    response,
+                    min(self._read_idle_timeout, remaining),
+                )
                 expected_size = self._content_length(response, filename=filename)
                 size_limit = self._max_artifact_bytes[filename]
                 if expected_size > size_limit:
@@ -516,10 +839,15 @@ class PonyChartGenerationStore:
                 received = 0
                 with destination.open("wb") as stream:
                     while True:
-                        if time.monotonic() >= deadline:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
                             raise TimeoutError(
                                 "artifact bundle transfer deadline expired"
                             )
+                        self._set_response_read_idle_timeout(
+                            response,
+                            min(self._read_idle_timeout, remaining),
+                        )
                         chunk = read_one(_COPY_BUFFER_SIZE)
                         if not chunk:
                             break
@@ -540,7 +868,15 @@ class PonyChartGenerationStore:
                             f"PonyChart artifact body length mismatch: {filename}"
                         )
                     stream.flush()
+                    self._require_refresh_budget(
+                        deadline,
+                        "PonyChart transfer deadline expired before artifact fsync",
+                    )
                     os.fsync(stream.fileno())
+                    self._require_refresh_budget(
+                        deadline,
+                        "PonyChart transfer deadline expired during artifact fsync",
+                    )
                 return _normalize_etag(response.headers.get("ETag"))
         except (HTTPError, URLError, TimeoutError, OSError) as error:
             raise PonyChartArtifactError(
@@ -548,19 +884,38 @@ class PonyChartGenerationStore:
                 f"{type(error).__name__}"
             ) from error
 
-    def _remote_metadata(self) -> _RemoteMetadata:
+    def _remote_metadata(self, *, deadline: float | None = None) -> _RemoteMetadata:
+        now = time.monotonic()
+        snapshot_deadline = now + _METADATA_SNAPSHOT_TIMEOUT
+        if deadline is not None:
+            snapshot_deadline = min(snapshot_deadline, deadline)
         return _RemoteMetadata(
-            model_etag=self._remote_etag(_MODEL_FILENAME),
-            thresholds_etag=self._remote_etag(_THRESHOLDS_FILENAME),
+            model_etag=self._remote_etag(
+                _MODEL_FILENAME,
+                deadline=snapshot_deadline,
+            ),
+            thresholds_etag=self._remote_etag(
+                _THRESHOLDS_FILENAME,
+                deadline=snapshot_deadline,
+            ),
         )
 
-    def _remote_etag(self, filename: str) -> str | None:
+    def _remote_etag(
+        self,
+        filename: str,
+        *,
+        deadline: float | None = None,
+    ) -> str | None:
+        now = time.monotonic()
+        operation_deadline = now + _METADATA_SNAPSHOT_TIMEOUT
+        if deadline is not None:
+            operation_deadline = min(operation_deadline, deadline)
         requested_url = f"{self._base_url}/{filename}"
         request = urllib.request.Request(requested_url, method="HEAD")
         try:
             with self._open_verified(
                 request,
-                timeout=self._timeout,
+                deadline=operation_deadline,
             ) as response:
                 self._assert_https_response(response, requested_url=requested_url)
                 return _normalize_etag(response.headers.get("ETag"))
@@ -573,14 +928,20 @@ class PonyChartGenerationStore:
         self,
         request: urllib.request.Request,
         *,
-        timeout: float,
+        deadline: float,
     ) -> AbstractContextManager[Any]:
         context = self._active_ssl_context
         try:
             return self._urlopen(
                 request,
                 context=context,
-                timeout=timeout,
+                timeout=min(
+                    self._connect_timeout,
+                    _remaining(
+                        deadline,
+                        message="PonyChart network phase deadline expired",
+                    ),
+                ),
             )
         except URLError as error:
             if (
@@ -598,8 +959,26 @@ class PonyChartGenerationStore:
         return self._urlopen(
             request,
             context=self._active_ssl_context,
-            timeout=timeout,
+            timeout=min(
+                self._connect_timeout,
+                _remaining(
+                    deadline,
+                    message="PonyChart network phase deadline expired",
+                ),
+            ),
         )
+
+    @staticmethod
+    def _set_response_read_idle_timeout(response: Any, timeout: float) -> None:
+        """Apply the idle watchdog to urllib's connected socket when exposed."""
+        fp = getattr(response, "fp", None)
+        raw = getattr(fp, "raw", None)
+        socket = getattr(raw, "_sock", None)
+        for candidate in (socket, raw, fp, response):
+            setter = getattr(candidate, "settimeout", None)
+            if callable(setter):
+                setter(timeout)
+                return
 
     @staticmethod
     def _assert_https_response(response: Any, *, requested_url: str) -> None:
@@ -658,13 +1037,24 @@ class PonyChartGenerationStore:
                 f"Remote PonyChart artifact changed during download: {filename}"
             )
 
-    def _validate_stage(self, stage: Path) -> _PreparedStage:
+    def _validate_stage(self, stage: Path, *, deadline: float) -> _PreparedStage:
         model_path = stage / _MODEL_FILENAME
         thresholds_path = stage / _THRESHOLDS_FILENAME
+        self._require_refresh_budget(
+            deadline,
+            "PonyChart refresh deadline expired before candidate validation",
+        )
         candidate = self._candidate_factory(model_path, thresholds_path)
         candidate.load()
-        model_hash, model_size = _hash_file(model_path)
-        thresholds_hash, thresholds_size = _hash_file(thresholds_path)
+        self._require_refresh_budget(
+            deadline,
+            "PonyChart refresh deadline expired during candidate validation",
+        )
+        model_hash, model_size = _hash_file(model_path, deadline=deadline)
+        thresholds_hash, thresholds_size = _hash_file(
+            thresholds_path,
+            deadline=deadline,
+        )
         generation = _generation_id(model_hash, thresholds_hash)
         manifest: dict[str, object] = {
             "schema": _GENERATION_SCHEMA,
@@ -680,51 +1070,100 @@ class PonyChartGenerationStore:
                 },
             },
         }
-        _write_json_fsynced(stage / _MANIFEST_FILENAME, manifest)
-        _fsync_directory(stage)
-        return _PreparedStage(
-            path=stage,
-            generation=generation,
+        _write_json_fsynced(
+            stage / _MANIFEST_FILENAME,
+            manifest,
+            deadline=deadline,
         )
+        _fsync_directory(stage, deadline=deadline)
+        return _PreparedStage(path=stage, generation=generation)
 
-    def _install_prepared(
+    def _promote_prepared(
         self,
         prepared: _PreparedStage,
-    ) -> LoadedPonyChartGeneration:
+        *,
+        deadline: float,
+    ) -> Path:
+        """Atomically expose validated bytes without loading under the lock."""
+
+        self._require_refresh_budget(
+            deadline,
+            "PonyChart refresh deadline expired before generation promotion",
+        )
         destination = self._generations / prepared.generation
-        if destination.exists():
-            self._validate_generation(destination, prepared.generation)
-            self._discard_stage(prepared.path)
-        else:
+        if not destination.exists():
             try:
                 prepared.path.rename(destination)
             except OSError:
                 if not destination.exists():
                     raise
-                self._validate_generation(destination, prepared.generation)
+            _fsync_directory(self._generations, deadline=deadline)
+        return destination
+
+    def _install_prepared(
+        self,
+        prepared: _PreparedStage,
+        *,
+        deadline: float,
+    ) -> LoadedPonyChartGeneration:
+        """Promote and load a stage for focused storage-level tests."""
+
+        try:
+            self._promote_prepared(prepared, deadline=deadline)
+            return self._load_generation(prepared.generation, deadline=deadline)
+        finally:
+            if prepared.path.exists():
                 self._discard_stage(prepared.path)
-            _fsync_directory(self._generations)
+
+    def _load_generation(
+        self,
+        generation: str,
+        *,
+        deadline: float | None = None,
+    ) -> LoadedPonyChartGeneration:
+        destination = self._generations / generation
+        self._validate_generation(destination, generation, deadline=deadline)
+        if deadline is not None:
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired before canonical model load",
+            )
         candidate = self._candidate_factory(
             destination / _MODEL_FILENAME,
             destination / _THRESHOLDS_FILENAME,
         )
         candidate.load()
+        if deadline is not None:
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired during canonical model load",
+            )
         return LoadedPonyChartGeneration(
-            generation=prepared.generation,
-            predictor=candidate.predict_bytes,
+            generation=generation,
+            model_path=destination / _MODEL_FILENAME,
+            thresholds_path=destination / _THRESHOLDS_FILENAME,
         )
 
-    def _load_pointer(self, pointer: _CurrentPointer) -> LoadedPonyChartGeneration:
-        generation_path = self._generations / pointer.generation
-        self._validate_generation(generation_path, pointer.generation)
-        candidate = self._candidate_factory(
-            generation_path / _MODEL_FILENAME,
-            generation_path / _THRESHOLDS_FILENAME,
-        )
-        candidate.load()
-        return LoadedPonyChartGeneration(pointer.generation, candidate.predict_bytes)
+    def _load_pointer(
+        self,
+        pointer: _CurrentPointer,
+        *,
+        deadline: float | None = None,
+    ) -> LoadedPonyChartGeneration:
+        return self._load_generation(pointer.generation, deadline=deadline)
 
-    def _validate_generation(self, path: Path, expected_generation: str) -> None:
+    def _validate_generation(
+        self,
+        path: Path,
+        expected_generation: str,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        if deadline is not None:
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired before generation validation",
+            )
         if not path.is_dir():
             raise PonyChartArtifactError(
                 f"Committed PonyChart generation is missing: {expected_generation}"
@@ -748,8 +1187,14 @@ class PonyChartGenerationStore:
                 thresholds_manifest, dict
             ):
                 raise TypeError
-            model_hash, model_size = _hash_file(path / _MODEL_FILENAME)
-            thresholds_hash, thresholds_size = _hash_file(path / _THRESHOLDS_FILENAME)
+            model_hash, model_size = _hash_file(
+                path / _MODEL_FILENAME,
+                deadline=deadline,
+            )
+            thresholds_hash, thresholds_size = _hash_file(
+                path / _THRESHOLDS_FILENAME,
+                deadline=deadline,
+            )
             if model_manifest != {"sha256": model_hash, "size": model_size}:
                 raise ValueError
             if thresholds_manifest != {
@@ -769,6 +1214,11 @@ class PonyChartGenerationStore:
             raise PonyChartArtifactError(
                 f"Committed PonyChart generation is corrupt: {expected_generation}"
             ) from error
+        if deadline is not None:
+            self._require_refresh_budget(
+                deadline,
+                "PonyChart refresh deadline expired during generation validation",
+            )
 
     def _read_pointer(self) -> _CurrentPointer | None:
         try:
@@ -799,8 +1249,11 @@ class PonyChartGenerationStore:
             raise PonyChartArtifactError("current.json is invalid") from error
         return _CurrentPointer(generation, metadata)
 
-    def _commit_pointer(self, pointer: _CurrentPointer) -> None:
-        self._prepare_directories()
+    def _commit_pointer(self, pointer: _CurrentPointer, *, deadline: float) -> None:
+        self._require_refresh_budget(
+            deadline,
+            "PonyChart refresh deadline expired before pointer staging",
+        )
         descriptor, temporary_name = tempfile.mkstemp(
             dir=self._root,
             prefix=".current-",
@@ -824,9 +1277,17 @@ class PonyChartGenerationStore:
                 ).encode()
                 stream.write(encoded)
                 stream.flush()
+                self._require_refresh_budget(
+                    deadline,
+                    "PonyChart refresh deadline expired before pointer fsync",
+                )
                 os.fsync(stream.fileno())
+                self._require_refresh_budget(
+                    deadline,
+                    "PonyChart refresh deadline expired during pointer fsync",
+                )
             os.replace(temporary, self._current_path)
-            _fsync_directory(self._root)
+            _fsync_directory(self._root, deadline=deadline)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise

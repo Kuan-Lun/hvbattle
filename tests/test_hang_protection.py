@@ -10,12 +10,15 @@ itself via asyncio.wait() regardless of what zendriver is doing internally.
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
+from hvbrowser import Realm
 from hvbrowser.runtime import ZendriverOperationTimeout
 
 from hvbattle import ArenaOption, GrindfestOption
+from hvbattle._timing import SemanticDeadline
 from hvbattle.battle_launcher import BattleLauncher
 from hvbattle.hv_battle_item_provider import ItemProvider
 from hvbattle.hv_battle_ponychart import PonyChart
@@ -25,6 +28,9 @@ from hvbattle.session import BattleSession
 
 class _HangingPage:
     """A page whose browser reads never resolve."""
+
+    async def send(self, command: object) -> Any:
+        await asyncio.Event().wait()
 
     async def evaluate(self, expression: str) -> Any:
         await asyncio.Event().wait()
@@ -39,29 +45,6 @@ class _HangingPage:
         await asyncio.Event().wait()
 
     async def select_all(self, selector: str, timeout: float = 10) -> Any:
-        await asyncio.Event().wait()
-
-
-class _RespondsOnceThenHangsPage:
-    """A page whose first evaluate() succeeds, and every call after hangs.
-
-    Models a launcher submission flow: the pre-submit URL check succeeds,
-    but the browser stops responding to the actual form-submission call.
-    """
-
-    def __init__(self, first_result: Any) -> None:
-        self._first_result = first_result
-        self._calls = 0
-
-    async def evaluate(self, expression: str) -> Any:
-        self._calls += 1
-        if self._calls == 1:
-            return self._first_result
-        await asyncio.Event().wait()
-
-
-class _HangingElement:
-    async def apply(self, js_function: str) -> Any:
         await asyncio.Event().wait()
 
 
@@ -91,6 +74,17 @@ class _SlowPage:
 
 
 class BattleSessionHangProtectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_atomic_battle_presence_times_out_as_one_command(self) -> None:
+        session = object.__new__(BattleSession)
+        session._completion_observed = False
+        session.page = _HangingPage()
+
+        with (
+            patch("hvbattle.session.PROTOCOL_TIMEOUT_SECONDS", 0.02),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await asyncio.wait_for(session.is_in_battle(), timeout=1)
+
     async def test_read_battle_phase_times_out_instead_of_hanging_forever(
         self,
     ) -> None:
@@ -100,19 +94,16 @@ class BattleSessionHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ZendriverOperationTimeout):
             await asyncio.wait_for(session._read_battle_phase(), timeout=15)
 
-    async def test_read_battle_phase_tolerates_post_navigation_settling(
+    async def test_read_battle_phase_never_uses_navigation_as_read_budget(
         self,
     ) -> None:
-        """Regression test for the 2026-08-19 startup incident: a several-
-        second-but-not-infinite delay right after login/realm navigation
-        must succeed, not be misclassified as a fatal, non-retried hang."""
+        """A phase evaluate is one protocol read, not a lifecycle wait."""
 
         session = object.__new__(BattleSession)
         session.page = _SlowPage(6.0, "active")
 
-        phase = await asyncio.wait_for(session._read_battle_phase(), timeout=15)
-
-        self.assertEqual(phase, "active")
+        with self.assertRaises(ZendriverOperationTimeout):
+            await asyncio.wait_for(session._read_battle_phase(), timeout=6)
 
     async def test_has_battle_marker_tolerates_post_navigation_settling(
         self,
@@ -178,8 +169,11 @@ class PonyChartHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         pony_chart.hvdriver = Mock()
         pony_chart.hvdriver.page = _HangingPage()
 
-        with self.assertRaises(ZendriverOperationTimeout):
-            await asyncio.wait_for(pony_chart._check(), timeout=5)
+        with (
+            patch("hvbattle.hv_battle_ponychart.PROTOCOL_TIMEOUT_SECONDS", 0.02),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await asyncio.wait_for(pony_chart._check(), timeout=1)
 
     async def test_wait_for_image_loaded_times_out_instead_of_hanging_forever(
         self,
@@ -190,7 +184,8 @@ class PonyChartHangProtectionTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ZendriverOperationTimeout):
             await asyncio.wait_for(
-                pony_chart._wait_for_image_loaded(timeout=0.2), timeout=5
+                pony_chart._wait_for_image_loaded(deadline=SemanticDeadline.after(0.2)),
+                timeout=5,
             )
 
     async def test_capture_pony_chart_image_times_out_instead_of_hanging_forever(
@@ -200,77 +195,76 @@ class PonyChartHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         pony_chart.hvdriver = Mock()
         pony_chart.hvdriver.page = _HangingPage()
         pony_chart._image_directory = None
-        pony_chart._wait_for_image_loaded = AsyncMock(return_value=None)
+        pony_chart._wait_for_image_loaded = AsyncMock(
+            return_value=SimpleNamespace(
+                source="challenge",
+                width=640,
+                height=480,
+            )
+        )
 
         with self.assertRaises(ZendriverOperationTimeout):
-            await asyncio.wait_for(pony_chart._capture_pony_chart_image(), timeout=5)
+            await asyncio.wait_for(
+                pony_chart._capture_pony_chart_image(
+                    deadline=SemanticDeadline.after(0.2)
+                ),
+                timeout=5,
+            )
 
 
 class SkillManagerHangProtectionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_select_pane_control_times_out_instead_of_hanging_forever(
-        self,
-    ) -> None:
+    async def test_atomic_menu_open_times_out_instead_of_hanging_forever(self) -> None:
         manager = object.__new__(SkillManager)
         manager.hvdriver = Mock()
         manager.hvdriver.page = _HangingPage()
 
-        with self.assertRaises(ZendriverOperationTimeout):
-            await asyncio.wait_for(
-                manager._select_pane_control("#pane_skill"), timeout=5
-            )
+        with (
+            patch("hvbattle.hv_battle_skill_manager._MENU_DEADLINE_SECONDS", 0.02),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await asyncio.wait_for(manager.open_skills_menu(), timeout=1)
 
 
 class ItemProviderHangProtectionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_get_items_menu_element_times_out_instead_of_hanging_forever(
-        self,
-    ) -> None:
+    async def test_atomic_items_menu_times_out_instead_of_hanging_forever(self) -> None:
         provider = object.__new__(ItemProvider)
         provider.hvdriver = Mock()
         provider.hvdriver.page = _HangingPage()
 
         with self.assertRaises(ZendriverOperationTimeout):
-            await asyncio.wait_for(provider._get_items_menu_element(), timeout=5)
+            await asyncio.wait_for(
+                provider.click_items_menu(deadline=SemanticDeadline.after(0.02)),
+                timeout=1,
+            )
 
-    async def test_is_open_items_menu_times_out_when_apply_hangs(self) -> None:
+    async def test_is_open_items_menu_times_out_when_evaluate_hangs(self) -> None:
         provider = object.__new__(ItemProvider)
-        provider.hvdriver = Mock()
-        provider._get_items_menu_element = _get_hanging_element
+        provider.hvdriver = Mock(page=_HangingPage())
 
-        with self.assertRaises(ZendriverOperationTimeout):
-            await asyncio.wait_for(provider.is_open_items_menu(), timeout=5)
+        with (
+            patch("hvbattle.hv_battle_item_provider.PROTOCOL_TIMEOUT_SECONDS", 0.02),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await asyncio.wait_for(provider.is_open_items_menu(), timeout=1)
 
 
 class BattleLauncherHangProtectionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _stub_lifecycle(launcher: BattleLauncher) -> None:
+        lifecycle = Mock()
+        lifecycle.enable = AsyncMock()
+        lifecycle.trigger = Mock()
+        lifecycle.wait = AsyncMock()
+        lifecycle.close = Mock()
+        launcher._main_document_lifecycle = Mock(return_value=lifecycle)
+
     async def test_start_grindfest_times_out_instead_of_hanging_forever(
         self,
     ) -> None:
         client = Mock()
         client.page = _HangingPage()
         launcher = BattleLauncher(client, Mock())
-        launcher._path_prefix = AsyncMock(return_value="")
-
-        with (
-            patch(
-                "hvbattle.battle_launcher._NAVIGATION_READ_TIMEOUT_SECONDS",
-                0.02,
-            ),
-            self.assertRaises(ZendriverOperationTimeout),
-        ):
-            await asyncio.wait_for(
-                launcher.start_grindfest(GrindfestOption(battle_id=1)), timeout=1
-            )
-
-    async def test_start_arena_submission_times_out_instead_of_hanging_forever(
-        self,
-    ) -> None:
-        """The pre-submit URL check succeeds; the form-submission call hangs."""
-
-        client = Mock()
-        client.page = _RespondsOnceThenHangsPage(
-            "https://hentaiverse.org/?s=Battle&ss=ar"
-        )
-        launcher = BattleLauncher(client, Mock())
-        launcher._path_prefix = AsyncMock(return_value="")
+        self._stub_lifecycle(launcher)
 
         with (
             patch(
@@ -280,13 +274,37 @@ class BattleLauncherHangProtectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(ZendriverOperationTimeout),
         ):
             await asyncio.wait_for(
-                launcher.start_arena(ArenaOption(battle_id=1, token=None)),
+                launcher.start_grindfest(
+                    GrindfestOption(battle_id=1),
+                    expected_realm=Realm.PERSISTENT,
+                ),
                 timeout=1,
             )
 
+    async def test_start_arena_submission_times_out_instead_of_hanging_forever(
+        self,
+    ) -> None:
+        """The single atomic form snapshot/submission call hangs."""
 
-async def _get_hanging_element() -> _HangingElement:
-    return _HangingElement()
+        client = Mock()
+        client.page = _HangingPage()
+        launcher = BattleLauncher(client, Mock())
+        self._stub_lifecycle(launcher)
+
+        with (
+            patch(
+                "hvbattle.battle_launcher._NAVIGATION_MUTATION_TIMEOUT_SECONDS",
+                0.02,
+            ),
+            self.assertRaises(ZendriverOperationTimeout),
+        ):
+            await asyncio.wait_for(
+                launcher.start_arena(
+                    ArenaOption(battle_id=1, token=None),
+                    expected_realm=Realm.PERSISTENT,
+                ),
+                timeout=1,
+            )
 
 
 if __name__ == "__main__":

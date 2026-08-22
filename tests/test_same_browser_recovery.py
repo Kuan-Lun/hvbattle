@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from hvbattle import (
     BattleActionKind,
@@ -333,9 +333,14 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stalled.matches_stalled_single_xhr)
         self.assertFalse(stalled.matches_server_communication_failure)
         self.assertTrue(stalled.allows_same_browser_recovery)
+        self.assertTrue(
+            replace(
+                stalled,
+                action_kind=BattleActionKind.NEXT_FLOOR,
+            ).matches_stalled_single_xhr
+        )
 
         rejected = (
-            {"action_kind": BattleActionKind.NEXT_FLOOR},
             {"action_kind": "turn"},
             {"action_id": ""},
             {"selector": ""},
@@ -395,7 +400,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         manager._read_action_state = AsyncMock(side_effect=[before, navigated])
 
         with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
-            await manager.click_and_wait_log_locator("#mkey_3", timeout=1e-9)
+            await manager.click_and_wait_log_locator("#mkey_3", timeout=0.005)
 
         evidence = raised.exception.recovery_evidence
         self.assertIsNotNone(evidence)
@@ -411,7 +416,8 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence.dialog_action_id, action_id)
         manager._get_dialog_category.assert_called_once_with(action_id)
         manager._click.assert_awaited_once_with(
-            manager._select_for_single_click.return_value
+            manager._select_for_single_click.return_value,
+            operation_timeout=ANY,
         )
 
     async def test_partial_xhr_before_navigation_remains_receipt_unavailable(
@@ -442,6 +448,9 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         )
         navigated = _action_state(document_id="document-after", monitor=None)
         reads = 0
+        clock = Mock()
+        clock.now = 0.0
+        clock.time.side_effect = lambda: clock.now
 
         async def read_state(*_args: object, **_kwargs: object) -> _BattleActionState:
             nonlocal reads
@@ -449,17 +458,32 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
             if reads == 1:
                 return before
             if reads == 2:
+                clock.now = 0.2
                 return partial
+            if reads == 3:
+                clock.now = 0.4
+                return navigated
+            clock.now = 1.0
             return navigated
 
         manager._read_action_state = AsyncMock(side_effect=read_state)
         manager._final_action_probe = AsyncMock(return_value=(navigated, None))
 
-        with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
+        with (
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.get_running_loop",
+                return_value=clock,
+            ),
+            patch(
+                "hvbattle.hv_battle_action_manager.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+            self.assertRaises(BattleActionOutcomeUnknownError) as raised,
+        ):
             await manager.click_and_wait_log_locator(
                 "#mkey_3",
-                timeout=0.001,
-                check_interval=1e-9,
+                timeout=1.0,
+                check_interval=0.1,
             )
 
         evidence = raised.exception.recovery_evidence
@@ -470,6 +494,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(evidence.xhr_sent)
         self.assertEqual(evidence.xhr_sent_count, 1)
         self.assertEqual(evidence.post_click_document_id, "document-after")
+        self.assertEqual(reads, 4)
 
     async def test_five_second_same_document_single_xhr_is_recoverable_without_dialog(
         self,
@@ -502,7 +527,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
             await manager.click_and_wait_log_locator(
                 "#ikey_2",
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 
@@ -514,7 +539,8 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(evidence.allows_same_browser_recovery)
         self.assertIsNone(evidence.dialog_category)
         manager._click.assert_awaited_once_with(
-            manager._select_for_single_click.return_value
+            manager._select_for_single_click.return_value,
+            operation_timeout=ANY,
         )
         manager._cleanup_action_monitor.assert_not_awaited()
 
@@ -550,7 +576,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
             await manager.click_and_wait_log_locator(
                 "#ikey_2",
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 
@@ -587,7 +613,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
             await manager.click_and_wait_log_locator(
                 "#mkey_3",
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 
@@ -628,7 +654,8 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         reads = 0
         now = 10.0
 
-        async def slow_click(_element: object) -> None:
+        async def slow_click(_element: object, *, operation_timeout: float) -> None:
+            self.assertLessEqual(operation_timeout, 0.5)
             nonlocal now
             now = 20.0
 
@@ -667,16 +694,17 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         evidence = raised.exception.recovery_evidence
         self.assertIsNotNone(evidence)
         assert evidence is not None
-        self.assertTrue(evidence.matches_server_communication_failure)
+        self.assertFalse(evidence.matches_server_communication_failure)
         self.assertEqual(evidence.action_kind, BattleActionKind.NEXT_FLOOR)
-        self.assertTrue(evidence.xhr_sent)
-        self.assertEqual(evidence.xhr_sent_count, 1)
+        self.assertFalse(evidence.xhr_sent)
+        self.assertEqual(evidence.xhr_sent_count, 0)
         self.assertFalse(evidence.xhr_completed)
         self.assertFalse(evidence.xhr_pending_at_least_five_seconds)
-        self.assertEqual(evidence.post_click_document_id, "document-after")
-        self.assertEqual(reads, 3)
+        self.assertEqual(evidence.post_click_document_id, "unknown")
+        self.assertEqual(reads, 1)
         manager._click.assert_awaited_once_with(
-            manager._select_for_single_click.return_value
+            manager._select_for_single_click.return_value,
+            operation_timeout=ANY,
         )
         manager._cleanup_action_monitor.assert_not_awaited()
 
@@ -767,7 +795,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleActionOutcomeUnknownError) as raised:
             await manager.click_and_wait_transition_locator(
                 "#btcp",
-                timeout=1e-9,
+                timeout=0.005,
                 check_interval=1e-9,
             )
 
@@ -903,6 +931,31 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
         state_store.reset.assert_called_once_with()
 
+    async def test_final_local_acceptance_crossing_deadline_fails_closed(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        old = _recovery_state(document_id="document-before")
+        fresh = _recovery_state()
+        actions.read_recovery_state.side_effect = [old, fresh, fresh, fresh]
+
+        def expire_during_reset() -> None:
+            self.clock.now = 10.0
+
+        state_store.reset.side_effect = expire_during_reset
+
+        recovered = await coordinator.recover(
+            _recovery_evidence(),
+            expected_realm="persistent",
+            auto_reload_checks=2,
+            recovery_timeout=10,
+            stable_checks=2,
+            check_interval=1e-9,
+            probe_timeout=1,
+        )
+
+        self.assertFalse(recovered)
+        actions.clear_page_action_state.assert_awaited_once_with(probe_timeout=1)
+        state_store.reset.assert_called_once_with()
+
     async def test_missing_auto_reload_reloads_current_page_once_then_rebases(
         self,
     ) -> None:
@@ -932,7 +985,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(recovered)
-        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
+        actions.reload_current_page.assert_awaited_once()
         state_store.inspect.assert_not_awaited()
 
     async def test_stalled_single_xhr_reloads_after_one_race_probe_and_rebases(
@@ -957,7 +1010,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(self.clock.now, 10)
         self.assertAlmostEqual(self.clock.now, 1e-9)
         self.assertEqual(actions.read_recovery_state.await_count, 4)
-        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
+        actions.reload_current_page.assert_awaited_once()
         actions.clear_page_action_state.assert_awaited_once_with(probe_timeout=1)
         state_store.inspect.assert_awaited_once()
         state_store.reset.assert_called_once_with()
@@ -1012,7 +1065,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(recovered)
-        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
+        actions.reload_current_page.assert_awaited_once()
 
     async def test_reloaded_shell_can_become_stable_just_before_deadline(self) -> None:
         coordinator, actions, state_store = self._coordinator()
@@ -1046,7 +1099,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(recovered)
         self.assertEqual(self.clock.now, 9.75)
-        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
+        actions.reload_current_page.assert_awaited_once()
         state_store.inspect.assert_awaited_once()
         self.assertEqual(
             state_store.inspect.await_args.kwargs["timeout"],
@@ -1085,7 +1138,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(recovered)
         self.assertEqual(self.clock.now, 10)
-        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
+        actions.reload_current_page.assert_awaited_once()
         actions.clear_page_action_state.assert_not_awaited()
         state_store.inspect.assert_not_awaited()
 
@@ -1116,6 +1169,33 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertFalse(recovered)
+        actions.clear_page_action_state.assert_not_awaited()
+        state_store.inspect.assert_not_awaited()
+
+    async def test_reload_consumes_the_same_recovery_deadline(self) -> None:
+        coordinator, actions, state_store = self._coordinator()
+        actions.read_recovery_state.return_value = _recovery_state(
+            document_id="document-before"
+        )
+
+        async def consume_reload_budget(*, deadline: object) -> None:
+            self.assertAlmostEqual(deadline.remaining(), 1.0)  # type: ignore[attr-defined]
+            self.clock.now += 1.0
+
+        actions.reload_current_page.side_effect = consume_reload_budget
+
+        recovered = await coordinator.recover(
+            _stalled_xhr_evidence(),
+            expected_realm="persistent",
+            recovery_timeout=1,
+            stable_checks=2,
+            check_interval=0.25,
+            probe_timeout=1,
+        )
+
+        self.assertFalse(recovered)
+        actions.reload_current_page.assert_awaited_once()
+        actions.read_recovery_state.assert_awaited_once()
         actions.clear_page_action_state.assert_not_awaited()
         state_store.inspect.assert_not_awaited()
 
@@ -1239,7 +1319,7 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertFalse(recovered)
-        actions.reload_current_page.assert_awaited_once_with(operation_timeout=15.0)
+        actions.reload_current_page.assert_awaited_once()
         actions.clear_page_action_state.assert_not_awaited()
         state_store.reset.assert_not_called()
         recovery_logger.error.assert_called_once_with(
@@ -1309,14 +1389,55 @@ class BattleRecoveryCoordinatorTests(unittest.IsolatedAsyncioTestCase):
                 stable_checks=1,
             )
 
-    async def test_reload_timeout_must_be_positive(self) -> None:
+    async def test_recovery_observation_counts_are_strictly_bounded(self) -> None:
+        coordinator, _actions, _state_store = self._coordinator()
+
+        for argument, value, message in (
+            ("auto_reload_checks", True, "between 1 and 40"),
+            ("auto_reload_checks", 41, "between 1 and 40"),
+            ("stable_checks", True, "between 2 and 40"),
+            ("stable_checks", 41, "between 2 and 40"),
+        ):
+            with (
+                self.subTest(argument=argument, value=value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                await coordinator.recover(
+                    _recovery_evidence(),
+                    expected_realm="persistent",
+                    **{argument: value},
+                )
+
+    async def test_recovery_timeout_must_be_positive(self) -> None:
         coordinator, _actions, _state_store = self._coordinator()
 
         with self.assertRaisesRegex(ValueError, "timeouts"):
             await coordinator.recover(
                 _recovery_evidence(),
                 expected_realm="persistent",
-                reload_timeout=0,
+                recovery_timeout=0,
+            )
+
+    async def test_recovery_timeout_cannot_hide_failure_beyond_ten_seconds(
+        self,
+    ) -> None:
+        coordinator, _actions, _store = self._coordinator()
+
+        with self.assertRaisesRegex(ValueError, "must not exceed 10 seconds"):
+            await coordinator.recover(
+                _recovery_evidence(),
+                expected_realm="persistent",
+                recovery_timeout=10.01,
+            )
+
+    async def test_probe_timeout_cannot_exceed_protocol_command_cap(self) -> None:
+        coordinator, _actions, _store = self._coordinator()
+
+        with self.assertRaisesRegex(ValueError, "must not exceed 5 seconds"):
+            await coordinator.recover(
+                _recovery_evidence(),
+                expected_realm="persistent",
+                probe_timeout=5.01,
             )
 
     async def test_changed_but_untrusted_document_fails_without_second_reload(
@@ -1556,7 +1677,12 @@ class _RunnerSession:
     async def resolve_ponychart(self) -> bool:
         return False
 
-    async def prepare_turn_state(self) -> BattleTurnState:
+    async def prepare_turn_state(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> BattleTurnState:
+        del timeout
         self.turn += 1
         return BattleTurnState(BattleTurnPhase.ACTIVE)
 

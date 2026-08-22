@@ -28,12 +28,15 @@ from .contracts import (
     BattleStepResult,
     BattleStopped,
     BattleTurnPhase,
+    BattleTurnState,
     TurnDecision,
 )
 from .session import BattleSession
 from .strategy import BattleStrategy
 
 logger = setup_logger(__name__)
+
+_MAX_STATE_READINESS_TIMEOUT_SECONDS = 5.0
 
 
 def _not_paused() -> bool:
@@ -55,20 +58,13 @@ class BattleRunner:
         strategy: BattleStrategy,
         *,
         pause_requested: Callable[[], bool] = _not_paused,
-        timeout_retries: int = 3,
         idle_delay: float = 2,
-        retry_delay: float = 5,
-        state_readiness_timeout: float = 30,
-        state_readiness_retry_delay: float = 2,
-        transition_checks: int = 3,
+        state_readiness_timeout: float = _MAX_STATE_READINESS_TIMEOUT_SECONDS,
+        state_readiness_retry_delay: float = 0.25,
         challenge_poll_interval: float = 0.25,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if timeout_retries < 1:
-            raise ValueError("timeout_retries must be at least 1")
-        if transition_checks < 1:
-            raise ValueError("transition_checks must be at least 1")
         if (
             not isinstance(challenge_poll_interval, (int, float))
             or isinstance(challenge_poll_interval, bool)
@@ -76,15 +72,23 @@ class BattleRunner:
             or challenge_poll_interval <= 0
         ):
             raise ValueError("challenge_poll_interval must be finite and positive")
-        if idle_delay < 0:
-            raise ValueError("idle_delay must not be negative")
+        if (
+            not isinstance(idle_delay, int | float)
+            or isinstance(idle_delay, bool)
+            or not math.isfinite(idle_delay)
+            or idle_delay < 0
+        ):
+            raise ValueError("idle_delay must be finite and non-negative")
         if (
             not isinstance(state_readiness_timeout, (int, float))
             or isinstance(state_readiness_timeout, bool)
             or not math.isfinite(state_readiness_timeout)
-            or state_readiness_timeout < 0
+            or state_readiness_timeout <= 0
+            or state_readiness_timeout > _MAX_STATE_READINESS_TIMEOUT_SECONDS
         ):
-            raise ValueError("state_readiness_timeout must be finite and non-negative")
+            raise ValueError(
+                "state_readiness_timeout must be finite and in (0, 5] seconds"
+            )
         if (
             not isinstance(state_readiness_retry_delay, (int, float))
             or isinstance(state_readiness_retry_delay, bool)
@@ -99,12 +103,9 @@ class BattleRunner:
         self.session = session
         self.strategy = strategy
         self.pause_requested = pause_requested
-        self.timeout_retries = timeout_retries
         self.idle_delay = idle_delay
-        self.retry_delay = retry_delay
         self.state_readiness_timeout = float(state_readiness_timeout)
         self.state_readiness_retry_delay = float(state_readiness_retry_delay)
-        self.transition_checks = transition_checks
         self.challenge_poll_interval = challenge_poll_interval
         self._sleep = sleep
         self._clock = clock
@@ -112,16 +113,11 @@ class BattleRunner:
         self._strategy_initialized = False
         self._strategy_initialization_error: BattleInterruptedError | None = None
         self._is_isekai: bool | None = None
-        self._retry_count = 0
-        self._state_readiness_started_at: float | None = None
+        self._state_readiness_expires_at: float | None = None
         self._state_readiness_observations = 0
-        self._state_readiness_diagnostic_captured = False
-        self._state_readiness_diagnostic_path: str | None = None
-        self._state_readiness_diagnostic_error_type: str | None = None
         self._recovery_pending_receipt = False
         self._completed: BattleCompleted | None = None
         self._transition_pending = False
-        self._transition_checks_completed = 0
         self._step_lock = asyncio.Lock()
 
     async def step(self) -> BattleStepResult:
@@ -179,7 +175,6 @@ class BattleRunner:
         self._strategy_initialized = False
         self._strategy_initialization_error = None
         self._is_isekai = None
-        self._retry_count = 0
         self._clear_state_readiness(log_recovery=False)
         self._recovery_pending_receipt = False
         self._completed = None
@@ -193,20 +188,25 @@ class BattleRunner:
 
         while True:
             try:
-                pause_result = await self._service_ponychart_or_pause()
-                if pause_result is not None:
-                    return pause_result
-                if await self.session.resolve_ponychart():
-                    return self._confirmed_progress(
-                        BattleStepProgressKind.PONYCHART_RESOLVED
+                if self._state_readiness_expires_at is None:
+                    pause_result = await self._service_ponychart_or_pause()
+                    if pause_result is not None:
+                        return pause_result
+                    self._state_readiness_expires_at = (
+                        self._read_clock() + self.state_readiness_timeout
                     )
-
-                prepared = await self.session.prepare_turn_state()
+                if self._transition_pending and self._state_readiness_remaining() <= 0:
+                    raise self._missing_completion_evidence()
+                try:
+                    prepared = await self._probe_pending_state_readiness()
+                except BattleStateReadinessError as error:
+                    if self._transition_pending:
+                        raise self._missing_completion_evidence() from error
+                    raise
                 if prepared.phase is BattleTurnPhase.NOT_READY:
-                    self._retry_count = 0
                     return await self._defer_state_not_ready()
-                self._clear_state_readiness()
                 if prepared.phase is not BattleTurnPhase.ABSENT:
+                    self._clear_state_readiness()
                     self._clear_transition_confirmation()
                 if await self.session.resolve_ponychart():
                     return self._confirmed_progress(
@@ -218,58 +218,36 @@ class BattleRunner:
                     # code is allowed to act.
                     continue
                 if prepared.phase is BattleTurnPhase.COMPLETE:
-                    pause_result = await self._service_ponychart_or_pause()
+                    pause_result = self._defer_if_paused()
                     if pause_result is not None:
                         return pause_result
                     return await self._acknowledge_completion()
                 if prepared.phase is BattleTurnPhase.ABSENT:
                     if self.session.battle_completion_observed:
+                        self._clear_state_readiness()
                         self._clear_transition_confirmation()
-                        pause_result = await self._service_ponychart_or_pause()
+                        pause_result = self._defer_if_paused()
                         if pause_result is not None:
                             return pause_result
                         return await self._acknowledge_completion()
                     if not self._transition_pending:
                         self._transition_pending = True
-                        self._transition_checks_completed = 0
-                        return BattleStepIdle(
-                            retry_after=self.idle_delay,
-                            reason=BattleStepIdleReason.TRANSITION_CONFIRMATION,
-                        )
-                    if await self.session.is_in_battle():
-                        self._clear_transition_confirmation()
-                        continue
-                    if self.session.battle_completion_observed:
-                        self._clear_transition_confirmation()
-                        pause_result = await self._service_ponychart_or_pause()
-                        if pause_result is not None:
-                            return pause_result
-                        return await self._acknowledge_completion()
-                    self._transition_checks_completed += 1
-                    if self._transition_checks_completed >= self.transition_checks:
-                        raise BattleInterruptedError(
-                            "Battle page disappeared without positive completion "
-                            "evidence",
-                            diagnostic_code="battle.completion-evidence-missing",
-                        )
+                    remaining = self._state_readiness_remaining()
+                    if remaining <= 0:
+                        raise self._missing_completion_evidence()
                     return BattleStepIdle(
-                        retry_after=self.idle_delay,
+                        retry_after=min(self.idle_delay, remaining),
                         reason=BattleStepIdleReason.TRANSITION_CONFIRMATION,
                     )
                 if prepared.phase is BattleTurnPhase.NEXT_FLOOR:
-                    pause_result = await self._service_ponychart_or_pause()
+                    pause_result = self._defer_if_paused()
                     if pause_result is not None:
                         return pause_result
-                    if await self.session.resolve_ponychart():
-                        return self._confirmed_progress(
-                            BattleStepProgressKind.PONYCHART_RESOLVED
-                        )
                     if not await self.session.go_next_floor():
                         raise TimeoutError(
                             "Next-floor control disappeared before progression"
                         )
                     self._recovery_pending_receipt = False
-                    self._retry_count = 0
                     return self._confirmed_progress(
                         BattleStepProgressKind.NEXT_FLOOR_CONFIRMED
                     )
@@ -278,19 +256,14 @@ class BattleRunner:
                         f"Unsupported battle turn phase: {prepared.phase!r}"
                     )
 
-                pause_result = await self._service_ponychart_or_pause()
+                pause_result = self._defer_if_paused()
                 if pause_result is not None:
                     return pause_result
-                if await self.session.resolve_ponychart():
-                    return self._confirmed_progress(
-                        BattleStepProgressKind.PONYCHART_RESOLVED
-                    )
 
                 await self._ensure_strategy_initialized()
 
                 decision = await self.strategy.take_turn(self.session)
                 if decision is TurnDecision.STOP:
-                    self._retry_count = 0
                     return BattleStopped(
                         is_isekai=self._is_isekai,
                         decision_count=self._decision_count(),
@@ -298,13 +271,11 @@ class BattleRunner:
                         total_rounds=self._local_counter("total_rounds"),
                     )
                 if decision is TurnDecision.IDLE:
-                    self._retry_count = 0
                     return BattleStepIdle(retry_after=self.idle_delay)
                 if decision is TurnDecision.ACTED:
                     # A normally returned ACTED decision has already waited
                     # for its authoritative receipt through BattleSession.
                     self._recovery_pending_receipt = False
-                    self._retry_count = 0
                     return self._confirmed_progress(
                         BattleStepProgressKind.TURN_ACTION_CONFIRMED
                     )
@@ -321,30 +292,16 @@ class BattleRunner:
                     diagnostic_code="battle.browser-operation-timeout",
                 ) from error
             except TimeoutError as error:
-                self._retry_count += 1
-                if self._retry_count >= self.timeout_retries:
-                    logger.error(
-                        "Battle turn timed out; retry limit reached (%d/%d) "
-                        "error_type=%s",
-                        self._retry_count,
-                        self.timeout_retries,
-                        type(error).__name__,
-                    )
-                    raise BattleInterruptedError(
-                        "Battle outcome is unknown after a turn timeout",
-                        diagnostic_code="battle.turn-timeout",
-                    ) from error
-                logger.warning(
-                    "Battle turn timed out; retrying (%d/%d) error_type=%s",
-                    self._retry_count,
-                    self.timeout_retries,
+                logger.error(
+                    "Battle turn timed out; no unclassified timeout is retried "
+                    "error_type=%s",
                     type(error).__name__,
                 )
                 logger.debug("Battle turn timeout error detail", exc_info=True)
-                return BattleStepIdle(
-                    retry_after=self.retry_delay,
-                    reason=BattleStepIdleReason.RETRYABLE_TIMEOUT,
-                )
+                raise BattleInterruptedError(
+                    "Battle outcome is unknown after a turn timeout",
+                    diagnostic_code="battle.turn-timeout",
+                ) from error
 
     async def _ensure_presence_initialized(self) -> BattleStepResult | None:
         if self._presence_initialized:
@@ -411,17 +368,59 @@ class BattleRunner:
             raise RuntimeError("BattleRunner clock returned a non-finite value")
         return now
 
+    def _state_readiness_error(self) -> BattleStateReadinessError:
+        logger.error(
+            "Battle turn state readiness deadline exhausted observations=%d "
+            "diagnostic_skipped=deadline-exhausted",
+            self._state_readiness_observations,
+        )
+        return BattleStateReadinessError(
+            observation_count=self._state_readiness_observations,
+            diagnostic_path=None,
+            diagnostic_error_type=None,
+        )
+
+    def _state_readiness_remaining(self, *, now: float | None = None) -> float:
+        expires_at = self._state_readiness_expires_at
+        if expires_at is None:
+            raise RuntimeError("Battle state readiness deadline is not active")
+        observed_at = self._read_clock() if now is None else now
+        return max(0.0, expires_at - observed_at)
+
+    async def _probe_pending_state_readiness(self) -> BattleTurnState:
+        """Run one bounded probe without starting work at or after expiry."""
+
+        remaining = self._state_readiness_remaining()
+        if remaining <= 0:
+            raise self._state_readiness_error()
+        try:
+            prepared = await self.session.prepare_turn_state(timeout=remaining)
+        except ZendriverOperationTimeout:
+            raise
+        except TimeoutError:
+            if self._state_readiness_remaining() <= 0:
+                self._state_readiness_observations += 1
+                raise self._state_readiness_error() from None
+            raise
+        if self._state_readiness_remaining() <= 0:
+            # A result that arrives at the exact boundary is late. In
+            # particular, do not accept an ACTIVE result from an over-budget
+            # final probe and allow policy to mutate the page.
+            self._state_readiness_observations += 1
+            raise self._state_readiness_error()
+        return prepared
+
     async def _defer_state_not_ready(self) -> BattleStepIdle:
         now = self._read_clock()
-        if self._state_readiness_started_at is None:
-            self._state_readiness_started_at = now
+        if self._state_readiness_expires_at is None:
+            raise RuntimeError("Battle state readiness deadline was not started")
+        if self._state_readiness_observations == 0:
             logger.info(
                 "Battle document is present; waiting for turn state readiness",
                 extra={"activity": "Battle"},
             )
         self._state_readiness_observations += 1
-        elapsed = max(0.0, now - self._state_readiness_started_at)
-        remaining = max(0.0, self.state_readiness_timeout - elapsed)
+        remaining = self._state_readiness_remaining(now=now)
         if remaining > 0:
             logger.debug(
                 "Battle turn state is not ready observation=%d remaining=%.1fs",
@@ -433,47 +432,7 @@ class BattleRunner:
                 reason=BattleStepIdleReason.STATE_NOT_READY,
             )
 
-        if not self._state_readiness_diagnostic_captured:
-            self._state_readiness_diagnostic_captured = True
-            (
-                self._state_readiness_diagnostic_path,
-                self._state_readiness_diagnostic_error_type,
-            ) = await self._capture_state_readiness_diagnostic()
-        logger.error(
-            "Battle turn state readiness deadline exhausted "
-            "observations=%d diagnostic_saved=%s diagnostic_error_type=%s",
-            self._state_readiness_observations,
-            self._state_readiness_diagnostic_path is not None,
-            self._state_readiness_diagnostic_error_type,
-        )
-        raise BattleStateReadinessError(
-            observation_count=self._state_readiness_observations,
-            diagnostic_path=self._state_readiness_diagnostic_path,
-            diagnostic_error_type=self._state_readiness_diagnostic_error_type,
-        )
-
-    async def _capture_state_readiness_diagnostic(
-        self,
-    ) -> tuple[str | None, str | None]:
-        try:
-            path = await self.session.save_page_diagnostic("battle_state_not_ready")
-            return (None if path is None else str(path)), None
-        except Exception as error:
-            if contains_log_persistence_error(error) or is_browser_generation_error(
-                error
-            ):
-                raise
-            logger.warning(
-                "Battle state readiness diagnostic capture failed "
-                "kind=%s error_type=%s",
-                "battle_state_not_ready",
-                type(error).__name__,
-            )
-            logger.debug(
-                "Battle state readiness diagnostic capture traceback",
-                exc_info=True,
-            )
-            return None, type(error).__name__
+        raise self._state_readiness_error()
 
     def _clear_state_readiness(self, *, log_recovery: bool = True) -> None:
         if log_recovery and self._state_readiness_observations:
@@ -482,11 +441,8 @@ class BattleRunner:
                 self._state_readiness_observations,
                 extra={"activity": "Battle"},
             )
-        self._state_readiness_started_at = None
+        self._state_readiness_expires_at = None
         self._state_readiness_observations = 0
-        self._state_readiness_diagnostic_captured = False
-        self._state_readiness_diagnostic_path = None
-        self._state_readiness_diagnostic_error_type = None
 
     async def _reconcile_unknown_action(
         self,
@@ -521,7 +477,6 @@ class BattleRunner:
                     )
         if recovered:
             self._recovery_pending_receipt = True
-            self._retry_count = 0
             logger.warning(
                 "Battle action outcome was unknown after a verified receipt-loss "
                 "incident; continuing from reloaded server state"
@@ -603,7 +558,6 @@ class BattleRunner:
         self,
         kind: BattleStepProgressKind,
     ) -> BattleStepProgress:
-        self._retry_count = 0
         self._clear_state_readiness()
         return BattleStepProgress(
             kind=kind,
@@ -630,7 +584,13 @@ class BattleRunner:
 
     def _clear_transition_confirmation(self) -> None:
         self._transition_pending = False
-        self._transition_checks_completed = 0
+
+    @staticmethod
+    def _missing_completion_evidence() -> BattleInterruptedError:
+        return BattleInterruptedError(
+            "Battle page disappeared without positive completion evidence",
+            diagnostic_code="battle.completion-evidence-missing",
+        )
 
     async def _service_ponychart_or_pause(
         self,
@@ -639,6 +599,11 @@ class BattleRunner:
 
         if await self.session.resolve_ponychart():
             return self._confirmed_progress(BattleStepProgressKind.PONYCHART_RESOLVED)
+        return self._defer_if_paused()
+
+    def _defer_if_paused(self) -> BattleStepIdle | None:
+        """Read the local pause gate without issuing another browser probe."""
+
         paused = self.pause_requested()
         if not isinstance(paused, bool):
             raise TypeError("pause_requested() must return bool")

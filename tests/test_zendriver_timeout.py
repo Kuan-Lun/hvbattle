@@ -34,7 +34,7 @@ class ZendriverTimeoutTests(unittest.IsolatedAsyncioTestCase):
         waiter = asyncio.create_task(
             wait_for_zendriver(
                 protocol_future,
-                timeout=60,
+                timeout=5,
                 owner=SimpleNamespace(),
             )
         )

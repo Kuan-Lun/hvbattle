@@ -36,7 +36,7 @@ class BattleStateStoreTests(unittest.IsolatedAsyncioTestCase):
         store = BattleStateStore(driver)
 
         with self.assertRaises(TimeoutError):
-            await store._get_content(timeout=0)
+            await store._get_content(timeout=0.001)
 
         self.assertFalse(content.cancelled())
         content.set_result("<html>late</html>")
@@ -84,7 +84,8 @@ class BattleStateStoreTests(unittest.IsolatedAsyncioTestCase):
             content = await store._get_content(timeout=1)
 
         self.assertEqual(content, "<html></html>")
-        self.assertEqual(observed_timeouts[0], 1)
+        self.assertGreater(observed_timeouts[0], 0)
+        self.assertLessEqual(observed_timeouts[0], 1)
         self.assertGreater(observed_timeouts[1], 0)
         self.assertLess(observed_timeouts[1], 1)
         self.assertEqual(observed_owners, [driver.page, driver.page])

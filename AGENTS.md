@@ -12,3 +12,9 @@ directory.
   editable checkouts manually, in dependency order, only after rebuilding the
   environment.
 - Automated tests must remain offline and must never start or flee a battle.
+
+## Git Workflow
+
+- Do not create or switch to a development branch.
+- Perform all development work directly on the repository's primary branch
+  (`main`).

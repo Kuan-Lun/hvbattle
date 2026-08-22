@@ -9,8 +9,9 @@ class ProjectMetadataTests(unittest.TestCase):
         with project_path.open("rb") as project_file:
             project = tomllib.load(project_file)["project"]
 
-        self.assertEqual("0.11.4", project["version"])
-        self.assertIn("hvbrowser>=0.9.2,<0.10", project["dependencies"])
+        self.assertEqual("0.11.5", project["version"])
+        self.assertIn("hvbrowser>=0.9.3,<0.10", project["dependencies"])
+        self.assertIn("hv-bie>=0.7.3,<0.8", project["dependencies"])
         self.assertIn(
             "ponychart-classifier>=0.12.1,<0.13",
             project["dependencies"],

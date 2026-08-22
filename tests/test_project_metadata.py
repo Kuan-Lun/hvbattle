@@ -4,12 +4,17 @@ from pathlib import Path
 
 
 class ProjectMetadataTests(unittest.TestCase):
-    def test_hvbrowser_compatibility_range_is_exact(self) -> None:
+    def test_release_version_and_compatibility_ranges_are_exact(self) -> None:
         project_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
         with project_path.open("rb") as project_file:
             project = tomllib.load(project_file)["project"]
 
-        self.assertIn("hvbrowser>=0.9.1,<0.10", project["dependencies"])
+        self.assertEqual("0.11.4", project["version"])
+        self.assertIn("hvbrowser>=0.9.2,<0.10", project["dependencies"])
+        self.assertIn(
+            "ponychart-classifier>=0.12.1,<0.13",
+            project["dependencies"],
+        )
 
 
 if __name__ == "__main__":

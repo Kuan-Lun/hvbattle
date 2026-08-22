@@ -3,7 +3,11 @@ name: Publish to PyPI
 on:
   push:
     branches: [main]
-    paths: [pyproject.toml]
+    paths:
+      - .github/workflows/publish.yml
+      - pyproject.toml
+      - src/**
+      - tests/**
 
 concurrency:
   group: publish-pypi
@@ -18,57 +22,68 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
-      - name: Install version checker
-        run: python -m pip install packaging
+      - name: Install release tooling
+        run: >-
+          python -m pip install
+          "build==1.5.0"
+          "check-wheel-contents==0.6.3"
+          "packaging==26.3"
+          "twine==7.0.0"
 
-      - name: Check version bump
+      - name: Check whether this version is unpublished
         id: version
-        env:
-          BEFORE_SHA: ${{ github.event.before }}
         run: |
-          CURRENT=$(python -c "
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
           import tomllib
-          with open('pyproject.toml', 'rb') as f:
-              print(tomllib.load(f)['project']['version'])
-          ")
-          if git cat-file -e "${BEFORE_SHA}:pyproject.toml" 2>/dev/null; then
-            PREVIOUS=$(git show "${BEFORE_SHA}:pyproject.toml" | python -c "
-          import tomllib, sys
-          print(tomllib.load(sys.stdin.buffer)['project']['version'])
-            ")
-          else
-            PREVIOUS=""
-          fi
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "previous=$PREVIOUS" >> "$GITHUB_OUTPUT"
-          if [ -z "$PREVIOUS" ]; then
-            echo "bumped=true" >> "$GITHUB_OUTPUT"
-          elif [ "$CURRENT" != "$PREVIOUS" ]; then
-            python -c "
-          from packaging.version import Version
-          current, previous = Version('$CURRENT'), Version('$PREVIOUS')
-          exit(0 if current > previous else 1)
-          "
-            echo "bumped=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "bumped=false" >> "$GITHUB_OUTPUT"
-          fi
+          import urllib.error
+          import urllib.request
 
-      - name: Install project and build tooling
-        if: steps.version.outputs.bumped == 'true'
+          from packaging.version import Version
+
+          with open("pyproject.toml", "rb") as project_file:
+              current = Version(tomllib.load(project_file)["project"]["version"])
+
+          release_url = f"https://pypi.org/pypi/hvbattle/{current}/json"
+          try:
+              urllib.request.urlopen(release_url, timeout=30).close()
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          else:
+              print(f"current={current}")
+              print("publish=false")
+              raise SystemExit
+
+          with urllib.request.urlopen(
+              "https://pypi.org/pypi/hvbattle/json",
+              timeout=30,
+          ) as response:
+              published = Version(json.load(response)["info"]["version"])
+
+          if current <= published:
+              raise SystemExit(
+                  f"Unpublished version {current} must exceed latest release {published}"
+              )
+
+          print(f"current={current}")
+          print(f"published={published}")
+          print("publish=true")
+          PY
+
+      - name: Install project
+        if: steps.version.outputs.publish == 'true'
         run: |
-          python -m pip install --upgrade build
           for attempt in 1 2 3 4 5; do
-            if python -m pip install --editable ".[dev]"; then
+            if python -m pip install --no-cache-dir --editable ".[dev]"; then
               break
             fi
             if [ "$attempt" -eq 5 ]; then
@@ -78,23 +93,26 @@ jobs:
           done
 
       - name: Check formatting and lint
-        if: steps.version.outputs.bumped == 'true'
+        if: steps.version.outputs.publish == 'true'
         run: |
           python -m black --check src/hvbattle tests
           python -m ruff check src/hvbattle tests
 
       - name: Check types
-        if: steps.version.outputs.bumped == 'true'
+        if: steps.version.outputs.publish == 'true'
         run: python -m mypy src/hvbattle
 
       - name: Run tests
-        if: steps.version.outputs.bumped == 'true'
+        if: steps.version.outputs.publish == 'true'
         run: python -m pytest
 
       - name: Build distributions
-        if: steps.version.outputs.bumped == 'true'
-        run: python -m build
+        if: steps.version.outputs.publish == 'true'
+        run: |
+          python -m build
+          python -m twine check dist/*
+          check-wheel-contents dist/*.whl
 
       - name: Publish
-        if: steps.version.outputs.bumped == 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
+        if: steps.version.outputs.publish == 'true'
+        uses: pypa/gh-action-pypi-publish@v1.14.2

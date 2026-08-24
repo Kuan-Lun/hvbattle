@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import math
 import threading
 import time
@@ -18,7 +19,6 @@ from hvbrowser.runtime import (
     ZendriverOperationTimeout,
     is_browser_generation_error,
     notify,
-    setup_logger,
     wait_for_zendriver,
 )
 from zendriver import cdp
@@ -32,13 +32,24 @@ from ._ponychart_workers import (
     PonyChartWorkerOwnershipError,
 )
 from ._timing import PROTOCOL_TIMEOUT_SECONDS, SemanticDeadline, protocol_timeout
-from .contracts import BattleInterruptedError, PonyChartResolutionOutcome
+from .audit import (
+    ActionNotSubmittedReason,
+    ActionOutcomeUnknownReason,
+    ActionReceiptEvidence,
+    AuditEventBus,
+    _ActionAuditTrail,
+)
+from .contracts import (
+    BattleActionKind,
+    BattleInterruptedError,
+    PonyChartResolutionOutcome,
+)
 from .ponychart_model_store import (
     LoadedPonyChartGeneration,
     PonyChartRefreshOutcome,
 )
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _PONYCHART_MUTATION_TIMEOUT_SECONDS = PROTOCOL_TIMEOUT_SECONDS
 _PONYCHART_INFERENCE_DEADLINE_SECONDS = 5.0
@@ -1131,6 +1142,18 @@ class _PonyChartPageDiagnostic:
         )
 
     @property
+    def proves_no_submission(self) -> bool:
+        """Whether the page monitor proves the submit boundary was untouched."""
+
+        return bool(
+            self.submit_invocation_count == 0
+            and self.command_click_event_count == 0
+            and self.command_form_submit_event_count == 0
+            and self.command_submitter_match_count == 0
+            and self.command_form_submit_prevented_count == 0
+        )
+
+    @property
     def transition_follows_submit(self) -> bool:
         transition = self.transition_elapsed_ms
         form_submit = self.form_submit_event_elapsed_ms
@@ -2069,7 +2092,10 @@ class PonyChart:
         image_directory: Path | None = None,
         inference_owner: PonyChartInferenceOwner | None = None,
         retention_owner: PonyChartRetentionOwner | None = None,
+        audit_event_bus: AuditEventBus,
     ) -> None:
+        if not isinstance(audit_event_bus, AuditEventBus):
+            raise TypeError("audit_event_bus must be AuditEventBus")
         self.hvdriver = driver
         self._image_directory = image_directory
         self._inference_owner = (
@@ -2078,6 +2104,7 @@ class PonyChart:
         self._retention_owner = (
             retention_owner if retention_owner is not None else _retention_owner
         )
+        self.audit_event_bus = audit_event_bus
         self._image_binding_lock = asyncio.Lock()
         self._network_page: Any | None = None
         self._network_handlers: tuple[tuple[type[Any], Any], ...] = ()
@@ -2818,6 +2845,7 @@ class PonyChart:
         *,
         monitor_id: str,
         deadline: SemanticDeadline,
+        audit_trail: _ActionAuditTrail | None = None,
     ) -> bool:
         """Wait for a verified DOM contract, then select and submit exactly once.
 
@@ -2831,6 +2859,15 @@ class PonyChart:
             monitor_id=monitor_id,
             predicted_labels=labels,
         )
+        trail = (
+            audit_trail
+            if audit_trail is not None
+            else _ActionAuditTrail(
+                self.audit_event_bus,
+                monitor_id,
+                BattleActionKind.PONYCHART,
+            )
+        )
         last_status: _PonyChartSubmitStatus | None = None
         while deadline.remaining() > 0:
             try:
@@ -2840,6 +2877,7 @@ class PonyChart:
                 operation_timeout = protocol_timeout(
                     _PONYCHART_MUTATION_TIMEOUT_SECONDS
                 )
+                trail.record_intent()
                 raw = await wait_for_zendriver(
                     self.page.evaluate(script),
                     timeout=operation_timeout,
@@ -2871,6 +2909,8 @@ class PonyChart:
                     "PonyChart answer submission returned an invalid acknowledgement",
                     diagnostic_code="battle.ponychart.submit-outcome-unknown",
                 ) from error
+            if diagnostic.has_exact_submit_evidence:
+                trail.mark_submitted()
             if status is not last_status or status in {
                 _PonyChartSubmitStatus.SUBMITTED,
                 _PonyChartSubmitStatus.CHALLENGE_ABSENT,
@@ -2883,6 +2923,8 @@ class PonyChart:
                 last_status = status
 
             if status is _PonyChartSubmitStatus.CHALLENGE_ABSENT:
+                if diagnostic.proves_no_submission:
+                    trail.mark_not_submitted(ActionNotSubmittedReason.CHALLENGE_EXPIRED)
                 return False
             if status is _PonyChartSubmitStatus.SUBMITTED:
                 if (
@@ -2901,6 +2943,9 @@ class PonyChart:
                 )
                 continue
 
+            if diagnostic.proves_no_submission:
+                trail.mark_not_submitted(ActionNotSubmittedReason.COMMAND_REJECTED)
+
             diagnostic_code = _PONYCHART_SUBMIT_DIAGNOSTIC_CODES.get(status)
             if diagnostic_code is None:
                 diagnostic_code = "battle.ponychart.submit-outcome-unknown"
@@ -2914,6 +2959,8 @@ class PonyChart:
             timeout_status,
             "battle.ponychart.submit-outcome-unknown",
         )
+        if trail.intent_recorded and not trail.resolved:
+            trail.mark_not_submitted(ActionNotSubmittedReason.COMMAND_REJECTED)
         raise BattleInterruptedError(
             f"PonyChart did not become submit-ready: {timeout_status.value}",
             diagnostic_code=diagnostic_code,
@@ -3151,6 +3198,11 @@ class PonyChart:
                 "battle.ponychart.expired-before-monitor",
             )
             return PonyChartResolutionOutcome.EXPIRED_WITHOUT_SUBMISSION
+        audit_trail = _ActionAuditTrail(
+            self.audit_event_bus,
+            monitor_id,
+            BattleActionKind.PONYCHART,
+        )
         image: bytes | None = None
         try:
             if not self.hvdriver.headless:
@@ -3190,10 +3242,12 @@ class PonyChart:
                 ) from error
 
             try:
+                audit_trail.record_intent()
                 submitted = await self._select_and_submit_answer(
                     labels,
                     monitor_id=monitor_id,
                     deadline=receipt_context.deadline,
+                    audit_trail=audit_trail,
                 )
             except BattleInterruptedError as error:
                 safe_pre_submit_codes = {
@@ -3203,6 +3257,20 @@ class PonyChart:
                         | _PONYCHART_SAFE_PRE_SUBMIT_STOP_STATUSES
                     )
                 }
+                if audit_trail.intent_recorded and not audit_trail.resolved:
+                    try:
+                        await self._wait_for_challenge_receipt(
+                            receipt_context,
+                            deadline=receipt_context.expiration_classification_deadline,
+                        )
+                    except Exception as reconciliation_error:
+                        if is_browser_generation_error(reconciliation_error):
+                            raise
+                    else:
+                        audit_trail.confirm_reconciliation(
+                            ActionReceiptEvidence.PONYCHART_SUBMISSION_TRANSITION
+                        )
+                        return PonyChartResolutionOutcome.SUBMISSION_CONFIRMED
                 if (
                     error.diagnostic_code in safe_pre_submit_codes
                     and await self._reconcile_natural_expiration(
@@ -3210,12 +3278,20 @@ class PonyChart:
                         deadline=receipt_context.expiration_classification_deadline,
                     )
                 ):
+                    if audit_trail.intent_recorded and not audit_trail.resolved:
+                        audit_trail.mark_not_submitted(
+                            ActionNotSubmittedReason.CHALLENGE_EXPIRED
+                        )
                     return PonyChartResolutionOutcome.EXPIRED_WITHOUT_SUBMISSION
                 raise
             if submitted:
+                audit_trail.mark_submitted()
                 await self._wait_for_challenge_receipt(
                     receipt_context,
                     deadline=receipt_context.expiration_classification_deadline,
+                )
+                audit_trail.confirm_receipt(
+                    ActionReceiptEvidence.PONYCHART_SUBMISSION_TRANSITION
                 )
                 logger.debug("PonyChart submitted resolution confirmed")
                 return PonyChartResolutionOutcome.SUBMISSION_CONFIRMED
@@ -3223,10 +3299,20 @@ class PonyChart:
                 receipt_context,
                 deadline=receipt_context.expiration_classification_deadline,
             ):
+                if audit_trail.intent_recorded and not audit_trail.resolved:
+                    audit_trail.mark_not_submitted(
+                        ActionNotSubmittedReason.CHALLENGE_EXPIRED
+                    )
                 return PonyChartResolutionOutcome.EXPIRED_WITHOUT_SUBMISSION
             raise PonyChartResolutionError(
                 "PonyChart disappeared before an answer submission was observed"
             )
+        except BaseException:
+            if audit_trail.intent_recorded and not audit_trail.resolved:
+                audit_trail.mark_outcome_unknown(
+                    ActionOutcomeUnknownReason.PONYCHART_RECEIPT_MISSING
+                )
+            raise
         finally:
             if image is not None:
                 await self._retain_pony_chart_image(image)

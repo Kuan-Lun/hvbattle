@@ -1,6 +1,7 @@
 """State inspection and atomic actions for one HentaiVerse battle session."""
 
 import asyncio
+import logging
 import math
 from collections.abc import Awaitable
 from dataclasses import dataclass
@@ -15,12 +16,16 @@ from hvbrowser import (
 )
 from hvbrowser.runtime import (
     is_browser_generation_error,
-    setup_logger,
     wait_for_zendriver,
 )
 from zendriver import cdp
 
 from ._timing import PROTOCOL_TIMEOUT_SECONDS, SemanticDeadline, protocol_timeout
+from .audit import (
+    ActionReceiptEvidence,
+    ActionReconciliationConfirmedAuditEvent,
+    AuditEventBus,
+)
 from .battle_launcher import BattleLauncher
 from .battle_state import BattleStateStore
 from .contracts import (
@@ -43,7 +48,7 @@ from .hv_battle_ponychart import PonyChart, preload_ponychart_classifier
 from .hv_battle_skill_manager import SkillManager
 from .recovery import ActionDialogTracker, BattleRecoveryCoordinator
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _BATTLE_PHASE_ACTIVE = "active"
 _BATTLE_PHASE_COMPLETE = "complete"
@@ -120,8 +125,11 @@ class BattleSession:
         auto_accept_dialogs: bool = False,
         hentaiverse: HentaiVerseSession | None = None,
         ponychart_image_directory: str | Path | None = None,
+        audit_event_bus: AuditEventBus,
         **kwargs: Any,
     ) -> None:
+        if not isinstance(audit_event_bus, AuditEventBus):
+            raise TypeError("audit_event_bus must be AuditEventBus")
         if hentaiverse is not None and (args or kwargs):
             raise TypeError(
                 "Browser options cannot be combined with an injected "
@@ -133,6 +141,7 @@ class BattleSession:
             else HentaiVerseSession(*args, **kwargs)
         )
         self.auto_accept_dialogs = auto_accept_dialogs
+        self.audit_event_bus = audit_event_bus
         image_directory = (
             Path(ponychart_image_directory)
             if ponychart_image_directory is not None
@@ -141,10 +150,12 @@ class BattleSession:
         self._ponychart = PonyChart(
             self.hentaiverse.browser,
             image_directory=image_directory,
+            audit_event_bus=self.audit_event_bus,
         )
         self._launcher = BattleLauncher(
             self.hentaiverse.browser,
             self.hentaiverse.realm,
+            audit_event_bus=self.audit_event_bus,
         )
         self.battle_state: BattleStateStore | None = None
         self.element_action_manager: ElementActionManager | None = None
@@ -188,6 +199,11 @@ class BattleSession:
     async def is_isekai(self) -> bool:
         """Expose the realm needed by battle-run completion results."""
         return await self.hentaiverse.realm.current() is Realm.ISEKAI
+
+    def raise_for_audit_failure(self) -> None:
+        """Surface a sticky audit failure at a caller-selected safe boundary."""
+
+        self.audit_event_bus.raise_for_failure()
 
     async def __aenter__(self) -> Self:
         async with self._browser_hooks_lock:
@@ -370,6 +386,7 @@ class BattleSession:
             browser,
             begin_dialog_observation=self.action_dialog_tracker.begin,
             get_dialog_category=self.action_dialog_tracker.category_for,
+            audit_event_bus=self.audit_event_bus,
         )
         items = ItemProvider(browser, state_store, actions)
         skills = SkillManager(browser, state_store, actions)
@@ -511,6 +528,15 @@ class BattleSession:
         )
         if not recovered:
             return False
+
+        self.audit_event_bus.publish(
+            ActionReconciliationConfirmedAuditEvent(
+                evidence.action_id,
+                evidence.action_kind,
+                ActionReceiptEvidence.SAME_BROWSER_RECOVERY_STABLE_STATE,
+            )
+        )
+        self.audit_event_bus.raise_for_failure()
 
         self.action_dialog_tracker.clear()
         self.round = -1

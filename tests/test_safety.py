@@ -24,7 +24,6 @@ from hvbattle import (
     BattlePresence,
     BattleRecoveryExhaustedError,
     BattleRunner,
-    BattleSession,
     BattleStepIdle,
     BattleStepIdleReason,
     BattleStepProgress,
@@ -42,11 +41,19 @@ from hvbattle import (
     TurnDecision,
 )
 from hvbattle._timing import SemanticDeadline
-from hvbattle.battle_launcher import BattleLauncher
+from hvbattle.battle_launcher import BattleFormOutcomeUnknownError
 from hvbattle.battle_state import BattleStateStore, CombatLogTracker
 from hvbattle.hv_battle_buff_manager import BuffManager
-from hvbattle.hv_battle_ponychart import PonyChart
 from hvbattle.recovery import ActionDialogTracker
+from hvbattle.testing import (
+    TestingBattleLauncher as BattleLauncher,
+)
+from hvbattle.testing import (
+    TestingBattleSession as BattleSession,
+)
+from hvbattle.testing import (
+    TestingPonyChart as PonyChart,
+)
 
 
 def _stub_form_lifecycle(
@@ -2243,8 +2250,6 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
             "missing-initid",
             "missing-initform",
             "missing-exact-action",
-            True,
-            {"unexpected": "payload"},
         )
         for atomic_result in failure_results:
             with self.subTest(atomic_result=atomic_result):
@@ -2269,6 +2274,28 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
                     RingOfBloodStartOutcome.OPTION_UNAVAILABLE,
                 )
                 page.evaluate.assert_awaited_once()
+
+    async def test_invalid_atomic_acknowledgement_is_not_treated_as_rejection(
+        self,
+    ) -> None:
+        for atomic_result in (True, {"unexpected": "payload"}):
+            with self.subTest(atomic_result=atomic_result):
+                launcher, page = self._launcher()
+                option = RingOfBloodOption(
+                    112,
+                    "Triple Trio and the Tree",
+                    1.0,
+                    10,
+                )
+                snapshot = RingOfBloodSnapshot(20, (option,))
+                page.evaluate = AsyncMock(return_value=atomic_result)
+
+                with self.assertRaises(BattleFormOutcomeUnknownError):
+                    await launcher.start_ring_of_blood(
+                        option,
+                        expected_before=snapshot,
+                        expected_realm=Realm.PERSISTENT,
+                    )
 
     async def test_start_submission_exception_propagates(self) -> None:
         launcher, page = self._launcher()

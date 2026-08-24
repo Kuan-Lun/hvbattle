@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import pickle
 import secrets
@@ -22,11 +23,12 @@ from typing import Any, Final, cast
 from hvbrowser.runtime import (
     OwnedProcess,
     ProcessOwnershipError,
-    setup_logger,
+    close_forwarded_logging,
+    configure_forwarded_logging,
     start_owned_process,
 )
 
-logger = setup_logger(__name__)
+logger = logging.getLogger("hvbattle.control_panel")
 
 _GUI_START_TOTAL_TIMEOUT: Final = 10.0
 _GUI_START_CLEANUP_RESERVE: Final = 5.0
@@ -1045,6 +1047,7 @@ class ControlPanel(BaseControlPanel):
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                forward_logging=True,
                 startup_timeout=max(sys.float_info.epsilon, startup_timeout),
                 deadline=startup_expires_at,
             )
@@ -1789,5 +1792,18 @@ def _run_gui_child(arguments: Sequence[str]) -> int:
     return 0
 
 
+def _run_owned_gui_child(arguments: Sequence[str]) -> int:
+    """Own the optional forwarding lifecycle around the GUI business result."""
+
+    configure_forwarded_logging()
+    try:
+        return _run_gui_child(arguments)
+    finally:
+        try:
+            close_forwarded_logging()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
-    raise SystemExit(_run_gui_child(sys.argv[1:]))
+    raise SystemExit(_run_owned_gui_child(sys.argv[1:]))

@@ -259,7 +259,7 @@ class InferenceFramedChannelTests(unittest.IsolatedAsyncioTestCase):
 
 class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        self.owner = PonyChartInferenceOwner(
+        self.owner = PonyChartInferenceOwner._for_testing(
             worker_target=_fake_inference_worker,
             register_atexit=False,
         )
@@ -444,7 +444,9 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(workers.socket, "socket", return_value=listener),
-            patch.object(workers, "start_owned_process", return_value=process_owner),
+            patch.object(
+                workers, "start_owned_process", return_value=process_owner
+            ) as start_process,
             patch.object(workers, "_InferenceChannel", return_value=connection),
             self.assertRaisesRegex(TimeoutError, "receive deadline"),
         ):
@@ -455,6 +457,7 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         connection.receive.assert_called_once_with(expires_at=ready_expires_at)
+        self.assertIs(start_process.call_args.kwargs["forward_logging"], True)
         self.assertGreater(expires_at - time.monotonic(), 3.0)
         process_owner.shutdown.assert_called_once()
         self.assertEqual(owner._owned_states, {})
@@ -519,7 +522,7 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_partial_prediction_frame_times_out_and_reaps_worker(self) -> None:
         await self.owner.close(timeout=2.5)
-        self.owner = PonyChartInferenceOwner(
+        self.owner = PonyChartInferenceOwner._for_testing(
             worker_target=_partial_prediction_worker,
             register_atexit=False,
         )
@@ -537,7 +540,7 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_predict_startup_lock_wait_uses_total_deadline(self) -> None:
         await self.owner.close(timeout=2.5)
-        self.owner = PonyChartInferenceOwner(
+        self.owner = PonyChartInferenceOwner._for_testing(
             worker_target=_never_ready_worker,
             register_atexit=False,
         )
@@ -675,7 +678,7 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
             marker,
             Path(self.directory.name) / "unused-thresholds",
         )
-        self.owner = PonyChartInferenceOwner(
+        self.owner = PonyChartInferenceOwner._for_testing(
             worker_target=_stubborn_inference_worker,
             register_atexit=False,
         )
@@ -778,7 +781,7 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
             marker,
             Path(self.directory.name) / "unused-thresholds",
         )
-        self.owner = PonyChartInferenceOwner(
+        self.owner = PonyChartInferenceOwner._for_testing(
             worker_target=_stubborn_inference_worker,
             register_atexit=False,
         )
@@ -802,7 +805,7 @@ class PonyChartInferenceOwnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_preload_cleanup_remains_registered_for_close(self) -> None:
         await self.owner.close(timeout=2.5)
-        self.owner = PonyChartInferenceOwner(
+        self.owner = PonyChartInferenceOwner._for_testing(
             worker_target=_never_ready_worker,
             register_atexit=False,
         )
@@ -831,7 +834,7 @@ class PonyChartRetentionOwnerTests(unittest.IsolatedAsyncioTestCase):
             await owner.close(timeout=5.01)
 
     def test_partial_injected_ready_frame_times_out_and_reaps_worker(self) -> None:
-        owner = PonyChartRetentionOwner(
+        owner = PonyChartRetentionOwner._for_testing(
             worker_target=_partial_retention_ready_worker,
             register_atexit=False,
         )
@@ -865,7 +868,9 @@ class PonyChartRetentionOwnerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(workers.socket, "socket", return_value=transport),
-            patch.object(workers, "start_owned_process", return_value=process_owner),
+            patch.object(
+                workers, "start_owned_process", return_value=process_owner
+            ) as start_process,
             patch.object(workers, "uuid4", return_value=token),
             patch.object(workers.json, "loads", slow_loads),
             self.assertRaisesRegex(TimeoutError, "preload timed out"),
@@ -876,6 +881,7 @@ class PonyChartRetentionOwnerTests(unittest.IsolatedAsyncioTestCase):
             )
 
         process_owner.shutdown.assert_called_once()
+        self.assertIs(start_process.call_args.kwargs["forward_logging"], True)
         self.assertIsNone(owner._process)
         self.assertIsNone(owner._transport)
         self.assertIsNone(owner._transport_token)

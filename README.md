@@ -80,6 +80,17 @@ not open a replacement browser or choose a worker-restart budget; the calling
 application owns that policy and must continue to honor the no-replay receipt
 guards.
 
+Irreversible turn, next-floor, PonyChart, Arena, Ring of Blood, GrindFest, and
+final-exit operations use a correlated write-ahead audit lifecycle. The
+library synchronously publishes `action-intent-recorded` before the first
+server-facing mutation and refuses to mutate if that publication fails. Every
+path that can continue then records submission evidence followed by an
+authoritative receipt, a proven `action-not-submitted`, or
+`action-outcome-unknown`. A later verified same-browser recovery resolves the
+same action token with `action-reconciliation-confirmed`. A hard process loss
+may leave an unmatched intent by design; the composition root must treat it as
+replay-sensitive state and fail closed rather than issue the action again.
+
 A `ZendriverOperationTimeout` is not treated like an ordinary retryable
 `TimeoutError`, because its CDP command deliberately remains live. A live
 timeout while arming or cleaning an action monitor, or while parsing session

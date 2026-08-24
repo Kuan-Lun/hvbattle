@@ -778,15 +778,44 @@ class PonyChartInferenceOwner:
     def __init__(
         self,
         *,
-        context: Any | None = None,
-        worker_target: _InferenceWorkerTarget = _inference_worker_main,
         register_atexit: bool = True,
     ) -> None:
-        self._context = context or _spawn_context()
-        self._worker_target = worker_target
-        self._use_process_supervisor = (
-            context is None and worker_target is _inference_worker_main
+        self._initialize(
+            context=_spawn_context(),
+            worker_target=_inference_worker_main,
+            use_process_supervisor=True,
+            register_atexit=register_atexit,
         )
+
+    @classmethod
+    def _for_testing(
+        cls,
+        *,
+        worker_target: _InferenceWorkerTarget,
+        context: Any | None = None,
+        register_atexit: bool = False,
+    ) -> PonyChartInferenceOwner:
+        """Build the raw-process test double path outside the production API."""
+        owner = cls.__new__(cls)
+        owner._initialize(
+            context=context or _spawn_context(),
+            worker_target=worker_target,
+            use_process_supervisor=False,
+            register_atexit=register_atexit,
+        )
+        return owner
+
+    def _initialize(
+        self,
+        *,
+        context: Any,
+        worker_target: _InferenceWorkerTarget,
+        use_process_supervisor: bool,
+        register_atexit: bool,
+    ) -> None:
+        self._context = context
+        self._worker_target = worker_target
+        self._use_process_supervisor = use_process_supervisor
         self._states: dict[str, _InferenceProcess] = {}
         self._owned_states: dict[int, _InferenceProcess] = {}
         self._pending_leases: dict[str, int] = {}
@@ -832,6 +861,7 @@ class PonyChartInferenceOwner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 drain_output=True,
+                forward_logging=True,
                 startup_timeout=startup_timeout,
                 deadline=expires_at,
             )
@@ -1907,18 +1937,51 @@ class PonyChartRetentionOwner:
     def __init__(
         self,
         *,
-        context: Any | None = None,
-        worker_target: _RetentionWorkerTarget = _retention_worker_main,
         capacity: int = _RETENTION_QUEUE_CAPACITY,
         register_atexit: bool = True,
     ) -> None:
+        self._initialize(
+            context=_spawn_context(),
+            worker_target=_retention_worker_main,
+            use_process_supervisor=True,
+            capacity=capacity,
+            register_atexit=register_atexit,
+        )
+
+    @classmethod
+    def _for_testing(
+        cls,
+        *,
+        worker_target: _RetentionWorkerTarget,
+        context: Any | None = None,
+        capacity: int = _RETENTION_QUEUE_CAPACITY,
+        register_atexit: bool = False,
+    ) -> PonyChartRetentionOwner:
+        """Build the raw-process test double path outside the production API."""
+        owner = cls.__new__(cls)
+        owner._initialize(
+            context=context or _spawn_context(),
+            worker_target=worker_target,
+            use_process_supervisor=False,
+            capacity=capacity,
+            register_atexit=register_atexit,
+        )
+        return owner
+
+    def _initialize(
+        self,
+        *,
+        context: Any,
+        worker_target: _RetentionWorkerTarget,
+        use_process_supervisor: bool,
+        capacity: int,
+        register_atexit: bool,
+    ) -> None:
         if capacity <= 0:
             raise ValueError("retention queue capacity must be positive")
-        self._context = context or _spawn_context()
+        self._context = context
         self._worker_target = worker_target
-        self._use_process_supervisor = (
-            context is None and worker_target is _retention_worker_main
-        )
+        self._use_process_supervisor = use_process_supervisor
         self._capacity = capacity
         self._process: BaseProcess | _SupervisedProcess | None = None
         self._messages: Queue[object] | None = None
@@ -2030,6 +2093,7 @@ class PonyChartRetentionOwner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 drain_output=True,
+                forward_logging=True,
                 startup_timeout=startup_timeout,
                 deadline=expires_at,
             )

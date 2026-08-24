@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+_ACTION_ID_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+
 
 @dataclass(frozen=True, slots=True)
 class ArenaOption:
@@ -256,10 +258,15 @@ class BattleRecoveryExhaustedError(BattleInterruptedError):
 
 
 class BattleActionKind(StrEnum):
-    """The submitted control whose receipt became ambiguous."""
+    """One bounded kind of battle-domain mutation."""
 
     TURN = "turn"
     NEXT_FLOOR = "next-floor"
+    PONYCHART = "ponychart"
+    ARENA = "arena"
+    RING_OF_BLOOD = "ring-of-blood"
+    GRINDFEST = "grindfest"
+    FINAL_BATTLE_EXIT = "final-battle-exit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,8 +292,9 @@ class BattleActionRecoveryEvidence:
     def _has_valid_action_envelope(self) -> bool:
         return bool(
             isinstance(self.action_kind, BattleActionKind)
+            and self.action_kind in {BattleActionKind.TURN, BattleActionKind.NEXT_FLOOR}
             and isinstance(self.action_id, str)
-            and self.action_id
+            and _ACTION_ID_PATTERN.fullmatch(self.action_id) is not None
             and isinstance(self.selector, str)
             and self.selector
             and self.click_started is True

@@ -116,6 +116,14 @@ budget. Failed reconciliation of matching incident evidence is also typed
 exhaustion, while an unmatched first unknown is an ordinary terminal
 interruption.
 
+The runtime additionally places a durable `action-intent-recorded` boundary
+before each irreversible action. Receipt, proven non-submission, unknown
+outcome, and correlated reconciliation events close that intent when execution
+continues. Crash-left unmatched intents are an application-level replay guard;
+the Lean state machine models the underlying no-replay and receipt predicates,
+while filesystem durability and restart journal reconstruction remain runtime
+obligations.
+
 At the reusable package boundary, same-browser recovery produces one of three
 typed resolutions: return to preparation, ordinary interruption, or recovery
 exhaustion. The two interruption kinds retain their stable diagnostic codes,

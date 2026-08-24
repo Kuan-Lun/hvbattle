@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import logging
 import math
 import time
 from collections.abc import Awaitable, Callable
@@ -9,10 +10,8 @@ from collections.abc import Awaitable, Callable
 from hvbrowser.runtime import (
     ZendriverOperationTimeout,
     is_browser_generation_error,
-    setup_logger,
 )
 
-from ._failure_safety import contains_log_persistence_error
 from .contracts import (
     BattleAbsent,
     BattleActionOutcomeUnknownError,
@@ -35,7 +34,7 @@ from .contracts import (
 from .session import BattleSession
 from .strategy import BattleStrategy
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _MAX_STATE_READINESS_TIMEOUT_SECONDS = 5.0
 
@@ -137,9 +136,7 @@ class BattleRunner:
             except BattleInterruptedError:
                 raise
             except Exception as error:
-                if contains_log_persistence_error(error) or is_browser_generation_error(
-                    error
-                ):
+                if is_browser_generation_error(error):
                     raise
                 raise BattleInterruptedError(
                     "Battle outcome is unknown after an active-session error",
@@ -351,9 +348,7 @@ class BattleRunner:
                 self._strategy_initialization_error = error
                 raise
             except Exception as error:
-                if contains_log_persistence_error(error) or is_browser_generation_error(
-                    error
-                ):
+                if is_browser_generation_error(error):
                     raise
                 interrupted = BattleInterruptedError(
                     "Battle strategy lifecycle failed before the first turn",

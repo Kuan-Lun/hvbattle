@@ -218,6 +218,7 @@ def test_supervisor_start_receives_one_shared_absolute_deadline(
         )
 
     assert state.process is process
+    assert launcher.call_args.kwargs["forward_logging"] is True
     assert launcher.call_args.kwargs["startup_timeout"] <= 5.0
     assert launcher.call_args.kwargs["deadline"] == now + 15.0
     assert owner._owned[id(state)] is state  # noqa: SLF001

@@ -11,14 +11,14 @@ from hvbrowser import (
     MaintenanceNavigationObservation,
     Realm,
 )
-from hvbrowser.runtime import LogPersistenceError, ZendriverOperationTimeout
+from hvbrowser.runtime import ZendriverOperationTimeout
 from zendriver import cdp
 
 from hvbattle import BattlePresence, BattleRouteReadinessError, BattleSession
 from hvbattle import battle_launcher as battle_launcher_module
 from hvbattle import session as session_module
 from hvbattle._timing import SemanticDeadline
-from hvbattle.battle_launcher import BattleLauncher
+from hvbattle.testing import TestingBattleLauncher as BattleLauncher
 
 
 def _markers(**overrides: bool) -> dict[str, bool]:
@@ -756,24 +756,6 @@ class BattleDirectNavigationTests(unittest.IsolatedAsyncioTestCase):
             await launcher.goto_arena(expected_realm=Realm.PERSISTENT)
 
         self.assertEqual(raised.exception.last_state, "route-dom-missing")
-        self.assertEqual(browser.diagnostic_calls, [])
-
-    async def test_nested_log_failure_in_readiness_observation_is_not_retried(
-        self,
-    ) -> None:
-        launcher, browser, page = _launcher()
-        wrapped = RuntimeError("readiness wrapper")
-        wrapped.__cause__ = LogPersistenceError(
-            "emit",
-            OSError("nested log sink failure"),
-        )
-        page.route_observation_results = [wrapped]
-
-        with self.assertRaises(RuntimeError) as raised:
-            await launcher.goto_arena(expected_realm=Realm.PERSISTENT)
-
-        self.assertIs(raised.exception, wrapped)
-        self.assertEqual(page.route_observation_calls, 1)
         self.assertEqual(browser.diagnostic_calls, [])
 
     async def test_invalid_atomic_observation_fails_closed_before_get(self) -> None:

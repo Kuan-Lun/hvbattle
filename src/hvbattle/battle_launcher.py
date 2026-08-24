@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
 from hvbrowser import (
     HENTAIVERSE_ROOT_URL,
@@ -22,15 +24,21 @@ from hvbrowser import (
 )
 from hvbrowser.runtime import (
     is_browser_generation_error,
-    setup_logger,
     wait_for_zendriver,
 )
 
-from ._failure_safety import contains_log_persistence_error
 from ._page_lifecycle import MainFrameDOMContentLoadedWaiter
 from ._timing import PROTOCOL_TIMEOUT_SECONDS, SemanticDeadline, protocol_timeout
+from .audit import (
+    ActionNotSubmittedReason,
+    ActionOutcomeUnknownReason,
+    ActionReceiptEvidence,
+    AuditEventBus,
+    _ActionAuditTrail,
+)
 from .contracts import (
     ArenaOption,
+    BattleActionKind,
     GrindfestOption,
     RingOfBloodChallenge,
     RingOfBloodOption,
@@ -38,7 +46,7 @@ from .contracts import (
     RingOfBloodStartOutcome,
 )
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _ARENA_ACTION_PATTERN = re.compile(
     r"init_battle\(\s*(\d+)\s*,\s*(\d+)\s*" r"(?:,\s*['\"]([^'\"]*)['\"]\s*)?\)\s*;?"
@@ -66,6 +74,20 @@ _RING_OF_BLOOD_ATOMIC_RESULTS = frozenset(
         "option-unavailable",
         "unexpected-page",
         "invalid-state",
+        "missing-table",
+        "missing-initid",
+        "missing-initform",
+        "missing-exact-action",
+    }
+)
+_BATTLE_FORM_SAFE_NON_SUBMISSION_RESULTS = frozenset(
+    {
+        "insufficient-tokens",
+        "state-changed",
+        "option-unavailable",
+        "unexpected-page",
+        "invalid-state",
+        "form-unavailable",
         "missing-table",
         "missing-initid",
         "missing-initform",
@@ -265,9 +287,18 @@ def _ring_inspection_error(
 class BattleLauncher:
     """List and submit battle choices without owning selection policy."""
 
-    def __init__(self, browser: HVDriver, realm: RealmNavigator) -> None:
+    def __init__(
+        self,
+        browser: HVDriver,
+        realm: RealmNavigator,
+        *,
+        audit_event_bus: AuditEventBus,
+    ) -> None:
+        if not isinstance(audit_event_bus, AuditEventBus):
+            raise TypeError("audit_event_bus must be AuditEventBus")
         self.browser = browser
         self.realm = realm
+        self.audit_event_bus = audit_event_bus
 
     @property
     def page(self) -> Any:
@@ -280,13 +311,19 @@ class BattleLauncher:
         self,
         script: str,
         *,
-        kind: str,
+        kind: BattleActionKind,
         battle_id: int,
         route: str,
         expected_realm: Realm,
     ) -> object:
         """Submit once and prove its battle receipt within one deadline."""
 
+        action_id = uuid4().hex
+        audit_trail = _ActionAuditTrail(
+            self.audit_event_bus,
+            action_id,
+            kind,
+        )
         deadline = SemanticDeadline.after(_BATTLE_FORM_RECEIPT_DEADLINE_SECONDS)
         pre_submit_deadline = deadline.capped(_BATTLE_FORM_PRE_SUBMIT_DEADLINE_SECONDS)
         lifecycle = self._main_document_lifecycle()
@@ -301,6 +338,7 @@ class BattleLauncher:
                 )
             )
             lifecycle.trigger()
+            audit_trail.record_intent()
             mutation_started = True
             try:
                 result = await wait_for_zendriver(
@@ -320,6 +358,8 @@ class BattleLauncher:
                     "pre-submit deadline"
                 )
 
+            if result == "submitted":
+                audit_trail.mark_submitted()
             if result == "submitted" or acknowledgement_error is not None:
                 try:
                     await lifecycle.wait(deadline)
@@ -336,7 +376,7 @@ class BattleLauncher:
                     logger.warning(
                         "Battle form submission reconciled after acknowledgement "
                         "error kind=%s id=%s route=%s blocker=%s error_type=%s",
-                        kind,
+                        kind.value,
                         battle_id,
                         route,
                         blocker.value,
@@ -345,12 +385,33 @@ class BattleLauncher:
                 deadline.require_remaining(
                     "Battle form submission receipt was accepted after its deadline"
                 )
+                evidence = (
+                    ActionReceiptEvidence.BATTLE_FORM_ACTIVE
+                    if blocker is MaintenanceNavigationBlocker.ACTIVE
+                    else ActionReceiptEvidence.BATTLE_FORM_CHALLENGE
+                )
+                if acknowledgement_error is not None:
+                    audit_trail.confirm_reconciliation(evidence)
+                else:
+                    audit_trail.confirm_receipt(evidence)
                 return "submitted"
+            if (
+                not isinstance(result, str)
+                or result not in _BATTLE_FORM_SAFE_NON_SUBMISSION_RESULTS
+            ):
+                raise BattleFormOutcomeUnknownError(
+                    "Battle form returned an untrusted submission acknowledgement"
+                )
+            audit_trail.mark_not_submitted(ActionNotSubmittedReason.COMMAND_REJECTED)
             pre_submit_deadline.require_remaining(
                 "Battle form submission result arrived after its pre-submit deadline"
             )
             return result
-        except Exception as error:
+        except BaseException as error:
+            if audit_trail.intent_recorded and not audit_trail.resolved:
+                audit_trail.mark_outcome_unknown(
+                    ActionOutcomeUnknownReason.BATTLE_FORM_RECEIPT_MISSING
+                )
             if mutation_started:
                 logger.error(
                     "Battle form submission outcome is unknown "
@@ -401,6 +462,11 @@ class BattleLauncher:
         if (
             state is not _BattleRouteReadinessState.BLOCKED
             or observation.blocker is None
+            or observation.blocker
+            not in {
+                MaintenanceNavigationBlocker.ACTIVE,
+                MaintenanceNavigationBlocker.CHALLENGE,
+            }
         ):
             raise BattleFormOutcomeUnknownError(
                 "Battle form receipt did not expose a trusted battle marker; "
@@ -504,9 +570,7 @@ class BattleLauncher:
                 "Battle route navigation deadline expired at lifecycle receipt"
             )
         except Exception as error:
-            if contains_log_persistence_error(error) or is_browser_generation_error(
-                error
-            ):
+            if is_browser_generation_error(error):
                 raise
             raise BattleNavigationSafetyError(
                 f"The direct {_BATTLE_ROUTE_LABELS[route]} navigation outcome is "
@@ -527,9 +591,7 @@ class BattleLauncher:
             deadline.require_remaining(f"Battle navigation deadline expired {context}")
             return observation
         except Exception as error:
-            if contains_log_persistence_error(error) or is_browser_generation_error(
-                error
-            ):
+            if is_browser_generation_error(error):
                 raise
             raise BattleNavigationSafetyError(
                 f"Unable to observe trusted Battle navigation state {context}"
@@ -646,9 +708,7 @@ class BattleLauncher:
                     ),
                 )
             except Exception as observation_error:
-                if contains_log_persistence_error(
-                    observation_error
-                ) or is_browser_generation_error(observation_error):
+                if is_browser_generation_error(observation_error):
                     raise
                 last_error = observation_error
                 last_state = _BattleRouteReadinessState.INVALID_OBSERVATION
@@ -1144,7 +1204,7 @@ class BattleLauncher:
                     return 'submitted';
                 }})()
             """,
-            kind="ring-of-blood",
+            kind=BattleActionKind.RING_OF_BLOOD,
             battle_id=option.battle_id,
             route="rb",
             expected_realm=expected_realm,
@@ -1247,7 +1307,7 @@ class BattleLauncher:
                     return 'submitted';
                 }})()
             """,
-            kind="arena",
+            kind=BattleActionKind.ARENA,
             battle_id=option.battle_id,
             route="ar",
             expected_realm=expected_realm,
@@ -1337,7 +1397,7 @@ class BattleLauncher:
                     return 'submitted';
                 }})()
             """,
-            kind="grindfest",
+            kind=BattleActionKind.GRINDFEST,
             battle_id=option.battle_id,
             route="gr",
             expected_realm=expected_realm,

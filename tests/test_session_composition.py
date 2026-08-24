@@ -9,10 +9,15 @@ from hvbrowser import HentaiVerseSession, HVDriver, Realm
 
 import hvbattle.session as session_module
 from hvbattle import (
-    BattleSession,
     RingOfBloodOption,
     RingOfBloodSnapshot,
     RingOfBloodStartOutcome,
+)
+from hvbattle.testing import (
+    TestingAuditEventBus,
+)
+from hvbattle.testing import (
+    TestingBattleSession as BattleSession,
 )
 
 
@@ -42,7 +47,9 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(session.hentaiverse, hentaiverse)
         self.assertIs(session._launcher.browser, browser)
         self.assertIs(session._launcher.realm, hentaiverse.realm)
+        self.assertIs(session._launcher.audit_event_bus, session.audit_event_bus)
         self.assertIs(session._ponychart.hvdriver, browser)
+        self.assertIs(session._ponychart.audit_event_bus, session.audit_event_bus)
         self.assertEqual(session._ponychart._image_directory, image_directory)
         self.assertIs(actions.hvdriver, browser)
         self.assertIs(items.state_store, session.battle_state)
@@ -55,6 +62,7 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(buffs._skill_manager, skills)
         self.assertIs(session.battle_recovery._actions, actions)
         self.assertIs(session.battle_recovery._state_store, session.battle_state)
+        self.assertIs(actions.audit_event_bus, session.audit_event_bus)
         self.assertIs(
             actions._begin_dialog_observation.__self__,
             session.action_dialog_tracker,
@@ -64,6 +72,22 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             session.action_dialog_tracker,
         )
         self.assertFalse(hasattr(browser, "_hvbattle_action_lock"))
+
+    def test_injected_audit_bus_is_shared_without_session_owned_lifecycle(
+        self,
+    ) -> None:
+        bus = TestingAuditEventBus()
+        session = BattleSession(
+            hentaiverse=HentaiVerseSession(browser=HVDriver(headless=True)),
+            audit_event_bus=bus,
+        )
+
+        self.assertIs(session.audit_event_bus, bus)
+        assert session.element_action_manager is not None
+        self.assertIs(session.element_action_manager.audit_event_bus, bus)
+        self.assertIs(session._launcher.audit_event_bus, bus)
+        self.assertIs(session._ponychart.audit_event_bus, bus)
+        session.raise_for_audit_failure()
 
     def test_injected_session_cannot_be_combined_with_browser_options(self) -> None:
         hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))

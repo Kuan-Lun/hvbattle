@@ -219,6 +219,7 @@ class ControlPanelLifecycleTests(unittest.TestCase):
         parameters = start_process.call_args.args[1]
         self.assertEqual(parameters[0].rsplit("/", maxsplit=1)[-1], "control_panel.py")
         self.assertEqual(parameters[1:], ["41321", auth_token])
+        self.assertIs(start_process.call_args.kwargs["forward_logging"], True)
         self.assertLessEqual(start_process.call_args.kwargs["startup_timeout"], 5.0)
         self.assertLessEqual(
             start_process.call_args.kwargs["deadline"],

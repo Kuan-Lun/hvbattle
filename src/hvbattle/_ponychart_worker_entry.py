@@ -8,6 +8,8 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from hvbrowser.runtime import close_forwarded_logging, configure_forwarded_logging
+
 from ._ponychart_workers import (
     PonyChartGenerationDescriptor,
     _inference_worker_main,
@@ -60,5 +62,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
     return 0
 
 
+def _run_owned_child(arguments: Sequence[str] | None = None) -> int:
+    """Own the optional forwarding lifecycle around the child business result."""
+
+    configure_forwarded_logging()
+    try:
+        return main(arguments)
+    finally:
+        try:
+            close_forwarded_logging()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_run_owned_child())

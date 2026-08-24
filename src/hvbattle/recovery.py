@@ -1,18 +1,19 @@
 """Composable recovery boundary for one ambiguous submitted battle action."""
 
 import asyncio
+import logging
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
-from hvbrowser.runtime import is_browser_generation_error, setup_logger
+from hvbrowser.runtime import is_browser_generation_error
 
 from ._timing import PROTOCOL_TIMEOUT_SECONDS, SemanticDeadline, protocol_timeout
 from .contracts import BattleActionRecoveryEvidence, BattleTurnPhase
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _MAX_RECOVERY_DEADLINE_SECONDS = 10.0
 _MAX_RECOVERY_OBSERVATION_CHECKS = 40

@@ -8,7 +8,7 @@ from zendriver import cdp
 
 from hvbattle._page_lifecycle import MainFrameDOMContentLoadedWaiter
 from hvbattle._timing import SemanticDeadline
-from hvbattle.hv_battle_action_manager import ElementActionManager
+from hvbattle.testing import TestingElementActionManager as ElementActionManager
 
 
 class _LifecyclePage:

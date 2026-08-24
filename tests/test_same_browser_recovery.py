@@ -5,6 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from hvbattle import (
+    ActionReconciliationConfirmedAuditEvent,
+    AuditEvent,
+    AuditPublicationError,
     BattleActionKind,
     BattleActionOutcomeUnknownError,
     BattleActionRecoveryEvidence,
@@ -31,6 +34,7 @@ from hvbattle.recovery import (
     BattleRecoveryCoordinator,
     BattleRecoveryState,
 )
+from hvbattle.testing import TestingAuditEventBus
 
 
 def _monitor(
@@ -118,14 +122,14 @@ def _stalled_recoverable_error() -> BattleActionOutcomeUnknownError:
 
 def _recovery_evidence(**changes: object) -> BattleActionRecoveryEvidence:
     evidence = BattleActionRecoveryEvidence(
-        action_id="action-1",
+        action_id="0123456789abcdef0123456789abcdef",
         action_kind=BattleActionKind.TURN,
         selector="#mkey_3",
         click_started=True,
         xhr_pending_at_least_five_seconds=False,
         pre_click_document_id="document-before",
         post_click_document_id="document-after",
-        dialog_action_id="action-1",
+        dialog_action_id="0123456789abcdef0123456789abcdef",
         dialog_category="server-communication-failed",
         xhr_sent=False,
         xhr_sent_count=0,
@@ -223,9 +227,17 @@ class RecoveryStateReconciliationTests(unittest.TestCase):
         self.assertIsNone(state)
 
 
+def _uninitialized_action_manager() -> ElementActionManager:
+    """Build an explicit audit-capable seam for focused private-method tests."""
+
+    manager = object.__new__(ElementActionManager)
+    manager._audit_event_bus = TestingAuditEventBus()
+    return manager
+
+
 class RecoveryStateProbeBudgetTests(unittest.IsolatedAsyncioTestCase):
     async def test_second_dom_probe_receives_only_remaining_total_budget(self) -> None:
-        manager = object.__new__(ElementActionManager)
+        manager = _uninitialized_action_manager()
 
         async def read_action_state(
             _state_id: str,
@@ -344,6 +356,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         rejected = (
             {"action_kind": "turn"},
             {"action_id": ""},
+            {"action_id": "action-1"},
             {"selector": ""},
             {"click_started": 1},
             {"xhr_pending_at_least_five_seconds": False},
@@ -382,7 +395,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(tracker.category_for("another-action"))
 
     async def test_unknown_action_exposes_structured_recovery_context(self) -> None:
-        manager = object.__new__(ElementActionManager)
+        manager = _uninitialized_action_manager()
         manager._action_lock = asyncio.Lock()
         manager._select_for_single_click = AsyncMock(return_value=object())
         manager._click = AsyncMock()
@@ -424,7 +437,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_partial_xhr_before_navigation_remains_receipt_unavailable(
         self,
     ) -> None:
-        manager = object.__new__(ElementActionManager)
+        manager = _uninitialized_action_manager()
         manager._action_lock = asyncio.Lock()
         manager._select_for_single_click = AsyncMock(return_value=object())
         manager._click = AsyncMock()
@@ -500,7 +513,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_five_second_same_document_single_xhr_is_recoverable_without_dialog(
         self,
     ) -> None:
-        manager = object.__new__(ElementActionManager)
+        manager = _uninitialized_action_manager()
         manager._action_lock = asyncio.Lock()
         manager._select_for_single_click = AsyncMock(return_value=object())
         manager._click = AsyncMock()
@@ -548,7 +561,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_recently_sent_xhr_is_not_recoverable_from_click_deadline_alone(
         self,
     ) -> None:
-        manager = object.__new__(ElementActionManager)
+        manager = _uninitialized_action_manager()
         manager._action_lock = asyncio.Lock()
         manager._select_for_single_click = AsyncMock(return_value=object())
         manager._click = AsyncMock()
@@ -592,7 +605,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_turn_without_successful_post_click_probe_has_unknown_document(
         self,
     ) -> None:
-        manager = object.__new__(ElementActionManager)
+        manager = _uninitialized_action_manager()
         manager._action_lock = asyncio.Lock()
         manager._select_for_single_click = AsyncMock(return_value=object())
         manager._click = AsyncMock()
@@ -628,7 +641,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_next_floor_preserves_partial_receipt_across_navigation(
         self,
     ) -> None:
-        manager = object.__new__(ElementActionManager)
+        manager = _uninitialized_action_manager()
         manager._action_lock = asyncio.Lock()
         manager._select_for_single_click = AsyncMock(return_value=object())
         manager._click = AsyncMock()
@@ -712,7 +725,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_next_floor_duplicate_receipt_is_preserved_and_rejected(
         self,
     ) -> None:
-        manager = object.__new__(ElementActionManager)
+        manager = _uninitialized_action_manager()
         manager._action_lock = asyncio.Lock()
         manager._select_for_single_click = AsyncMock(return_value=object())
         manager._click = AsyncMock()
@@ -774,7 +787,7 @@ class ActionRecoveryContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_next_floor_without_post_click_probe_has_unknown_document(
         self,
     ) -> None:
-        manager = object.__new__(ElementActionManager)
+        manager = _uninitialized_action_manager()
         manager._action_lock = asyncio.Lock()
         manager._select_for_single_click = AsyncMock(return_value=object())
         manager._click = AsyncMock()
@@ -1625,6 +1638,8 @@ class BattleSessionRecoveryCompositionTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         session = object.__new__(BattleSession)
+        events: list[AuditEvent] = []
+        session.audit_event_bus = TestingAuditEventBus(events.append)
         session.battle_recovery = Mock()
         session.battle_recovery.recover = AsyncMock(return_value=True)
         session.action_dialog_tracker = Mock()
@@ -1650,6 +1665,33 @@ class BattleSessionRecoveryCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.turn, 8)
         self.assertEqual(session.round, -1)
         self.assertFalse(session._completion_observed)
+        self.assertEqual(len(events), 1)
+        reconciliation = events[0]
+        self.assertIsInstance(reconciliation, ActionReconciliationConfirmedAuditEvent)
+        assert isinstance(reconciliation, ActionReconciliationConfirmedAuditEvent)
+        self.assertEqual(reconciliation.action_id, _recovery_evidence().action_id)
+
+    async def test_recovery_audit_failure_prevents_success_return(self) -> None:
+        writer_error = OSError("/private/audit-journal")
+
+        def fail(_event: AuditEvent) -> None:
+            raise writer_error
+
+        session = object.__new__(BattleSession)
+        session.audit_event_bus = TestingAuditEventBus(fail)
+        session.battle_recovery = Mock()
+        session.battle_recovery.recover = AsyncMock(return_value=True)
+        session.action_dialog_tracker = Mock()
+
+        with self.assertRaises(AuditPublicationError) as raised:
+            await BattleSession.recover_unknown_action(
+                session,
+                _recoverable_error(),
+                expected_is_isekai=False,
+            )
+
+        session.action_dialog_tracker.clear.assert_not_called()
+        self.assertIs(raised.exception.__cause__, writer_error)
 
 
 class _RunnerSession:

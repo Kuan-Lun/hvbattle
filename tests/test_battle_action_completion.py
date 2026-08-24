@@ -10,6 +10,15 @@ from unittest.mock import ANY, AsyncMock, Mock, patch
 from hvbrowser.runtime import ZendriverOperationTimeout
 
 from hvbattle import (
+    ActionIntentRecordedAuditEvent,
+    ActionOutcomeUnknownAuditEvent,
+    ActionReceiptConfirmedAuditEvent,
+    ActionReceiptEvidence,
+    ActionReconciliationConfirmedAuditEvent,
+    ActionSubmittedAuditEvent,
+    AuditEvent,
+    AuditEventBus,
+    AuditPublicationError,
     BattleActionKind,
     BattleActionOutcomeUnknownError,
     BattleActionRecoveryEvidence,
@@ -18,7 +27,6 @@ from hvbattle._timing import SemanticDeadline
 from hvbattle.hv_battle_action_manager import (
     _BATTLE_EXIT_STATE_JS,
     _CLEANUP_ACTION_MONITOR_JS,
-    ElementActionManager,
     _action_recovery_evidence,
     _ActionMonitorState,
     _BattleActionState,
@@ -28,6 +36,12 @@ from hvbattle.hv_battle_action_manager import (
     _confirmed_transition_evidence,
     _final_completion_control_ready,
     _normal_action_response,
+)
+from hvbattle.testing import (
+    TestingAuditEventBus,
+)
+from hvbattle.testing import (
+    TestingElementActionManager as ElementActionManager,
 )
 
 _NODE_ACTION_HOOK_HARNESS = r"""
@@ -420,7 +434,10 @@ def _exit_state(
     )
 
 
-def _manager() -> ElementActionManager:
+def _manager(
+    *,
+    audit_event_bus: AuditEventBus | None = None,
+) -> ElementActionManager:
     manager = object.__new__(ElementActionManager)
     manager._action_lock = asyncio.Lock()
     manager._select_for_single_click = AsyncMock(return_value=object())
@@ -432,6 +449,9 @@ def _manager() -> ElementActionManager:
     lifecycle.wait = AsyncMock()
     lifecycle.close = Mock()
     manager._main_document_lifecycle = Mock(return_value=lifecycle)
+    manager._audit_event_bus = (
+        audit_event_bus if audit_event_bus is not None else TestingAuditEventBus()
+    )
     return manager
 
 
@@ -612,7 +632,7 @@ class BattleActionEvidenceTests(unittest.TestCase):
     ) -> None:
         def evidence_for_age(age_ms: float) -> BattleActionRecoveryEvidence:
             return _action_recovery_evidence(
-                action_id="action-1",
+                action_id="0123456789abcdef0123456789abcdef",
                 action_kind=BattleActionKind.TURN,
                 selector="#ikey_2",
                 click_started=True,
@@ -1086,7 +1106,7 @@ class BattleActionEvidenceTests(unittest.TestCase):
         )
 
         evidence = _action_recovery_evidence(
-            action_id="action-1",
+            action_id="0123456789abcdef0123456789abcdef",
             action_kind=BattleActionKind.TURN,
             selector="#mkey_3",
             click_started=True,
@@ -2647,6 +2667,365 @@ class BattleActionManagerTests(unittest.IsolatedAsyncioTestCase):
 
         manager._select_for_single_click.assert_awaited_once()
         manager._click.assert_not_awaited()
+
+
+class BattleActionAuditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_turn_publishes_single_submission_and_authoritative_receipt(
+        self,
+    ) -> None:
+        events: list[AuditEvent] = []
+        manager = _manager(audit_event_bus=TestingAuditEventBus(events.append))
+        before = _state(monitor=_pending_monitor())
+        sent = _state(
+            monitor=_monitor(
+                completed=False,
+                status=None,
+                outcome=None,
+                log_mutations=0,
+                response_parse_ok=None,
+                response_has_textlog=False,
+            )
+        )
+        confirmed = _state(monitor=_monitor(log_mutations=1))
+        manager._read_action_state = AsyncMock(side_effect=[before, sent, confirmed])
+
+        await manager.click_and_wait_log_locator(
+            "#mkey_1",
+            timeout=1,
+            check_interval=1e-9,
+        )
+
+        self.assertEqual(len(events), 3)
+        intent, submitted, receipt = events
+        self.assertIsInstance(intent, ActionIntentRecordedAuditEvent)
+        self.assertIsInstance(submitted, ActionSubmittedAuditEvent)
+        self.assertIsInstance(receipt, ActionReceiptConfirmedAuditEvent)
+        assert isinstance(submitted, ActionSubmittedAuditEvent)
+        assert isinstance(receipt, ActionReceiptConfirmedAuditEvent)
+        self.assertEqual(submitted.action_id, receipt.action_id)
+        self.assertIs(submitted.action_kind, BattleActionKind.TURN)
+        self.assertIs(receipt.action_kind, BattleActionKind.TURN)
+        self.assertIs(
+            receipt.evidence,
+            ActionReceiptEvidence.XHR_ACK_COMBAT_LOG_MUTATION,
+        )
+
+    async def test_final_reconciliation_does_not_duplicate_audit_events(
+        self,
+    ) -> None:
+        events: list[AuditEvent] = []
+        manager = _manager(audit_event_bus=TestingAuditEventBus(events.append))
+        before = _state(monitor=_pending_monitor())
+        rejected = _state(
+            monitor=_monitor(
+                status=503,
+                response_has_textlog=False,
+                response_has_pane_completion=False,
+            )
+        )
+        final = _state(
+            completion_present=True,
+            battle_complete_present=True,
+            finish_image_present=True,
+            completion_revision="completion-finished",
+            action_controls=0,
+            monitor=_monitor(
+                log_mutations=0,
+                response_has_textlog=False,
+                response_has_pane_completion=True,
+            ),
+        )
+        manager._read_action_state = AsyncMock(side_effect=[before, rejected])
+        manager._final_action_probe = AsyncMock(return_value=(final, None))
+
+        await manager.click_and_wait_log_locator(
+            "#mkey_1",
+            timeout=1,
+            check_interval=1e-9,
+        )
+
+        self.assertEqual(
+            [type(event) for event in events],
+            [
+                ActionIntentRecordedAuditEvent,
+                ActionSubmittedAuditEvent,
+                ActionReconciliationConfirmedAuditEvent,
+            ],
+        )
+        receipt = events[2]
+        assert isinstance(receipt, ActionReconciliationConfirmedAuditEvent)
+        self.assertIs(
+            receipt.evidence,
+            ActionReceiptEvidence.XHR_ACK_BATTLE_COMPLETION,
+        )
+
+    async def test_unknown_turn_publishes_one_unknown_after_one_submission(
+        self,
+    ) -> None:
+        events: list[AuditEvent] = []
+        manager = _manager(audit_event_bus=TestingAuditEventBus(events.append))
+        before = _state(monitor=_pending_monitor())
+        sent_without_commit = _state(monitor=_monitor(log_mutations=0))
+
+        async def read_state(
+            _monitor_id: str,
+            *,
+            arm_monitor: bool = False,
+            probe_timeout: float = 3,
+        ) -> _BattleActionState:
+            del probe_timeout
+            return before if arm_monitor else sent_without_commit
+
+        manager._read_action_state = AsyncMock(side_effect=read_state)
+
+        with self.assertRaises(BattleActionOutcomeUnknownError):
+            await manager.click_and_wait_log_locator(
+                "#mkey_1",
+                timeout=0.005,
+                check_interval=1e-9,
+            )
+
+        self.assertEqual(
+            [type(event) for event in events],
+            [
+                ActionIntentRecordedAuditEvent,
+                ActionSubmittedAuditEvent,
+                ActionOutcomeUnknownAuditEvent,
+            ],
+        )
+        _intent, submitted, unknown = events
+        assert isinstance(submitted, ActionSubmittedAuditEvent)
+        assert isinstance(unknown, ActionOutcomeUnknownAuditEvent)
+        self.assertEqual(submitted.action_id, unknown.action_id)
+
+    async def test_writer_failure_prevents_action_mutation(
+        self,
+    ) -> None:
+        writer_error = OSError("/private/audit-journal: credential=value")
+        calls: list[AuditEvent] = []
+
+        def fail(event: AuditEvent) -> None:
+            calls.append(event)
+            raise writer_error
+
+        bus = TestingAuditEventBus(fail)
+        manager = _manager(audit_event_bus=bus)
+        before = _state(monitor=_pending_monitor())
+        confirmed = _state(monitor=_monitor(log_mutations=1))
+        manager._read_action_state = AsyncMock(side_effect=[before, confirmed])
+
+        with self.assertRaises(AuditPublicationError) as raised:
+            await manager.click_and_wait_log_locator("#mkey_1", timeout=1)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIsInstance(calls[0], ActionIntentRecordedAuditEvent)
+        manager._click.assert_not_awaited()
+        self.assertFalse(bus.healthy)
+        self.assertIs(raised.exception.__cause__, writer_error)
+        self.assertNotIn(str(writer_error), str(raised.exception))
+
+    async def test_cancellation_after_turn_intent_records_unknown(self) -> None:
+        events: list[AuditEvent] = []
+        manager = _manager(audit_event_bus=TestingAuditEventBus(events.append))
+        manager._read_action_state = AsyncMock(
+            return_value=_state(monitor=_pending_monitor())
+        )
+        manager._click = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with self.assertRaises(asyncio.CancelledError):
+            await manager.click_and_wait_log_locator("#mkey_1", timeout=1)
+
+        self.assertEqual(
+            [type(event) for event in events],
+            [ActionIntentRecordedAuditEvent, ActionOutcomeUnknownAuditEvent],
+        )
+
+    async def test_next_floor_uses_its_monitor_and_receipt_predicate(self) -> None:
+        events: list[AuditEvent] = []
+        manager = _manager(audit_event_bus=TestingAuditEventBus(events.append))
+        before = _state(
+            round_text="Initializing arena (Round 1 / 10)",
+            next_floor_present=True,
+            action_controls=0,
+            monitor=_pending_monitor(),
+        )
+        current = _state(
+            document_id="document-2",
+            battle_node_id="battle-node-2",
+            round_text="Initializing arena (Round 2 / 10)",
+            next_floor_present=False,
+            action_controls=3,
+            monitor=_monitor(log_mutations=0),
+        )
+        manager._read_action_state = AsyncMock(side_effect=[before, current])
+
+        await manager.click_and_wait_transition_locator("#btcp", timeout=1)
+
+        self.assertEqual(
+            [type(event) for event in events],
+            [
+                ActionIntentRecordedAuditEvent,
+                ActionSubmittedAuditEvent,
+                ActionReceiptConfirmedAuditEvent,
+            ],
+        )
+        _intent, submitted, receipt = events
+        assert isinstance(submitted, ActionSubmittedAuditEvent)
+        assert isinstance(receipt, ActionReceiptConfirmedAuditEvent)
+        self.assertIs(submitted.action_kind, BattleActionKind.NEXT_FLOOR)
+        self.assertIs(receipt.action_kind, BattleActionKind.NEXT_FLOOR)
+        self.assertIs(
+            receipt.evidence,
+            ActionReceiptEvidence.BATTLE_GENERATION_ROUND_ADVANCED,
+        )
+
+    async def test_unknown_next_floor_publishes_one_terminal_audit_event(
+        self,
+    ) -> None:
+        events: list[AuditEvent] = []
+        manager = _manager(audit_event_bus=TestingAuditEventBus(events.append))
+        before = _state(
+            round_text="Initializing arena (Round 1 / 10)",
+            next_floor_present=True,
+            action_controls=0,
+            monitor=_pending_monitor(),
+        )
+        unchanged = _state(
+            round_text="Initializing arena (Round 1 / 10)",
+            next_floor_present=True,
+            action_controls=0,
+            monitor=_monitor(log_mutations=0),
+        )
+
+        async def read_state(
+            _monitor_id: str,
+            *,
+            arm_monitor: bool = False,
+            probe_timeout: float = 3,
+        ) -> _BattleActionState:
+            del probe_timeout
+            return before if arm_monitor else unchanged
+
+        manager._read_action_state = AsyncMock(side_effect=read_state)
+
+        with self.assertRaises(BattleActionOutcomeUnknownError):
+            await manager.click_and_wait_transition_locator(
+                "#btcp",
+                timeout=0.005,
+                check_interval=1e-9,
+            )
+
+        self.assertEqual(
+            [type(event) for event in events],
+            [
+                ActionIntentRecordedAuditEvent,
+                ActionSubmittedAuditEvent,
+                ActionOutcomeUnknownAuditEvent,
+            ],
+        )
+        unknown = events[2]
+        assert isinstance(unknown, ActionOutcomeUnknownAuditEvent)
+        self.assertIs(unknown.action_kind, BattleActionKind.NEXT_FLOOR)
+
+    async def test_final_battle_exit_uses_intent_and_receipt_evidence(
+        self,
+    ) -> None:
+        events: list[AuditEvent] = []
+        manager = _manager(audit_event_bus=TestingAuditEventBus(events.append))
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        manager._read_battle_exit_state = AsyncMock(
+            side_effect=[before, before, exited]
+        )
+
+        await manager.click_and_wait_battle_exit_locator(
+            '#pane_completion img[src*="finishbattle.png"]',
+            expected_is_isekai=False,
+            timeout=1,
+        )
+
+        self.assertEqual(
+            [type(event) for event in events],
+            [ActionIntentRecordedAuditEvent, ActionReceiptConfirmedAuditEvent],
+        )
+        intent, receipt = events
+        assert isinstance(intent, ActionIntentRecordedAuditEvent)
+        assert isinstance(receipt, ActionReceiptConfirmedAuditEvent)
+        self.assertEqual(intent.action_id, receipt.action_id)
+        self.assertIs(intent.action_kind, BattleActionKind.FINAL_BATTLE_EXIT)
+        self.assertIs(receipt.action_kind, BattleActionKind.FINAL_BATTLE_EXIT)
+        self.assertIs(
+            receipt.evidence,
+            ActionReceiptEvidence.FINAL_EXIT_NEW_DOCUMENT,
+        )
+
+    async def test_unknown_final_exit_records_intent_without_submission_claim(
+        self,
+    ) -> None:
+        events: list[AuditEvent] = []
+        manager = _manager(audit_event_bus=TestingAuditEventBus(events.append))
+        before = _exit_state()
+        manager._read_battle_exit_state = AsyncMock(return_value=before)
+
+        with self.assertRaises(BattleActionOutcomeUnknownError):
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=0.005,
+                check_interval=1e-9,
+            )
+
+        self.assertEqual(
+            [type(event) for event in events],
+            [ActionIntentRecordedAuditEvent, ActionOutcomeUnknownAuditEvent],
+        )
+        self.assertNotIn(ActionSubmittedAuditEvent, map(type, events))
+
+    async def test_final_exit_reconciled_before_click_has_no_action_event(
+        self,
+    ) -> None:
+        events: list[AuditEvent] = []
+        manager = _manager(audit_event_bus=TestingAuditEventBus(events.append))
+        before = _exit_state()
+        exited = _exit_state(
+            document_id="document-2",
+            battle_present=False,
+            finish_image_present=False,
+        )
+        manager._read_battle_exit_state = AsyncMock(side_effect=[before, exited])
+
+        await manager.click_and_wait_battle_exit_locator(
+            '#pane_completion img[src*="finishbattle.png"]',
+            expected_is_isekai=False,
+            timeout=1,
+        )
+
+        manager._click.assert_not_awaited()
+        self.assertEqual(events, [])
+
+    async def test_final_exit_audit_failure_prevents_click(self) -> None:
+        writer_error = OSError("/private/audit-journal")
+
+        def fail(_event: AuditEvent) -> None:
+            raise writer_error
+
+        manager = _manager(audit_event_bus=TestingAuditEventBus(fail))
+        before = _exit_state()
+        manager._read_battle_exit_state = AsyncMock(return_value=before)
+
+        with self.assertRaises(AuditPublicationError) as raised:
+            await manager.click_and_wait_battle_exit_locator(
+                '#pane_completion img[src*="finishbattle.png"]',
+                expected_is_isekai=False,
+                timeout=1,
+            )
+
+        manager._click.assert_not_awaited()
+        self.assertIs(raised.exception.__cause__, writer_error)
 
 
 if __name__ == "__main__":

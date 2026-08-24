@@ -11,7 +11,8 @@ from hvbattle import (
     RingOfBloodSnapshot,
     RingOfBloodStartOutcome,
 )
-from hvbattle.battle_launcher import BattleLauncher
+from hvbattle.battle_launcher import BattleFormOutcomeUnknownError
+from hvbattle.testing import TestingBattleLauncher as BattleLauncher
 
 
 class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
@@ -386,8 +387,6 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             "missing-initid",
             "missing-initform",
             "missing-exact-action",
-            "unexpected-result-from-page",
-            {"unexpected": "payload"},
         )
         for atomic_result in results:
             with self.subTest(atomic_result=atomic_result):
@@ -402,19 +401,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                         expected_realm=Realm.PERSISTENT,
                     )
 
-                expected_reason = (
-                    atomic_result
-                    if isinstance(atomic_result, str)
-                    and atomic_result
-                    in {
-                        "unexpected-page",
-                        "missing-table",
-                        "missing-initid",
-                        "missing-initform",
-                        "missing-exact-action",
-                    }
-                    else "unexpected-result"
-                )
+                expected_reason = atomic_result
                 self.assertIs(
                     outcome,
                     RingOfBloodStartOutcome.OPTION_UNAVAILABLE,
@@ -433,10 +420,19 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                         option.battle_id,
                         expected_reason,
                     )
-                if expected_reason == "unexpected-result":
-                    self.assertNotIn(
-                        repr(atomic_result),
-                        repr(launcher_logger.method_calls),
+
+    async def test_untrusted_atomic_acknowledgement_fails_closed(self) -> None:
+        for atomic_result in ("unexpected-result-from-page", {"unexpected": "payload"}):
+            with self.subTest(atomic_result=atomic_result):
+                launcher, page = self._launcher()
+                option, snapshot, _payload = self._ring_values()
+                page.evaluate = AsyncMock(return_value=atomic_result)
+
+                with self.assertRaises(BattleFormOutcomeUnknownError):
+                    await launcher.start_ring_of_blood(
+                        option,
+                        expected_before=snapshot,
+                        expected_realm=Realm.PERSISTENT,
                     )
 
     async def test_ring_submission_exception_logs_only_error_type(self) -> None:

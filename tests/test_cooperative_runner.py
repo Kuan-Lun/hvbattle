@@ -101,14 +101,14 @@ def _recoverable_error() -> BattleActionOutcomeUnknownError:
     return BattleActionOutcomeUnknownError(
         "receipt missing",
         recovery_evidence=BattleActionRecoveryEvidence(
-            action_id="action-1",
+            action_id="0123456789abcdef0123456789abcdef",
             action_kind=BattleActionKind.TURN,
             selector="#mkey_3",
             click_started=True,
             xhr_pending_at_least_five_seconds=False,
             pre_click_document_id="document-before",
             post_click_document_id="document-after",
-            dialog_action_id="action-1",
+            dialog_action_id="0123456789abcdef0123456789abcdef",
             dialog_category="server-communication-failed",
             xhr_sent=False,
             xhr_sent_count=0,

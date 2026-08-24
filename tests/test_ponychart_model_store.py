@@ -20,7 +20,6 @@ from urllib.error import URLError
 
 import hvbattle.hv_battle_ponychart as ponychart_module
 import hvbattle.ponychart_model_store as store_module
-from hvbattle.hv_battle_ponychart import PonyChart
 from hvbattle.ponychart_model_store import (
     LoadedPonyChartGeneration,
     PonyChartArtifactError,
@@ -28,6 +27,7 @@ from hvbattle.ponychart_model_store import (
     PonyChartRefreshOutcome,
     PonyChartStoreRefresh,
 )
+from hvbattle.testing import TestingPonyChart as PonyChart
 
 
 def _missing_ski_error(

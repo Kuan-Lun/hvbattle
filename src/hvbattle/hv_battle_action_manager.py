@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import math
 import re
 from collections.abc import Callable, Mapping
@@ -13,13 +14,19 @@ from hvbrowser import HVDriver
 from hvbrowser.runtime import (
     ElementAction,
     is_browser_generation_error,
-    setup_logger,
     wait_for_zendriver,
 )
 from zendriver import cdp
 
 from ._page_lifecycle import MainFrameDOMContentLoadedWaiter
 from ._timing import PROTOCOL_TIMEOUT_SECONDS, SemanticDeadline, protocol_timeout
+from .audit import (
+    ActionNotSubmittedReason,
+    ActionOutcomeUnknownReason,
+    ActionReceiptEvidence,
+    AuditEventBus,
+    _ActionAuditTrail,
+)
 from .contracts import (
     BattleActionKind,
     BattleActionOutcomeUnknownError,
@@ -28,7 +35,7 @@ from .contracts import (
 )
 from .recovery import BattleRecoveryState
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _STALLED_XHR_MINIMUM_AGE_MS = 5_000.0
 _BATTLE_MUTATION_TIMEOUT_SECONDS = PROTOCOL_TIMEOUT_SECONDS
@@ -837,7 +844,7 @@ def _error_type_name(error: BaseException | None) -> str:
 
 def _confirmed_action_evidence(
     before: _BattleActionState, current: _BattleActionState
-) -> str | None:
+) -> ActionReceiptEvidence | None:
     """Return evidence only for a matched, acknowledged turn action."""
     if current.document_id != before.document_id:
         return None
@@ -845,22 +852,22 @@ def _confirmed_action_evidence(
     if not _normal_action_response(monitor) or monitor is None:
         return None
     if monitor.response_has_textlog and monitor.log_mutations > 0:
-        return "xhr-ack+combat-log-mutation"
+        return ActionReceiptEvidence.XHR_ACK_COMBAT_LOG_MUTATION
     if (
         monitor.response_has_textlog
         and current.log_revision is not None
         and current.log_revision != before.log_revision
     ):
-        return "xhr-ack+combat-log-revision"
+        return ActionReceiptEvidence.XHR_ACK_COMBAT_LOG_REVISION
     if monitor.response_has_pane_completion and (
         current.completion_revision != before.completion_revision
         or (current.completion_present and not before.completion_present)
     ):
         if current.battle_complete_present:
-            return "xhr-ack+battle-completion"
+            return ActionReceiptEvidence.XHR_ACK_BATTLE_COMPLETION
         if current.next_floor_present:
-            return "xhr-ack+round-completion"
-        return "xhr-ack+completion-pane"
+            return ActionReceiptEvidence.XHR_ACK_ROUND_COMPLETION
+        return ActionReceiptEvidence.XHR_ACK_COMPLETION_PANE
     return None
 
 
@@ -874,12 +881,12 @@ def _round_number(state: _BattleActionState) -> int | None:
 
 def _confirmed_transition_evidence(
     before: _BattleActionState, current: _BattleActionState
-) -> str | None:
+) -> ActionReceiptEvidence | None:
     """Return positive evidence that a next-floor navigation committed."""
     if current.ponychart_present and not before.ponychart_present:
-        return "ponychart-present"
+        return ActionReceiptEvidence.PONYCHART_PRESENT
     if current.battle_complete_present and not before.battle_complete_present:
-        return "battle-completion-present"
+        return ActionReceiptEvidence.BATTLE_COMPLETION_PRESENT
 
     before_round = _round_number(before)
     current_round = _round_number(current)
@@ -904,18 +911,18 @@ def _confirmed_transition_evidence(
     generation_ready = current.ready_state in {"interactive", "complete"}
     if round_advanced and actionable_battle:
         if generation_changed and generation_ready:
-            return "battle-generation+round-advanced"
+            return ActionReceiptEvidence.BATTLE_GENERATION_ROUND_ADVANCED
         if not generation_changed:
-            return "battle-round-advanced"
+            return ActionReceiptEvidence.BATTLE_ROUND_ADVANCED
     if round_initialized and actionable_battle:
         if generation_changed and generation_ready:
-            return "battle-generation+round-initialized"
+            return ActionReceiptEvidence.BATTLE_GENERATION_ROUND_INITIALIZED
         if (
             not generation_changed
             and current.log_revision is not None
             and current.log_revision != before.log_revision
         ):
-            return "battle-round-initialized"
+            return ActionReceiptEvidence.BATTLE_ROUND_INITIALIZED
     return None
 
 
@@ -956,6 +963,21 @@ def _final_completion_control_ready(
     )
 
 
+@dataclass(slots=True)
+class _MonitoredActionAuditTrail(_ActionAuditTrail):
+    """Add exact XHR-submission observation to the generic action trail."""
+
+    def observe_monitor(self, monitor: _ActionMonitorState | None) -> None:
+        if (
+            not self.submitted
+            and monitor is not None
+            and monitor.sent is True
+            and type(monitor.sent_count) is int
+            and monitor.sent_count == 1
+        ):
+            self.mark_submitted()
+
+
 class ElementActionManager:
     def __init__(
         self,
@@ -963,12 +985,33 @@ class ElementActionManager:
         *,
         begin_dialog_observation: Callable[[str], None] | None = None,
         get_dialog_category: Callable[[str], str | None] | None = None,
+        audit_event_bus: AuditEventBus,
     ) -> None:
+        if not isinstance(audit_event_bus, AuditEventBus):
+            raise TypeError("audit_event_bus must be AuditEventBus")
         self.hvdriver = driver
         self._action = ElementAction(lambda: driver.page)
         self._action_lock = asyncio.Lock()
         self._begin_dialog_observation = begin_dialog_observation
         self._get_dialog_category = get_dialog_category
+        self._audit_event_bus = audit_event_bus
+
+    @property
+    def audit_event_bus(self) -> AuditEventBus:
+        """The caller-owned bus shared with the containing battle session."""
+
+        return self._audit_event_bus
+
+    def _new_audit_trail(
+        self,
+        action_id: str,
+        action_kind: BattleActionKind,
+    ) -> _MonitoredActionAuditTrail:
+        return _MonitoredActionAuditTrail(
+            self.audit_event_bus,
+            action_id,
+            action_kind,
+        )
 
     @property
     def page(self) -> Any:
@@ -1196,6 +1239,11 @@ class ElementActionManager:
         probe_timeout: float,
     ) -> None:
         """Submit the final click once, then reconcile after lifecycle receipt."""
+        audit_trail = _ActionAuditTrail(
+            self.audit_event_bus,
+            uuid4().hex,
+            BattleActionKind.FINAL_BATTLE_EXIT,
+        )
         started = asyncio.get_running_loop().time()
         deadline = SemanticDeadline.after(timeout)
         lifecycle = self._main_document_lifecycle()
@@ -1210,6 +1258,7 @@ class ElementActionManager:
             )
             operation_timeout = deadline.protocol_timeout()
             lifecycle.trigger()
+            audit_trail.record_intent()
             try:
                 await self._click(
                     element,
@@ -1264,6 +1313,14 @@ class ElementActionManager:
                         except TimeoutError as error:
                             probe_error = error
                             break
+                        if click_error is not None or probe_error is not None:
+                            audit_trail.confirm_reconciliation(
+                                ActionReceiptEvidence.FINAL_EXIT_NEW_DOCUMENT
+                            )
+                        else:
+                            audit_trail.confirm_receipt(
+                                ActionReceiptEvidence.FINAL_EXIT_NEW_DOCUMENT
+                            )
                         elapsed = asyncio.get_running_loop().time() - started
                         if click_error is None and probe_error is None:
                             logger.debug(
@@ -1302,10 +1359,19 @@ class ElementActionManager:
                 "new-document same-realm out-of-battle evidence; "
                 f"selector={selector!r}; last_state={last.summary()}"
             )
+            audit_trail.mark_outcome_unknown(
+                ActionOutcomeUnknownReason.FINAL_EXIT_RECEIPT_MISSING
+            )
             cause = click_error or probe_error
             if cause is not None:
                 raise unknown from cause
             raise unknown
+        except BaseException:
+            if audit_trail.intent_recorded and not audit_trail.resolved:
+                audit_trail.mark_outcome_unknown(
+                    ActionOutcomeUnknownReason.FINAL_EXIT_RECEIPT_MISSING
+                )
+            raise
         finally:
             lifecycle.close()
 
@@ -1340,6 +1406,10 @@ class ElementActionManager:
                 delay=0.1,
             )
             monitor_id = uuid4().hex
+            audit_trail = self._new_audit_trail(
+                monitor_id,
+                BattleActionKind.TURN,
+            )
             monitor_cleanup_safe = True
             deadline: SemanticDeadline | None = None
             try:
@@ -1373,8 +1443,15 @@ class ElementActionManager:
                     "Battle action preparation deadline expired before submission"
                 )
                 deadline = SemanticDeadline.after(timeout)
-                self._begin_submitted_action(monitor_id)
                 operation_timeout = deadline.protocol_timeout()
+                audit_trail.record_intent()
+                try:
+                    self._begin_submitted_action(monitor_id)
+                except BaseException:
+                    audit_trail.mark_not_submitted(
+                        ActionNotSubmittedReason.PRE_MUTATION_ABORTED
+                    )
+                    raise
                 click_started = True
                 try:
                     await self._click(
@@ -1415,6 +1492,7 @@ class ElementActionManager:
                         last = current
                         if current.monitor is not None:
                             receipt_monitor = current.monitor
+                        audit_trail.observe_monitor(current.monitor)
                         post_click_probe_succeeded = True
                         evidence = _confirmed_action_evidence(before, current)
                         if evidence is not None:
@@ -1428,6 +1506,10 @@ class ElementActionManager:
                                 monitor_cleanup_safe = False
                                 probe_error = error
                                 break
+                            if click_error is not None or probe_error is not None:
+                                audit_trail.confirm_reconciliation(evidence)
+                            else:
+                                audit_trail.confirm_receipt(evidence)
                             elapsed = asyncio.get_running_loop().time() - started
                             status = current.monitor.status if current.monitor else None
                             if click_error is None and probe_error is None:
@@ -1492,6 +1574,7 @@ class ElementActionManager:
                         post_click_probe_succeeded = True
                     if last.monitor is not None:
                         receipt_monitor = last.monitor
+                    audit_trail.observe_monitor(last.monitor)
                 evidence = _confirmed_action_evidence(before, last)
                 if evidence is not None:
                     try:
@@ -1504,6 +1587,7 @@ class ElementActionManager:
                         monitor_cleanup_safe = False
                         probe_error = error
                     else:
+                        audit_trail.confirm_reconciliation(evidence)
                         elapsed = asyncio.get_running_loop().time() - started
                         status = last.monitor.status if last.monitor else None
                         logger.warning(
@@ -1524,6 +1608,9 @@ class ElementActionManager:
                     selector,
                     before.summary(),
                     last.summary(),
+                )
+                audit_trail.mark_outcome_unknown(
+                    ActionOutcomeUnknownReason.AUTHORITATIVE_RECEIPT_MISSING
                 )
                 dialog_category = self._submitted_action_dialog_category(monitor_id)
                 unknown = BattleActionOutcomeUnknownError(
@@ -1552,8 +1639,13 @@ class ElementActionManager:
                 if cause is not None:
                     raise unknown from cause
                 raise unknown
-            except asyncio.CancelledError:
-                monitor_cleanup_safe = False
+            except BaseException as error:
+                if audit_trail.intent_recorded and not audit_trail.resolved:
+                    audit_trail.mark_outcome_unknown(
+                        ActionOutcomeUnknownReason.AUTHORITATIVE_RECEIPT_MISSING
+                    )
+                if isinstance(error, asyncio.CancelledError):
+                    monitor_cleanup_safe = False
                 raise
             finally:
                 cleanup_remaining = (
@@ -1592,6 +1684,10 @@ class ElementActionManager:
                 delay=0.1,
             )
             state_id = uuid4().hex
+            audit_trail = self._new_audit_trail(
+                state_id,
+                BattleActionKind.NEXT_FLOOR,
+            )
             monitor_cleanup_safe = True
             deadline: SemanticDeadline | None = None
             try:
@@ -1621,12 +1717,19 @@ class ElementActionManager:
                 post_click_probe_succeeded = False
                 last = before
                 receipt_monitor = before.monitor
-                self._begin_submitted_action(state_id)
                 preparation_deadline.require_remaining(
                     "Battle transition preparation deadline expired before submission"
                 )
                 deadline = SemanticDeadline.after(timeout)
                 operation_timeout = deadline.protocol_timeout()
+                audit_trail.record_intent()
+                try:
+                    self._begin_submitted_action(state_id)
+                except BaseException:
+                    audit_trail.mark_not_submitted(
+                        ActionNotSubmittedReason.PRE_MUTATION_ABORTED
+                    )
+                    raise
                 try:
                     await self._click(
                         element,
@@ -1664,6 +1767,7 @@ class ElementActionManager:
                         post_click_probe_succeeded = True
                         if current.monitor is not None:
                             receipt_monitor = current.monitor
+                        audit_trail.observe_monitor(current.monitor)
                         evidence = _confirmed_transition_evidence(before, current)
                         if evidence is not None and (
                             _transition_receipt_has_at_most_one_dispatch(
@@ -1680,6 +1784,10 @@ class ElementActionManager:
                                 monitor_cleanup_safe = False
                                 probe_error = error
                                 break
+                            if click_error is not None or probe_error is not None:
+                                audit_trail.confirm_reconciliation(evidence)
+                            else:
+                                audit_trail.confirm_receipt(evidence)
                             elapsed = asyncio.get_running_loop().time() - started
                             if click_error is None and probe_error is None:
                                 logger.debug(
@@ -1735,6 +1843,7 @@ class ElementActionManager:
                             post_click_probe_succeeded = True
                             if last.monitor is not None:
                                 receipt_monitor = last.monitor
+                audit_trail.observe_monitor(last.monitor)
                 evidence = _confirmed_transition_evidence(before, last)
                 if evidence is not None and (
                     _transition_receipt_has_at_most_one_dispatch(receipt_monitor)
@@ -1749,6 +1858,7 @@ class ElementActionManager:
                         monitor_cleanup_safe = False
                         probe_error = error
                     else:
+                        audit_trail.confirm_reconciliation(evidence)
                         logger.warning(
                             "Battle transition confirmed during final reconciliation "
                             "selector=%r evidence=%s click_error=%s probe_error=%s",
@@ -1765,6 +1875,9 @@ class ElementActionManager:
                     selector,
                     before.summary(),
                     last.summary(),
+                )
+                audit_trail.mark_outcome_unknown(
+                    ActionOutcomeUnknownReason.POSITIVE_NEXT_PHASE_EVIDENCE_MISSING
                 )
                 dialog_category = self._submitted_action_dialog_category(state_id)
                 unknown = BattleActionOutcomeUnknownError(
@@ -1792,8 +1905,13 @@ class ElementActionManager:
                 if cause is not None:
                     raise unknown from cause
                 raise unknown
-            except asyncio.CancelledError:
-                monitor_cleanup_safe = False
+            except BaseException as error:
+                if audit_trail.intent_recorded and not audit_trail.resolved:
+                    audit_trail.mark_outcome_unknown(
+                        ActionOutcomeUnknownReason.POSITIVE_NEXT_PHASE_EVIDENCE_MISSING
+                    )
+                if isinstance(error, asyncio.CancelledError):
+                    monitor_cleanup_safe = False
                 raise
             finally:
                 cleanup_remaining = (

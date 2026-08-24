@@ -19,18 +19,30 @@ from hvbrowser.runtime import ZendriverOperationTimeout, wait_for_zendriver
 from zendriver import cdp
 
 import hvbattle.hv_battle_ponychart as ponychart_module
+from hvbattle import (
+    ActionIntentRecordedAuditEvent,
+    ActionSubmittedAuditEvent,
+    AuditEvent,
+    BattleActionKind,
+)
 from hvbattle._timing import SemanticDeadline
 from hvbattle.contracts import BattleInterruptedError, PonyChartResolutionOutcome
 from hvbattle.hv_battle_ponychart import (
-    PonyChart,
     PonyChartImageAcquisitionError,
     PonyChartResolutionError,
+)
+from hvbattle.testing import (
+    TestingAuditEventBus,
+)
+from hvbattle.testing import (
+    TestingPonyChart as PonyChart,
 )
 
 _IMAGE_SOURCE = "https://hentaiverse.org/pony-chart.png?challenge=1"
 _DOCUMENT_URL = "https://hentaiverse.org/battle"
 _FRAME_ID = cdp.page.FrameId("main-frame")
 _LOADER_ID = cdp.network.LoaderId("main-loader")
+_AUDIT_ACTION_ID = "0123456789abcdef0123456789abcdef"
 
 
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
@@ -1426,7 +1438,7 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(detected, PonyChartResolutionOutcome.SUBMISSION_CONFIRMED)
         challenge._predict_labels.assert_awaited_once_with(image, deadline=ANY)
         challenge._select_and_submit_answer.assert_awaited_once_with(
-            ("Twilight",), monitor_id=ANY, deadline=ANY
+            ("Twilight",), monitor_id=ANY, deadline=ANY, audit_trail=ANY
         )
         challenge._wait_for_challenge_receipt.assert_awaited_once_with(
             ANY, deadline=ANY
@@ -1500,9 +1512,10 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
             *,
             monitor_id: str,
             deadline: SemanticDeadline,
+            audit_trail: object,
         ) -> bool:
             nonlocal now
-            del monitor_id
+            del audit_trail, monitor_id
             observed.append(("submit", deadline.remaining(), deadline))
             now = 7.0
             return True
@@ -2300,20 +2313,30 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         driver.page.evaluate.assert_not_awaited()
 
     async def test_all_labels_and_submit_use_one_atomic_page_mutation(self) -> None:
+        events: list[AuditEvent] = []
         driver = Mock()
         driver.page = Mock()
         driver.page.evaluate = AsyncMock(
             return_value=_submit_acknowledgement("submitted", selected_count=2)
         )
-        challenge = PonyChart(driver)
+        challenge = PonyChart(
+            driver,
+            audit_event_bus=TestingAuditEventBus(events.append),
+        )
 
         submitted = await challenge._select_and_submit_answer(
             ("Applejack", "Twilight Sparkle"),
-            monitor_id="monitor",
+            monitor_id=_AUDIT_ACTION_ID,
             deadline=SemanticDeadline.after(15.0),
         )
 
         self.assertTrue(submitted)
+        self.assertEqual(len(events), 2)
+        self.assertIsInstance(events[0], ActionIntentRecordedAuditEvent)
+        event = events[1]
+        self.assertIsInstance(event, ActionSubmittedAuditEvent)
+        assert isinstance(event, ActionSubmittedAuditEvent)
+        self.assertIs(event.action_kind, BattleActionKind.PONYCHART)
         driver.page.evaluate.assert_awaited_once()
         script = driver.page.evaluate.await_args.args[0]
         self.assertIn("activeSubmit.click()", script)
@@ -2359,7 +2382,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         ):
             submitted = await challenge._select_and_submit_answer(
                 ("Applejack",),
-                monitor_id="monitor",
+                monitor_id=_AUDIT_ACTION_ID,
                 deadline=deadline,
             )
 
@@ -2386,7 +2409,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         submitted = await challenge._select_and_submit_answer(
             ("Applejack",),
-            monitor_id="monitor",
+            monitor_id=_AUDIT_ACTION_ID,
             deadline=SemanticDeadline.after(0.05),
         )
 
@@ -2411,7 +2434,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleInterruptedError) as raised:
             await challenge._select_and_submit_answer(
                 ("Applejack",),
-                monitor_id="monitor",
+                monitor_id=_AUDIT_ACTION_ID,
                 deadline=deadline,
             )
 
@@ -2452,7 +2475,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()):
             submitted = await challenge._select_and_submit_answer(
                 ("Applejack", "Twilight Sparkle"),
-                monitor_id="monitor",
+                monitor_id=_AUDIT_ACTION_ID,
                 deadline=SemanticDeadline.after(15.0),
             )
 
@@ -2478,7 +2501,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleInterruptedError) as raised:
             await challenge._select_and_submit_answer(
                 ("Twilight Sparkle",),
-                monitor_id="monitor",
+                monitor_id=_AUDIT_ACTION_ID,
                 deadline=SemanticDeadline.after(15.0),
             )
 
@@ -2499,7 +2522,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BattleInterruptedError) as raised:
             await challenge._select_and_submit_answer(
                 ("Twilight Sparkle",),
-                monitor_id="monitor",
+                monitor_id=_AUDIT_ACTION_ID,
                 deadline=SemanticDeadline.after(15.0),
             )
 
@@ -2530,7 +2553,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(BattleInterruptedError) as raised:
                     await challenge._select_and_submit_answer(
                         ("Twilight Sparkle",),
-                        monitor_id="monitor",
+                        monitor_id=_AUDIT_ACTION_ID,
                         deadline=SemanticDeadline.after(15.0),
                     )
 
@@ -2550,7 +2573,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ZendriverOperationTimeout) as raised:
             await challenge._select_and_submit_answer(
                 ("Twilight Sparkle",),
-                monitor_id="monitor",
+                monitor_id=_AUDIT_ACTION_ID,
                 deadline=SemanticDeadline.after(15.0),
             )
 

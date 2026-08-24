@@ -20,11 +20,15 @@ from zendriver import cdp
 
 from hvbattle import ArenaOption, GrindfestOption
 from hvbattle._timing import SemanticDeadline
-from hvbattle.battle_launcher import BattleLauncher
 from hvbattle.hv_battle_item_provider import ItemProvider
-from hvbattle.hv_battle_ponychart import PonyChart
 from hvbattle.hv_battle_skill_manager import SkillManager
 from hvbattle.session import BattleSession
+from hvbattle.testing import (
+    TestingBattleLauncher as BattleLauncher,
+)
+from hvbattle.testing import (
+    TestingPonyChart as PonyChart,
+)
 
 
 class _HangingPage:

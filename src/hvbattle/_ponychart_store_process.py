@@ -620,6 +620,7 @@ class PonyChartStoreProcessOwner:
                 ["-m", self._child_module, str(port), auth_token],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                forward_logging=True,
                 startup_timeout=min(
                     _STORE_START_TIMEOUT_SECONDS,
                     _remaining(semantic_expires_at),

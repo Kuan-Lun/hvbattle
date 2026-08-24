@@ -94,13 +94,15 @@ browser replacement or worker restart remains a calling-application decision.
 `BattleSession` preloads the PonyChart classifier and ONNX model before opening
 the browser, so a timed challenge never pays the first-load cost. The runner
 checks for and resolves PonyChart before parsing an ordinary battle turn or
-calling client strategy code. Browser PNG captures stay in memory through
-classification and challenge handling. Set `ponychart_image_directory` to
+calling client strategy code. The displayed image's byte-exact CDP Network
+response body stays in memory through classification and challenge handling;
+an unavailable or invalid response aborts without a screenshot or re-request
+fallback. Set `ponychart_image_directory` to
 retain every detected challenge, including successful resolutions and failures;
 the captured bytes are written once after each attempt under a
-collision-resistant `pony_chart_*.png` name, and callers own retention for that
-directory. Without an image directory, challenge images are never written to
-the filesystem.
+collision-resistant `pony_chart_*` name with its native PNG, JPEG, or WebP
+suffix, and callers own retention for that directory. Without an image
+directory, challenge images are never written to the filesystem.
 
 PonyChart model files are stored as immutable, content-addressed generations.
 Each update downloads both files over verified TLS into a same-filesystem
@@ -215,7 +217,7 @@ ordinary log. The exact listing query remains mandatory when no blocker exists.
 `ABSENT` is accepted only after the deadline observer reaches the validated
 realm-scoped route with its Arena DOM and no blocker.
 
-This atomic observation contract is the `hvbattle` 0.11 / `hvbrowser` 0.9
+This atomic observation contract is the `hvbattle` 0.13 / `hvbrowser` 0.9
 package line; the dependency range intentionally rejects older or newer minor
 lines with different navigation contracts.
 

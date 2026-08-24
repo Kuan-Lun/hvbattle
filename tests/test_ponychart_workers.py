@@ -1,11 +1,15 @@
 import asyncio
+import base64
+import binascii
 import json
 import os
 import queue
 import signal
+import struct
 import tempfile
 import time
 import unittest
+import zlib
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -21,6 +25,66 @@ from hvbattle._ponychart_workers import (
 # The owner reserves one second of this total budget for deterministic cleanup,
 # leaving four seconds for an expected-success worker startup and READY frame.
 _TEST_WORKER_STARTUP_TIMEOUT_SECONDS = 5.0
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    checksum = binascii.crc32(chunk_type + data) & 0xFFFFFFFF
+    return (
+        struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", checksum)
+    )
+
+
+def _png_bytes(width: int, height: int) -> bytes:
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    rows = b"".join(b"\x00" + b"\x00\x00\x00\xff" * width for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(rows))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _jpeg_bytes(width: int, height: int) -> bytes:
+    # Static codec-valid black frame generated offline; tests do not import cv2.
+    if (width, height) != (80, 60):
+        raise ValueError("JPEG fixture has fixed 80x60 dimensions")
+    return base64.b64decode(
+        "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUEBAME"
+        "BgUGBgYFBgYGBwkIBgcJBwYGCAsICQoKCgoKBggLDAsKDAkKCgr/2wBDAQICAgICAgUD"
+        "AwUKBwYHCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoK"
+        "CgoKCgr/wAARCAA8AFADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQF"
+        "BgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEI"
+        "I0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNk"
+        "ZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLD"
+        "xMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEB"
+        "AQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJB"
+        "UQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZH"
+        "SElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaan"
+        "qKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oA"
+        "DAMBAAIRAxEAPwD+f+iiigAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiii"
+        "gAooooAKKKKACiiigAooooAKKKKACiiigAooooAKKKKACiiigAooooA/9k=",
+        validate=True,
+    )
+
+
+def _webp_bytes(width: int, height: int) -> bytes:
+    # Static codec-valid black frame generated offline; tests do not import cv2.
+    if (width, height) != (72, 58):
+        raise ValueError("WebP fixture has fixed 72x58 dimensions")
+    return base64.b64decode(
+        "UklGRiAAAABXRUJQVlA4TBQAAAAvR0AOAAcQEf0PAAnh/3wpov8pAg==",
+        validate=True,
+    )
+
+
+def _vp8x_only_bytes(width: int, height: int) -> bytes:
+    def uint24(value: int) -> bytes:
+        return bytes((value & 0xFF, value >> 8 & 0xFF, value >> 16 & 0xFF))
+
+    payload = b"\x00\x00\x00\x00" + uint24(width - 1) + uint24(height - 1)
+    chunk = b"VP8X" + struct.pack("<I", len(payload)) + payload
+    return b"RIFF" + struct.pack("<I", 4 + len(chunk)) + b"WEBP" + chunk
 
 
 def _fake_inference_worker(
@@ -913,11 +977,13 @@ class PonyChartRetentionOwnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_writer_process_persists_then_close_proves_reaped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "captures"
+            first_image = _png_bytes(64, 64)
+            second_image = _jpeg_bytes(80, 60)
             owner = PonyChartRetentionOwner(register_atexit=False)
             await owner.prepare_async(timeout=3.0)
 
-            self.assertEqual(owner.submit(b"one", destination), "queued")
-            self.assertEqual(owner.submit(b"two", destination), "queued")
+            self.assertEqual(owner.submit(first_image, destination), "queued")
+            self.assertEqual(owner.submit(second_image, destination), "queued")
             await owner.close(timeout=3.0)
 
             self.assertIsNone(owner._process)
@@ -926,8 +992,58 @@ class PonyChartRetentionOwnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(owner._pending_shared, {})
             self.assertCountEqual(
                 (path.read_bytes() for path in destination.iterdir()),
-                (b"one", b"two"),
+                (first_image, second_image),
             )
+
+    def test_retained_bytes_are_exact_and_suffix_comes_from_magic(self) -> None:
+        cases = (
+            (_png_bytes(64, 64), ".png"),
+            (_jpeg_bytes(80, 60), ".jpg"),
+            (_webp_bytes(72, 58), ".webp"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "captures"
+            for image, suffix in cases:
+                with self.subTest(suffix=suffix):
+                    before = (
+                        set(destination.iterdir()) if destination.exists() else set()
+                    )
+
+                    workers._write_retained_capture(image, destination)
+
+                    created = set(destination.iterdir()) - before
+                    self.assertEqual(len(created), 1)
+                    path = created.pop()
+                    self.assertEqual(path.suffix, suffix)
+                    self.assertEqual(path.read_bytes(), image)
+
+    def test_magic_headers_without_complete_image_data_are_rejected(self) -> None:
+        header = struct.pack(">IIBBBBB", 64, 64, 8, 6, 0, 0, 0)
+        invalid_png = (
+            b"\x89PNG\r\n\x1a\n"
+            + _png_chunk(b"IHDR", header)
+            + _png_chunk(b"IDAT", b"not-zlib")
+            + _png_chunk(b"IEND", b"")
+        )
+        jpeg_without_scan = (
+            b"\xff\xd8"
+            + b"\xff\xc0\x00\x0b\x08"
+            + struct.pack(">HH", 60, 80)
+            + b"\x01\x01\x11\x00"
+            + b"\xff\xd9"
+        )
+        cases = (
+            invalid_png,
+            jpeg_without_scan,
+            _vp8x_only_bytes(72, 58),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "captures"
+            for image in cases:
+                with self.subTest(magic=image[:12]):
+                    with self.assertRaises(ValueError):
+                        workers._write_retained_capture(image, destination)
+            self.assertFalse(destination.exists())
 
     def test_full_queue_drops_immediately(self) -> None:
         owner = PonyChartRetentionOwner(register_atexit=False)

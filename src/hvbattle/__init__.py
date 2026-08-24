@@ -34,6 +34,7 @@ from .contracts import (
 )
 from .control_panel import BaseControlPanel, ControlPanel, NullControlPanel
 from .hv_battle_ponychart import (
+    PonyChartImageAcquisitionError,
     PonyChartResolutionError,
     close_ponychart_workers,
     preload_ponychart_classifier,
@@ -75,6 +76,7 @@ __all__ = [
     "GrindfestOption",
     "NullControlPanel",
     "PonyChartArtifactError",
+    "PonyChartImageAcquisitionError",
     "PonyChartRefreshOutcome",
     "PonyChartResolutionError",
     "PonyChartResolutionOutcome",

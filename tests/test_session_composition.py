@@ -80,6 +80,9 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             hentaiverse=hentaiverse,
             auto_accept_dialogs=True,
         )
+        session._ponychart.arm_network_capture = AsyncMock(
+            side_effect=lambda: events.append("network-arm")
+        )
         session._setup_alert_handler = AsyncMock(
             side_effect=lambda: events.append("alert-handler")
         )
@@ -118,10 +121,11 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             on_browser_ready=session._on_browser_ready,
         )
         session._setup_alert_handler.assert_awaited_once_with()
+        session._ponychart.arm_network_capture.assert_awaited_once_with()
         close.assert_awaited_once_with(None, None, None)
         self.assertEqual(
             tuple(event for event in events if event != "preload"),
-            ("browser-ready", "alert-handler", "login"),
+            ("browser-ready", "network-arm", "alert-handler", "login"),
         )
         self.assertIn("preload", events)
 
@@ -130,6 +134,7 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         classifier_started = asyncio.Event()
         hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
         session = BattleSession(hentaiverse=hentaiverse)
+        session._ponychart.arm_network_capture = AsyncMock()
 
         async def prepare_classifier() -> None:
             classifier_started.set()
@@ -295,6 +300,9 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             auto_accept_dialogs=True,
         )
         events: list[str] = []
+        session._ponychart.arm_network_capture = AsyncMock(
+            side_effect=lambda: events.append("network-arm")
+        )
         session._setup_alert_handler = AsyncMock(
             side_effect=lambda: events.append("attach-hooks")
         )
@@ -314,8 +322,9 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(first, session)
         self.assertIs(second, session)
         preload.assert_awaited_once_with()
+        session._ponychart.arm_network_capture.assert_awaited_once_with()
         session._setup_alert_handler.assert_awaited_once_with()
-        self.assertEqual(events, ["attach-hooks", "preload"])
+        self.assertEqual(events, ["network-arm", "attach-hooks", "preload"])
         start.assert_not_awaited()
         close.assert_not_awaited()
 
@@ -327,6 +336,7 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
             hentaiverse=hentaiverse,
             auto_accept_dialogs=True,
         )
+        session._ponychart.arm_network_capture = AsyncMock()
         session._setup_alert_handler = AsyncMock()
 
         with patch.object(
@@ -338,8 +348,83 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(first, session)
         self.assertIs(second, session)
+        session._ponychart.arm_network_capture.assert_awaited_once_with()
         session._setup_alert_handler.assert_awaited_once_with()
         preload.assert_not_called()
+
+    async def test_concurrent_attach_installs_browser_hooks_exactly_once(self) -> None:
+        hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
+        session = BattleSession(
+            hentaiverse=hentaiverse,
+            auto_accept_dialogs=True,
+        )
+        arm_started = asyncio.Event()
+        release_arm = asyncio.Event()
+
+        async def arm() -> None:
+            arm_started.set()
+            await release_arm.wait()
+
+        session._ponychart.arm_network_capture = AsyncMock(side_effect=arm)
+        session._setup_alert_handler = AsyncMock()
+        first = asyncio.create_task(session.attach_browser_hooks())
+        await arm_started.wait()
+        second = asyncio.create_task(session.attach_browser_hooks())
+        await asyncio.sleep(0)
+
+        session._ponychart.arm_network_capture.assert_awaited_once_with()
+        self.assertFalse(second.done())
+        release_arm.set()
+        attached = await asyncio.gather(first, second)
+
+        self.assertEqual(attached, [session, session])
+        session._ponychart.arm_network_capture.assert_awaited_once_with()
+        session._setup_alert_handler.assert_awaited_once_with()
+
+    async def test_exit_dominates_overlapping_browser_hook_installation(self) -> None:
+        hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
+        session = BattleSession(hentaiverse=hentaiverse)
+        arm_started = asyncio.Event()
+        release_arm = asyncio.Event()
+
+        async def arm() -> None:
+            arm_started.set()
+            await release_arm.wait()
+
+        session._ponychart.arm_network_capture = AsyncMock(side_effect=arm)
+        session._ponychart.close = AsyncMock()
+        hentaiverse.__aexit__ = AsyncMock()
+        attaching = asyncio.create_task(session.attach_browser_hooks())
+        await arm_started.wait()
+        exiting = asyncio.create_task(session.__aexit__(None, None, None))
+        await asyncio.sleep(0)
+
+        with self.assertRaisesRegex(RuntimeError, "hooks are closing"):
+            await session.attach_browser_hooks()
+
+        release_arm.set()
+        await attaching
+        await exiting
+
+        session._ponychart.close.assert_awaited_once_with()
+        self.assertFalse(session._browser_hooks_initialized)
+
+    async def test_exit_disarms_network_handlers_before_browser_handoff(self) -> None:
+        events: list[str] = []
+        hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
+        session = BattleSession(hentaiverse=hentaiverse)
+        session._browser_hooks_initialized = True
+        session._ponychart.close = AsyncMock(
+            side_effect=lambda: events.append("network-disarm")
+        )
+        hentaiverse.__aexit__ = AsyncMock(
+            side_effect=lambda *_args: events.append("browser-handoff")
+        )
+
+        await session.__aexit__(None, None, None)
+
+        self.assertEqual(events, ["network-disarm", "browser-handoff"])
+        self.assertFalse(session._browser_hooks_initialized)
 
     async def test_ring_of_blood_operations_delegate_to_shared_launcher(self) -> None:
         hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))

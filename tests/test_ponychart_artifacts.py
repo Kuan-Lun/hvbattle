@@ -21,7 +21,16 @@ from zendriver import cdp
 import hvbattle.hv_battle_ponychart as ponychart_module
 from hvbattle._timing import SemanticDeadline
 from hvbattle.contracts import BattleInterruptedError, PonyChartResolutionOutcome
-from hvbattle.hv_battle_ponychart import PonyChart, PonyChartResolutionError
+from hvbattle.hv_battle_ponychart import (
+    PonyChart,
+    PonyChartImageAcquisitionError,
+    PonyChartResolutionError,
+)
+
+_IMAGE_SOURCE = "https://hentaiverse.org/pony-chart.png?challenge=1"
+_DOCUMENT_URL = "https://hentaiverse.org/battle"
+_FRAME_ID = cdp.page.FrameId("main-frame")
+_LOADER_ID = cdp.network.LoaderId("main-loader")
 
 
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
@@ -42,24 +51,18 @@ def _png_bytes(width: int, height: int) -> bytes:
     )
 
 
-def _canvas_payload(image: bytes, width: int, height: int) -> dict[str, object]:
-    encoded = base64.b64encode(image).decode("ascii")
-    return {
-        "status": "ok",
-        "width": width,
-        "height": height,
-        "dataUrl": f"data:image/png;base64,{encoded}",
-    }
-
-
 def _image_receipt(
-    source: str = "challenge",
+    source: str = _IMAGE_SOURCE,
     width: float = 640,
     height: float = 480,
+    document_url: str = _DOCUMENT_URL,
+    monitor_token: str = "raw-monitor",
 ) -> object:
     return ponychart_module._PonyChartImageState(
         True,
         source,
+        document_url,
+        monitor_token,
         width,
         height,
         width,
@@ -206,16 +209,18 @@ class _ImageEventPage:
         return None
 
     async def evaluate(self, expression: str) -> object:
-        if "canvas.toDataURL" in expression:
-            image = _png_bytes(64, 64)
-            return _canvas_payload(image, 64, 64)
         self.snapshot_calls += 1
         match = re.search(r"const token = (\"[0-9a-f]+\");", expression)
         if match is None:
             raise AssertionError("image observer token was not embedded")
         self.token = json.loads(match.group(1))
         self.observer_armed.set()
-        return self.state
+        monitor_token = self.token if self.state.get("ready") is True else None
+        return {
+            "documentUrl": _DOCUMENT_URL,
+            "monitorToken": monitor_token,
+            **self.state,
+        }
 
     async def emit_image_change(self) -> None:
         event = SimpleNamespace(
@@ -224,6 +229,133 @@ class _ImageEventPage:
         )
         for handler in tuple(self.handlers[cdp.runtime.BindingCalled]):
             await handler(event)
+
+
+class _NetworkCapturePage:
+    def __init__(
+        self,
+        image: bytes,
+        *,
+        base64_encoded: bool = True,
+    ) -> None:
+        self.handlers: dict[type[Any], list[Any]] = defaultdict(list)
+        self.commands: list[dict[str, object]] = []
+        self.evaluations: list[str] = []
+        self.evaluation_results: list[object] = []
+        self.response_body: object = (
+            base64.b64encode(image).decode("ascii"),
+            base64_encoded,
+        )
+        self.handlers_installed_before_network_enable = False
+        self.remove_failures: set[type[Any]] = set()
+        self.before_frame_tree_return: Any | None = None
+        self.network_enable_started = asyncio.Event()
+        self.network_enable_release: asyncio.Event | None = None
+
+    def add_handler(self, event_type: type[Any], handler: Any) -> None:
+        self.handlers[event_type].append(handler)
+
+    def remove_handlers(self, event_type: type[Any], handler: Any) -> None:
+        if event_type in self.remove_failures:
+            self.remove_failures.remove(event_type)
+            raise RuntimeError("injected handler removal failure")
+        self.handlers[event_type].remove(handler)
+
+    async def send(self, command: object) -> object:
+        payload = next(command)  # type: ignore[arg-type]
+        self.commands.append(payload)
+        method = payload["method"]
+        if method == "Network.enable":
+            required = (
+                cdp.network.RequestWillBeSent,
+                cdp.network.ResponseReceived,
+                cdp.network.LoadingFinished,
+                cdp.network.LoadingFailed,
+                cdp.page.FrameNavigated,
+            )
+            self.handlers_installed_before_network_enable = all(
+                self.handlers[event_type] for event_type in required
+            )
+            self.network_enable_started.set()
+            if self.network_enable_release is not None:
+                await self.network_enable_release.wait()
+            return None
+        if method == "Page.enable":
+            return None
+        if method == "Page.getFrameTree":
+            if self.before_frame_tree_return is not None:
+                await self.before_frame_tree_return()
+            return SimpleNamespace(
+                frame=SimpleNamespace(id_=_FRAME_ID, loader_id=_LOADER_ID)
+            )
+        if method == "Network.getResponseBody":
+            if isinstance(self.response_body, list):
+                response_body = self.response_body.pop(0)
+                if isinstance(response_body, BaseException):
+                    raise response_body
+                return response_body
+            if isinstance(self.response_body, BaseException):
+                raise self.response_body
+            return self.response_body
+        raise AssertionError(f"unexpected CDP command: {method}")
+
+    async def evaluate(self, expression: str) -> object:
+        self.evaluations.append(expression)
+        if self.evaluation_results:
+            return self.evaluation_results.pop(0)
+        if "const monitor = window[monitorKey];" in expression:
+            return {"status": "stable"}
+        return {"status": "armed"}
+
+    async def emit(self, event_type: type[Any], event: object) -> None:
+        for handler in tuple(self.handlers[event_type]):
+            await handler(event)
+
+
+async def _emit_image_response(
+    page: _NetworkCapturePage,
+    *,
+    request_id: str = "pony-request",
+    request_url: str = _IMAGE_SOURCE,
+    response_url: str | None = None,
+    document_url: str = _DOCUMENT_URL,
+    mime_type: str = "image/png",
+    status: int = 200,
+    loader_id: cdp.network.LoaderId = _LOADER_ID,
+    frame_id: cdp.page.FrameId = _FRAME_ID,
+    finish: bool = True,
+) -> None:
+    typed_request_id = cdp.network.RequestId(request_id)
+    await page.emit(
+        cdp.network.RequestWillBeSent,
+        SimpleNamespace(
+            request_id=typed_request_id,
+            loader_id=loader_id,
+            document_url=document_url,
+            request=SimpleNamespace(url=request_url),
+            type_=cdp.network.ResourceType.IMAGE,
+            frame_id=frame_id,
+        ),
+    )
+    await page.emit(
+        cdp.network.ResponseReceived,
+        SimpleNamespace(
+            request_id=typed_request_id,
+            loader_id=loader_id,
+            type_=cdp.network.ResourceType.IMAGE,
+            frame_id=frame_id,
+            response=SimpleNamespace(
+                url=response_url or request_url,
+                status=status,
+                mime_type=mime_type,
+            ),
+        ),
+    )
+    if finish:
+        await page.emit(
+            cdp.network.LoadingFinished,
+            SimpleNamespace(request_id=typed_request_id),
+        )
 
 
 _NODE_IMAGE_READY_HARNESS = r"""
@@ -270,6 +402,7 @@ class FakeImage {
 }
 
 globalThis.window = globalThis;
+globalThis.location = {href: "https://hentaiverse.org/battle"};
 globalThis.MutationObserver = FakeMutationObserver;
 globalThis.setTimeout = () => 1;
 globalThis.clearTimeout = () => {};
@@ -310,39 +443,56 @@ process.stdout.write(JSON.stringify({
 }));
 """
 
-_NODE_CAPTURE_RECEIPT_HARNESS = r"""
+_NODE_RAW_RECEIPT_ABA_HARNESS = r"""
 const fs = require("node:fs");
-const expression = JSON.parse(fs.readFileSync(0, "utf8"));
-let image = {
-    src: "challenge",
-    currentSrc: "challenge",
-    complete: true,
-    naturalWidth: 640,
-    naturalHeight: 480,
-};
+const expressions = JSON.parse(fs.readFileSync(0, "utf8"));
+const observers = [];
+
+class FakeMutationObserver {
+    constructor(callback) {
+        this.callback = callback;
+        this.disconnected = false;
+        observers.push(this);
+    }
+    observe() {}
+    disconnect() { this.disconnected = true; }
+    trigger() { if (!this.disconnected) this.callback([]); }
+}
+
+class FakeImage {
+    constructor() {
+        this.src = "https://hentaiverse.org/pony-chart.png?challenge=1";
+        this.currentSrc = this.src;
+        this.complete = true;
+        this.naturalWidth = 640;
+        this.naturalHeight = 480;
+        this.listeners = new Map();
+    }
+    addEventListener(name, callback) { this.listeners.set(name, callback); }
+    removeEventListener(name, callback) {
+        if (this.listeners.get(name) === callback) this.listeners.delete(name);
+    }
+    getBoundingClientRect() { return {width: 640, height: 480}; }
+}
+
+globalThis.window = globalThis;
+globalThis.location = {href: "https://hentaiverse.org/battle"};
+globalThis.MutationObserver = FakeMutationObserver;
+globalThis.setTimeout = () => 1;
+globalThis.clearTimeout = () => {};
+globalThis.__hvbattle_ponychart_image_changed__ = () => {};
+let image = new FakeImage();
+const container = {querySelector: () => image};
 globalThis.document = {
-    getElementById(id) {
-        if (id !== "riddleimage") return null;
-        return {querySelector: () => image};
-    },
-    createElement(name) {
-        if (name !== "canvas") throw new Error("unexpected element");
-        return {
-            width: 0,
-            height: 0,
-            getContext: () => ({drawImage() {}}),
-            toDataURL: () => "data:image/png;base64,eA==",
-        };
-    },
+    documentElement: {},
+    getElementById(id) { return id === "riddleimage" ? container : null; },
 };
-const matching = eval(expression);
-image = {...image, src: "placeholder", currentSrc: "placeholder",
-    naturalWidth: 1, naturalHeight: 1};
-const placeholder = eval(expression);
-image = {...image, src: "other-challenge", currentSrc: "other-challenge",
-    naturalWidth: 640, naturalHeight: 480};
-const changedSource = eval(expression);
-process.stdout.write(JSON.stringify({matching, placeholder, changedSource}));
+
+const readiness = eval(expressions.arm);
+image = new FakeImage();
+observers.at(-1).trigger();
+const verification = eval(expressions.verify);
+process.stdout.write(JSON.stringify({readiness, verification}));
 """
 
 _NODE_PONYCHART_SUBMISSION_HARNESS = r"""
@@ -814,11 +964,13 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(driver.page.snapshot_calls, 1)
         self.assertTrue(all(not handlers for handlers in driver.page.handlers.values()))
 
-    async def test_small_rendered_size_is_diagnostic_not_canvas_readiness(self) -> None:
+    async def test_small_rendered_size_is_diagnostic_not_source_readiness(self) -> None:
         state = ponychart_module._decode_image_state(
             {
                 "ready": True,
                 "source": "challenge",
+                "documentUrl": _DOCUMENT_URL,
+                "monitorToken": "raw-monitor",
                 "width": 640,
                 "height": 480,
                 "renderedWidth": 1,
@@ -890,6 +1042,17 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         challenge._select_and_submit_answer = AsyncMock(return_value=True)
         challenge._wait_for_challenge_receipt = AsyncMock()
 
+        image = _png_bytes(64, 64)
+
+        async def capture_after_real_load(*, deadline: SemanticDeadline) -> bytes:
+            receipt = await challenge._wait_for_image_loaded(deadline=deadline)
+            self.assertEqual((receipt.width, receipt.height), (64, 64))
+            return image
+
+        challenge._capture_pony_chart_image = AsyncMock(
+            side_effect=capture_after_real_load
+        )
+
         resolution = asyncio.create_task(challenge.check())
         await asyncio.wait_for(page.observer_armed.wait(), timeout=1.0)
         challenge._predict_labels.assert_not_awaited()
@@ -907,7 +1070,7 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(outcome, PonyChartResolutionOutcome.SUBMISSION_CONFIRMED)
         classified_image = challenge._predict_labels.await_args.args[0]
-        self.assertEqual(ponychart_module._validate_png(classified_image), (64, 64))
+        self.assertEqual(classified_image, image)
 
     async def test_one_pixel_until_deadline_expires_without_inference(self) -> None:
         driver = Mock(headless=True)
@@ -930,13 +1093,11 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         challenge._predict_labels = AsyncMock()
         challenge._reconcile_natural_expiration = AsyncMock(return_value=True)
 
-        outcome = await challenge.check()
+        with self.assertRaises(TimeoutError):
+            await challenge.check()
 
-        self.assertIs(
-            outcome,
-            PonyChartResolutionOutcome.EXPIRED_WITHOUT_SUBMISSION,
-        )
         challenge._predict_labels.assert_not_awaited()
+        challenge._reconcile_natural_expiration.assert_not_awaited()
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for JS test")
     async def test_source_mutation_and_image_load_wake_without_fixed_sleep(
@@ -963,116 +1124,285 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["loading"]["ready"])
         self.assertTrue(result["loaded"]["ready"])
         self.assertTrue(result["initiallyReal"]["ready"])
+        self.assertEqual(result["loaded"]["monitorToken"], "receipt-token")
         self.assertEqual(result["sourceMutationWakeups"], 1)
         self.assertEqual(result["loadWakeups"], 2)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for JS test")
-    async def test_atomic_canvas_capture_rejects_placeholder_and_changed_source(
-        self,
-    ) -> None:
-        expression = (
-            ponychart_module._CANVAS_CAPTURE_JS.replace(
-                "__EXPECTED_SOURCE__",
-                json.dumps("challenge"),
+    async def test_atomic_monitor_detects_same_url_dimension_element_aba(self) -> None:
+        arm = (
+            ponychart_module._ARM_PONYCHART_IMAGE_READY_JS.replace(
+                "__TOKEN__",
+                json.dumps("atomic-token"),
             )
+            .replace("__MINIMUM_DIMENSION__", "50")
+            .replace("__CLEANUP_MILLISECONDS__", "10000")
+        )
+        verify = (
+            ponychart_module._VERIFY_PONYCHART_RAW_RESPONSE_RECEIPT_JS.replace(
+                "__TOKEN__",
+                json.dumps("atomic-token"),
+            )
+            .replace("__EXPECTED_SOURCE__", json.dumps(_IMAGE_SOURCE))
+            .replace("__EXPECTED_DOCUMENT_URL__", json.dumps(_DOCUMENT_URL))
             .replace("__EXPECTED_WIDTH__", "640")
             .replace("__EXPECTED_HEIGHT__", "480")
-            .replace("__MINIMUM_DIMENSION__", "50")
         )
         completed = subprocess.run(
-            [shutil.which("node") or "node", "-e", _NODE_CAPTURE_RECEIPT_HARNESS],
-            input=json.dumps(expression),
+            [shutil.which("node") or "node", "-e", _NODE_RAW_RECEIPT_ABA_HARNESS],
+            input=json.dumps({"arm": arm, "verify": verify}),
             check=True,
             capture_output=True,
             text=True,
         )
         result = json.loads(completed.stdout)
 
-        self.assertEqual(result["matching"]["status"], "ok")
-        self.assertEqual(result["placeholder"]["status"], "stale")
-        self.assertEqual(result["changedSource"]["status"], "stale")
+        self.assertTrue(result["readiness"]["ready"])
+        self.assertEqual(result["readiness"]["monitorToken"], "atomic-token")
+        self.assertEqual(result["verification"]["status"], "stale")
 
-    async def test_stale_capture_reuses_same_deadline_and_waits_for_new_receipt(
+    async def test_network_tracking_is_armed_before_enable_and_navigation(
         self,
     ) -> None:
-        image = _png_bytes(59, 57)
-        driver = Mock(headless=True)
-        driver.page = Mock()
-        driver.page.evaluate = AsyncMock(
-            side_effect=[
-                {"status": "stale", "errorName": "ImageReceiptChanged"},
-                _canvas_payload(image, 59, 57),
-            ]
-        )
+        page = _NetworkCapturePage(_png_bytes(60, 55))
+        driver = Mock(headless=True, page=page)
         challenge = PonyChart(driver)
-        challenge._wait_for_image_loaded = AsyncMock(
-            side_effect=[
-                _image_receipt("first-challenge", 59, 57),
-                _image_receipt("second-challenge", 59, 57),
-            ]
+
+        await challenge.arm_network_capture()
+
+        self.assertTrue(page.handlers_installed_before_network_enable)
+        self.assertEqual(
+            [command["method"] for command in page.commands],
+            ["Network.enable", "Page.enable", "Page.getFrameTree"],
         )
-        deadline = SemanticDeadline.after(1.0)
+        enable_parameters = page.commands[0]["params"]
+        self.assertEqual(enable_parameters["enableDurableMessages"], True)  # type: ignore[index]
 
-        captured = await challenge._capture_pony_chart_image(deadline=deadline)
+    async def test_concurrent_network_arms_install_exactly_one_handler_set(
+        self,
+    ) -> None:
+        page = _NetworkCapturePage(_png_bytes(60, 55))
+        page.network_enable_release = asyncio.Event()
+        driver = Mock(headless=True, page=page)
+        challenge = PonyChart(driver)
 
-        self.assertEqual(captured, image)
-        self.assertEqual(challenge._wait_for_image_loaded.await_count, 2)
-        for awaited in challenge._wait_for_image_loaded.await_args_list:
-            self.assertIs(awaited.kwargs["deadline"], deadline)
-        first_script = driver.page.evaluate.await_args_list[0].args[0]
-        second_script = driver.page.evaluate.await_args_list[1].args[0]
-        self.assertIn('"first-challenge"', first_script)
-        self.assertIn('"second-challenge"', second_script)
+        first = asyncio.create_task(challenge.arm_network_capture())
+        await page.network_enable_started.wait()
+        second = asyncio.create_task(challenge.arm_network_capture())
+        await asyncio.sleep(0)
 
-    async def test_canvas_capture_passes_page_as_timeout_owner(self) -> None:
+        self.assertTrue(all(len(handlers) == 1 for handlers in page.handlers.values()))
+        self.assertFalse(second.done())
+        page.network_enable_release.set()
+        await asyncio.gather(first, second)
+
+        self.assertEqual(
+            [command["method"] for command in page.commands].count("Network.enable"),
+            1,
+        )
+        self.assertTrue(all(len(handlers) == 1 for handlers in page.handlers.values()))
+        await challenge.close()
+
+    async def test_close_dominates_overlapping_arm_and_rejects_new_arm(self) -> None:
+        page = _NetworkCapturePage(_png_bytes(60, 55))
+        page.network_enable_release = asyncio.Event()
+        driver = Mock(headless=True, page=page)
+        challenge = PonyChart(driver)
+        arming = asyncio.create_task(challenge.arm_network_capture())
+        await page.network_enable_started.wait()
+
+        closing = asyncio.create_task(challenge.close())
+        await asyncio.sleep(0)
+        self.assertFalse(closing.done())
+        self.assertEqual(challenge._network_close_requests, 1)
+        with self.assertRaisesRegex(
+            PonyChartImageAcquisitionError,
+            "overlapped handler shutdown",
+        ):
+            await challenge.arm_network_capture()
+
+        page.network_enable_release.set()
+        await arming
+        await closing
+
+        self.assertIsNone(challenge._network_page)
+        self.assertTrue(all(not handlers for handlers in page.handlers.values()))
+
+    async def test_frame_tree_snapshot_cannot_overwrite_newer_navigation(self) -> None:
+        page = _NetworkCapturePage(_png_bytes(60, 55))
+        next_frame = cdp.page.FrameId("newer-frame")
+        next_loader = cdp.network.LoaderId("newer-loader")
+
+        async def navigate_before_snapshot_returns() -> None:
+            await page.emit(
+                cdp.page.FrameNavigated,
+                SimpleNamespace(
+                    frame=SimpleNamespace(
+                        id_=next_frame,
+                        loader_id=next_loader,
+                        parent_id=None,
+                    )
+                ),
+            )
+
+        page.before_frame_tree_return = navigate_before_snapshot_returns
+        driver = Mock(headless=True, page=page)
+        challenge = PonyChart(driver)
+
+        await challenge.arm_network_capture()
+
+        self.assertEqual(challenge._main_frame_id, next_frame)
+        self.assertEqual(challenge._main_loader_id, next_loader)
+
+    async def test_out_of_order_finished_event_waits_for_response_handler(self) -> None:
+        image = _png_bytes(60, 55)
+        page = _NetworkCapturePage(image)
+        driver = Mock(headless=True, page=page)
+        challenge = PonyChart(driver)
+        await challenge.arm_network_capture()
+        request_id = cdp.network.RequestId("out-of-order")
+        await page.emit(
+            cdp.network.RequestWillBeSent,
+            SimpleNamespace(
+                request_id=request_id,
+                loader_id=_LOADER_ID,
+                document_url=_DOCUMENT_URL,
+                request=SimpleNamespace(url=_IMAGE_SOURCE),
+                type_=cdp.network.ResourceType.IMAGE,
+                frame_id=_FRAME_ID,
+            ),
+        )
+        await page.emit(
+            cdp.network.LoadingFinished,
+            SimpleNamespace(request_id=request_id),
+        )
+        waiter = asyncio.create_task(
+            challenge._wait_for_matching_network_requests(
+                _image_receipt(width=60, height=55),
+                deadline=SemanticDeadline.after(1.0),
+            )
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(waiter.done())
+
+        await page.emit(
+            cdp.network.ResponseReceived,
+            SimpleNamespace(
+                request_id=request_id,
+                loader_id=_LOADER_ID,
+                type_=cdp.network.ResourceType.IMAGE,
+                frame_id=_FRAME_ID,
+                response=SimpleNamespace(
+                    url=_IMAGE_SOURCE,
+                    status=200,
+                    mime_type="image/png",
+                ),
+            ),
+        )
+
+        matching = await waiter
+        self.assertEqual(len(matching), 1)
+
+    async def test_close_detaches_handlers_before_external_page_reuse(self) -> None:
+        image = _png_bytes(60, 55)
+        page = _NetworkCapturePage(image)
+        driver = Mock(headless=True, page=page)
+        first = PonyChart(driver)
+        await first.arm_network_capture()
+
+        await first.close()
+
+        self.assertTrue(all(not handlers for handlers in page.handlers.values()))
+        self.assertNotIn(
+            "Network.disable",
+            [command["method"] for command in page.commands],
+        )
+        second = PonyChart(driver)
+        await second.arm_network_capture()
+        self.assertTrue(all(len(handlers) == 1 for handlers in page.handlers.values()))
+        await _emit_image_response(page, request_id="second-owner")
+        self.assertEqual(first._network_requests, {})
+        self.assertEqual(len(second._network_requests), 1)
+        await second.close()
+
+    async def test_close_preserves_failed_handler_removal_for_retry(self) -> None:
+        page = _NetworkCapturePage(_png_bytes(60, 55))
+        driver = Mock(headless=True, page=page)
+        challenge = PonyChart(driver)
+        await challenge.arm_network_capture()
+        await _emit_image_response(page)
+        page.remove_failures.add(cdp.network.ResponseReceived)
+
+        with self.assertRaises(PonyChartImageAcquisitionError):
+            await challenge.close()
+
+        self.assertIs(challenge._network_page, page)
+        self.assertEqual(len(challenge._network_handlers), 1)
+        self.assertTrue(challenge._network_requests)
+
+        await challenge.close()
+
+        self.assertIsNone(challenge._network_page)
+        self.assertEqual(challenge._network_handlers, ())
+        self.assertEqual(challenge._network_requests, {})
+
+    async def test_late_frame_navigation_event_does_not_erase_current_requests(
+        self,
+    ) -> None:
+        image = _png_bytes(60, 55)
+        page = _NetworkCapturePage(image)
+        driver = Mock(headless=True, page=page)
+        challenge = PonyChart(driver)
+        await challenge.arm_network_capture()
+        next_loader = cdp.network.LoaderId("next-loader")
+        next_frame = cdp.page.FrameId("next-frame")
+
+        await _emit_image_response(
+            page,
+            loader_id=next_loader,
+            frame_id=next_frame,
+        )
+        await page.emit(
+            cdp.page.FrameNavigated,
+            SimpleNamespace(
+                frame=SimpleNamespace(
+                    id_=next_frame,
+                    loader_id=next_loader,
+                    parent_id=None,
+                )
+            ),
+        )
+
+        matching = challenge._matching_network_requests(
+            _image_receipt(width=60, height=55)
+        )
+        self.assertEqual(len(matching), 1)
+
+    async def test_capture_returns_byte_exact_network_response_body(self) -> None:
         image = _png_bytes(53, 54)
-        driver = Mock(headless=True)
-        driver.page = Mock()
-        driver.page.evaluate = AsyncMock(return_value=_canvas_payload(image, 53, 54))
+        page = _NetworkCapturePage(image)
+        driver = Mock(headless=True, page=page)
         challenge = PonyChart(driver)
+        await challenge.arm_network_capture()
+        await _emit_image_response(page)
         challenge._wait_for_image_loaded = AsyncMock(
             return_value=_image_receipt(width=53, height=54)
         )
-        observed_owners: list[object] = []
-        original_wait = ponychart_module.wait_for_zendriver
 
-        async def observe_owner(
-            awaitable: object,
-            *,
-            timeout: float,
-            owner: object,
-        ) -> object:
-            observed_owners.append(owner)
-            return await original_wait(awaitable, timeout=timeout, owner=owner)
-
-        with patch.object(
-            ponychart_module,
-            "wait_for_zendriver",
-            side_effect=observe_owner,
-        ):
-            captured = await challenge._capture_pony_chart_image(
-                deadline=SemanticDeadline.after(30.0)
-            )
-
-        self.assertEqual(captured, image)
-        self.assertEqual(observed_owners, [driver.page])
-
-    async def test_one_pixel_canvas_capture_is_rejected_before_inference(
-        self,
-    ) -> None:
-        image = _png_bytes(1, 1)
-        driver = Mock(headless=True)
-        driver.page = Mock()
-        driver.page.evaluate = AsyncMock(return_value=_canvas_payload(image, 1, 1))
-        challenge = PonyChart(driver)
-        challenge._wait_for_image_loaded = AsyncMock(
-            return_value=_image_receipt(width=1, height=1)
+        captured = await challenge._capture_pony_chart_image(
+            deadline=SemanticDeadline.after(30.0)
         )
 
-        with self.assertRaisesRegex(ValueError, "placeholder dimensions"):
-            await challenge._capture_pony_chart_image(
-                deadline=SemanticDeadline.after(1.0)
-            )
+        self.assertEqual(captured, image)
+        self.assertEqual(
+            [
+                command["method"]
+                for command in page.commands
+                if command["method"] == "Network.getResponseBody"
+            ],
+            ["Network.getResponseBody"],
+        )
+        self.assertEqual(len(page.evaluations), 1)
 
     async def test_unconfigured_successful_resolution_stays_in_memory(
         self,
@@ -1290,13 +1620,11 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             image_directory = Path(directory) / "nested" / "pony_chart"
             image = _png_bytes(63, 57)
-            driver = Mock(headless=True)
-            driver.page = Mock()
-            driver.page.evaluate = AsyncMock(
-                return_value=_canvas_payload(image, 63, 57)
-            )
-            driver.page.send = AsyncMock()
+            page = _NetworkCapturePage(image)
+            driver = Mock(headless=True, page=page)
             challenge = PonyChart(driver, image_directory=image_directory)
+            await challenge.arm_network_capture()
+            await _emit_image_response(page, request_id="first")
             challenge._wait_for_image_loaded = AsyncMock(
                 return_value=_image_receipt(width=63, height=57)
             )
@@ -1304,6 +1632,7 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
             first = await challenge._capture_pony_chart_image(
                 deadline=SemanticDeadline.after(30.0)
             )
+            await _emit_image_response(page, request_id="second")
             second = await challenge._capture_pony_chart_image(
                 deadline=SemanticDeadline.after(30.0)
             )
@@ -1311,8 +1640,13 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(image_directory.exists())
             self.assertEqual(first, image)
             self.assertEqual(second, image)
-            self.assertEqual(driver.page.evaluate.await_count, 2)
-            driver.page.send.assert_not_awaited()
+            self.assertEqual(
+                sum(
+                    command["method"] == "Network.getResponseBody"
+                    for command in page.commands
+                ),
+                2,
+            )
 
     async def test_retain_pony_chart_image_enqueues_without_waiting_for_write(
         self,
@@ -1376,249 +1710,240 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
                 len(image),
             )
 
-    async def test_canvas_security_error_uses_one_shot_screenshot_fallback(
-        self,
-    ) -> None:
+    async def test_same_url_and_dimensions_replacement_fails_closed(self) -> None:
         image = _png_bytes(67, 55)
-        driver = Mock(headless=True)
-        driver.page = Mock()
-        driver.page.evaluate = AsyncMock(
-            side_effect=[
-                {"status": "security-error", "errorName": "SecurityError"},
-                {
-                    "status": "ok",
-                    "x": 0.0,
-                    "y": 12.5,
-                    "width": 987.25,
-                    "height": 543.75,
-                },
-                {"status": "stable"},
-            ]
-        )
-        driver.page.send = AsyncMock(
-            return_value=base64.b64encode(image).decode("ascii")
-        )
+        page = _NetworkCapturePage(image)
+        page.evaluation_results = [{"status": "stale"}]
+        driver = Mock(headless=True, page=page)
         challenge = PonyChart(driver)
-        challenge._wait_for_image_loaded = AsyncMock(return_value=_image_receipt())
+        await challenge.arm_network_capture()
+        await _emit_image_response(
+            page,
+            request_id="same-url-replacement",
+        )
+        challenge._wait_for_image_loaded = AsyncMock(
+            return_value=_image_receipt(width=67, height=55)
+        )
+
+        with self.assertRaisesRegex(
+            PonyChartImageAcquisitionError,
+            "displayed image changed",
+        ):
+            await challenge._capture_pony_chart_image(
+                deadline=SemanticDeadline.after(2.0)
+            )
+
+        challenge._wait_for_image_loaded.assert_awaited_once()
+        self.assertEqual(
+            [command["method"] for command in page.commands].count(
+                "Network.getResponseBody"
+            ),
+            1,
+        )
+
+    async def test_redirect_alias_matches_displayed_source(self) -> None:
+        image = _png_bytes(63, 57)
+        original_url = "https://hentaiverse.org/pony-chart?id=redirected"
+        final_url = "https://cdn.hentaiverse.org/pony-chart.png"
+        page = _NetworkCapturePage(image)
+        driver = Mock(headless=True, page=page)
+        challenge = PonyChart(driver)
+        await challenge.arm_network_capture()
+        request_id = cdp.network.RequestId("redirect")
+        await page.emit(
+            cdp.network.RequestWillBeSent,
+            SimpleNamespace(
+                request_id=request_id,
+                loader_id=_LOADER_ID,
+                document_url=_DOCUMENT_URL,
+                request=SimpleNamespace(url=original_url),
+                type_=cdp.network.ResourceType.IMAGE,
+                frame_id=_FRAME_ID,
+            ),
+        )
+        await _emit_image_response(
+            page,
+            request_id="redirect",
+            request_url=final_url,
+            response_url=final_url,
+        )
+        challenge._wait_for_image_loaded = AsyncMock(
+            return_value=_image_receipt(original_url, 63, 57)
+        )
 
         captured = await challenge._capture_pony_chart_image(
-            deadline=SemanticDeadline.after(30.0)
+            deadline=SemanticDeadline.after(1.0)
         )
 
         self.assertEqual(captured, image)
-        self.assertEqual(driver.page.evaluate.await_count, 3)
-        driver.page.send.assert_awaited_once()
 
-    async def test_changed_image_discards_screenshot_and_recaptures(self) -> None:
-        stale_screenshot = _png_bytes(67, 55)
-        final_image = _png_bytes(69, 56)
-        driver = Mock(headless=True)
-        driver.page = Mock()
-        driver.page.evaluate = AsyncMock(
-            side_effect=[
-                {"status": "security-error", "errorName": "SecurityError"},
-                {
-                    "status": "ok",
-                    "x": 0.0,
-                    "y": 0.0,
-                    "width": 640.0,
-                    "height": 480.0,
-                },
-                {"status": "stale"},
-                _canvas_payload(final_image, 69, 56),
-            ]
-        )
-        driver.page.send = AsyncMock(
-            return_value=base64.b64encode(stale_screenshot).decode("ascii")
-        )
+    async def test_capture_requires_request_event_from_prearmed_tracker(self) -> None:
+        image = _png_bytes(64, 64)
+        page = _NetworkCapturePage(image)
+        driver = Mock(headless=True, page=page)
         challenge = PonyChart(driver)
+        await challenge.arm_network_capture()
+        tracked = challenge._tracked_network_request(
+            cdp.network.RequestId("late-tracker")
+        )
+        tracked.urls.add(
+            ponychart_module._network_url_key(
+                _IMAGE_SOURCE,
+                description="test image",
+            )
+        )
+        tracked.document_urls.add(
+            ponychart_module._network_url_key(
+                _DOCUMENT_URL,
+                description="test document",
+            )
+        )
+        tracked.loader_ids.add(_LOADER_ID)
+        tracked.frame_ids.add(_FRAME_ID)
+        tracked.response_received = True
+        tracked.finished = True
+        tracked.is_image = True
+        tracked.status = 200
+        tracked.mime_type = "image/png"
+        challenge._wait_for_matching_network_requests = AsyncMock(
+            return_value=(tracked,)
+        )
         challenge._wait_for_image_loaded = AsyncMock(
-            side_effect=[
-                _image_receipt("first-challenge"),
-                _image_receipt("second-challenge", 69, 56),
-            ]
+            return_value=_image_receipt(width=64, height=64)
         )
 
-        captured = await challenge._capture_pony_chart_image(
-            deadline=SemanticDeadline.after(2.0)
+        with self.assertRaisesRegex(
+            PonyChartImageAcquisitionError,
+            "began after",
+        ):
+            await challenge._capture_pony_chart_image(
+                deadline=SemanticDeadline.after(1.0)
+            )
+
+        self.assertFalse(
+            any(
+                command["method"] == "Network.getResponseBody"
+                for command in page.commands
+            )
         )
 
-        self.assertEqual(captured, final_image)
-        self.assertNotEqual(captured, stale_screenshot)
-        self.assertEqual(challenge._wait_for_image_loaded.await_count, 2)
-        driver.page.send.assert_awaited_once()
-
-    async def test_invalid_canvas_base64_or_png_is_rejected_in_memory(
-        self,
-    ) -> None:
-        header = struct.pack(">IIBBBBB", 3, 4, 8, 6, 0, 0, 0)
-        header_only_png = b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", header)
-        bad_checksum_png = bytearray(_png_bytes(3, 4))
-        bad_checksum_png[-1] ^= 1
-        cases = {
-            "base64": {
-                "status": "ok",
-                "width": 3,
-                "height": 4,
-                "dataUrl": "data:image/png;base64,not%%%base64",
-            },
-            "png": {
-                "status": "ok",
-                "width": 3,
-                "height": 4,
-                "dataUrl": (
-                    "data:image/png;base64,"
-                    + base64.b64encode(b"not a PNG").decode("ascii")
-                ),
-            },
-            "truncated-png": _canvas_payload(header_only_png, 3, 4),
-            "bad-png-checksum": _canvas_payload(bytes(bad_checksum_png), 3, 4),
+    async def test_invalid_network_body_is_rejected_without_fallback(self) -> None:
+        valid_image = _png_bytes(64, 64)
+        invalid_checksum = bytearray(valid_image)
+        invalid_checksum[-1] ^= 1
+        cases: dict[str, tuple[object, str, tuple[float, float]]] = {
+            "not-base64-transport": (("raw text", False), "image/png", (64, 64)),
+            "invalid-base64": (("not%%%base64", True), "image/png", (64, 64)),
+            "not-an-image": (
+                (base64.b64encode(b"not an image").decode("ascii"), True),
+                "image/png",
+                (64, 64),
+            ),
+            "invalid-checksum": (
+                (base64.b64encode(bytes(invalid_checksum)).decode("ascii"), True),
+                "image/png",
+                (64, 64),
+            ),
+            "mime-mismatch": (
+                (base64.b64encode(valid_image).decode("ascii"), True),
+                "image/jpeg",
+                (64, 64),
+            ),
+            "dimension-mismatch": (
+                (base64.b64encode(valid_image).decode("ascii"), True),
+                "image/png",
+                (65, 64),
+            ),
         }
-        for name, payload in cases.items():
+        for name, (response_body, mime_type, dimensions) in cases.items():
             with self.subTest(name=name):
-                driver = Mock(headless=True)
-                driver.page = Mock()
-                driver.page.evaluate = AsyncMock(return_value=payload)
-                driver.page.send = AsyncMock()
+                page = _NetworkCapturePage(valid_image)
+                page.response_body = response_body
+                driver = Mock(headless=True, page=page)
                 challenge = PonyChart(driver)
+                await challenge.arm_network_capture()
+                await _emit_image_response(page, mime_type=mime_type)
                 challenge._wait_for_image_loaded = AsyncMock(
-                    return_value=_image_receipt()
+                    return_value=_image_receipt(
+                        width=dimensions[0],
+                        height=dimensions[1],
+                    )
                 )
 
-                with self.assertRaises(ValueError):
+                with self.assertRaises(PonyChartImageAcquisitionError):
                     await challenge._capture_pony_chart_image(
-                        deadline=SemanticDeadline.after(30.0)
+                        deadline=SemanticDeadline.after(1.0)
                     )
 
-                driver.page.send.assert_not_awaited()
+                self.assertEqual(
+                    sum(
+                        command["method"] == "Network.getResponseBody"
+                        for command in page.commands
+                    ),
+                    1,
+                )
 
-    async def test_canvas_header_dimension_mismatch_is_rejected_in_memory(
+    async def test_failed_or_ambiguous_response_never_requests_a_body(self) -> None:
+        image = _png_bytes(64, 64)
+        for name, statuses in {
+            "http-failure": (503,),
+            "ambiguous": (200, 200),
+        }.items():
+            with self.subTest(name=name):
+                page = _NetworkCapturePage(image)
+                driver = Mock(headless=True, page=page)
+                challenge = PonyChart(driver)
+                await challenge.arm_network_capture()
+                for index, status in enumerate(statuses):
+                    await _emit_image_response(
+                        page,
+                        request_id=f"request-{index}",
+                        status=status,
+                    )
+                challenge._wait_for_image_loaded = AsyncMock(
+                    return_value=_image_receipt(width=64, height=64)
+                )
+
+                with self.assertRaises(PonyChartImageAcquisitionError):
+                    await challenge._capture_pony_chart_image(
+                        deadline=SemanticDeadline.after(1.0)
+                    )
+
+                self.assertFalse(
+                    any(
+                        command["method"] == "Network.getResponseBody"
+                        for command in page.commands
+                    )
+                )
+
+    async def test_response_body_failure_raises_without_secondary_request(
         self,
     ) -> None:
-        image = _png_bytes(11, 9)
-        driver = Mock(headless=True)
-        driver.page = Mock()
-        driver.page.evaluate = AsyncMock(return_value=_canvas_payload(image, 11, 10))
-        driver.page.send = AsyncMock()
+        image = _png_bytes(64, 64)
+        page = _NetworkCapturePage(image)
+        page.response_body = RuntimeError("body evicted")
+        driver = Mock(headless=True, page=page)
         challenge = PonyChart(driver)
-        challenge._wait_for_image_loaded = AsyncMock(return_value=_image_receipt())
-
-        with self.assertRaisesRegex(ValueError, "dimensions did not match"):
-            await challenge._capture_pony_chart_image(
-                deadline=SemanticDeadline.after(30.0)
-            )
-
-        driver.page.send.assert_not_awaited()
-
-    async def test_canvas_timeout_does_not_fallback_or_retry(self) -> None:
-        driver = Mock(headless=True)
-        driver.page = Mock()
-
-        async def hang(_script: str) -> object:
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
-
-        driver.page.evaluate = AsyncMock(side_effect=hang)
-        driver.page.send = AsyncMock()
-        challenge = PonyChart(driver)
-        challenge._wait_for_image_loaded = AsyncMock(return_value=_image_receipt())
-
-        with (
-            patch.object(
-                ponychart_module,
-                "_PONYCHART_DOM_CAPTURE_TIMEOUT_SECONDS",
-                0.01,
-            ),
-            self.assertRaises(ZendriverOperationTimeout),
-        ):
-            await challenge._capture_pony_chart_image(
-                deadline=SemanticDeadline.after(30.0)
-            )
-
-        driver.page.evaluate.assert_awaited_once()
-        driver.page.send.assert_not_awaited()
-
-    async def test_image_load_and_capture_share_one_absolute_deadline(self) -> None:
-        now = 0.0
-        image = _png_bytes(3, 4)
-        driver = Mock(headless=True)
-        driver.page = Mock()
-        driver.page.evaluate = AsyncMock(return_value=_canvas_payload(image, 3, 4))
-        driver.page.send = AsyncMock()
-        challenge = PonyChart(driver)
-
-        async def consume_load(*, deadline: SemanticDeadline) -> object:
-            nonlocal now
-            self.assertEqual(deadline.remaining(), 10.0)
-            now = 9.2
-            return _image_receipt()
-
-        async def finish_canvas_late(
-            awaitable: object,
-            *,
-            timeout: float,
-            owner: object,
-        ) -> object:
-            nonlocal now
-            del owner
-            self.assertAlmostEqual(timeout, 0.8)
-            now = 10.1
-            return await awaitable  # type: ignore[misc]
-
-        challenge._wait_for_image_loaded = AsyncMock(side_effect=consume_load)
-        deadline = SemanticDeadline(expires_at=10.0, _clock=lambda: now)
-
-        with (
-            patch.object(
-                ponychart_module,
-                "wait_for_zendriver",
-                side_effect=finish_canvas_late,
-            ),
-            self.assertRaisesRegex(TimeoutError, "canvas capture"),
-        ):
-            await challenge._capture_pony_chart_image(deadline=deadline)
-
-        driver.page.evaluate.assert_awaited_once()
-        driver.page.send.assert_not_awaited()
-
-    async def test_screenshot_timeout_does_not_retry(self) -> None:
-        driver = Mock(headless=True)
-        driver.page = Mock()
-        driver.page.evaluate = AsyncMock(
-            side_effect=[
-                {"status": "security-error", "errorName": "SecurityError"},
-                {
-                    "status": "ok",
-                    "x": 0,
-                    "y": 0,
-                    "width": 90,
-                    "height": 80,
-                },
-            ]
+        await challenge.arm_network_capture()
+        await _emit_image_response(page)
+        challenge._wait_for_image_loaded = AsyncMock(
+            return_value=_image_receipt(width=64, height=64)
         )
 
-        async def hang(_command: object) -> object:
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
-
-        driver.page.send = AsyncMock(side_effect=hang)
-        challenge = PonyChart(driver)
-        challenge._wait_for_image_loaded = AsyncMock(return_value=_image_receipt())
-
-        with (
-            patch.object(
-                ponychart_module,
-                "_PONYCHART_SCREENSHOT_TIMEOUT_SECONDS",
-                0.01,
-            ),
-            self.assertRaises(ZendriverOperationTimeout),
+        with self.assertRaisesRegex(
+            PonyChartImageAcquisitionError,
+            "body was unavailable",
         ):
             await challenge._capture_pony_chart_image(
-                deadline=SemanticDeadline.after(30.0)
+                deadline=SemanticDeadline.after(1.0)
             )
 
-        self.assertEqual(driver.page.evaluate.await_count, 2)
-        driver.page.send.assert_awaited_once()
+        self.assertEqual(
+            [command["method"] for command in page.commands].count(
+                "Network.getResponseBody"
+            ),
+            1,
+        )
 
 
 class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
@@ -2278,6 +2603,56 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         challenge._capture_pony_chart_image.assert_awaited_once()
         challenge._predict_labels.assert_not_awaited()
         challenge._reconcile_natural_expiration.assert_not_awaited()
+
+    async def test_raw_acquisition_failure_is_never_reclassified_as_expiry(
+        self,
+    ) -> None:
+        acquisition_error = PonyChartImageAcquisitionError("body unavailable")
+        driver = Mock(headless=True)
+        challenge = PonyChart(driver)
+        challenge._check = AsyncMock(return_value=True)
+        challenge._arm_challenge_receipt_monitor = AsyncMock(
+            return_value=_receipt_context()
+        )
+        challenge._capture_pony_chart_image = AsyncMock(side_effect=acquisition_error)
+        challenge._predict_labels = AsyncMock()
+        challenge._reconcile_natural_expiration = AsyncMock(return_value=True)
+
+        with self.assertRaises(PonyChartImageAcquisitionError) as raised:
+            await challenge.check()
+
+        self.assertIs(raised.exception, acquisition_error)
+        challenge._predict_labels.assert_not_awaited()
+        challenge._reconcile_natural_expiration.assert_not_awaited()
+
+    async def test_all_capture_exceptions_propagate_without_expiry_probe(
+        self,
+    ) -> None:
+        errors = (
+            PonyChartImageAcquisitionError("raw response failed"),
+            TimeoutError("image receipt expired"),
+            ValueError("malformed receipt"),
+        )
+        for capture_error in errors:
+            with self.subTest(error_type=type(capture_error).__name__):
+                driver = Mock(headless=True)
+                challenge = PonyChart(driver)
+                challenge._check = AsyncMock(return_value=True)
+                challenge._arm_challenge_receipt_monitor = AsyncMock(
+                    return_value=_receipt_context()
+                )
+                challenge._capture_pony_chart_image = AsyncMock(
+                    side_effect=capture_error
+                )
+                challenge._predict_labels = AsyncMock()
+                challenge._reconcile_natural_expiration = AsyncMock(return_value=True)
+
+                with self.assertRaises(type(capture_error)) as raised:
+                    await challenge.check()
+
+                self.assertIs(raised.exception, capture_error)
+                challenge._predict_labels.assert_not_awaited()
+                challenge._reconcile_natural_expiration.assert_not_awaited()
 
     async def test_inference_generation_timeout_skips_natural_expiry_probe(
         self,

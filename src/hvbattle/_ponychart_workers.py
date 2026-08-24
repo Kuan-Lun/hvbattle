@@ -34,6 +34,8 @@ from hvbrowser.runtime import (
     start_owned_process,
 )
 
+from ._ponychart_image import inspect_ponychart_image
+
 _INFERENCE_TERMINATE_GRACE_SECONDS: Final = 0.25
 _INFERENCE_KILL_GRACE_SECONDS: Final = 0.75
 _INFERENCE_STARTUP_TIMEOUT_SECONDS: Final = 15.0
@@ -1792,13 +1794,14 @@ class _RetentionWrite:
 
 
 def _write_retained_capture(image: bytes, directory: Path) -> None:
+    image_info = inspect_ponychart_image(image)
     directory.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     destination: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             prefix=f"pony_chart_{timestamp}_",
-            suffix=".png",
+            suffix=image_info.extension,
             dir=directory,
             delete=False,
         ) as temporary:
@@ -1827,7 +1830,7 @@ def _retention_worker_main(
             return
         try:
             _write_retained_capture(message.image, message.directory)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             logger.warning(
                 "PonyChart image retention write failed error_type=%s",
                 type(error).__name__,

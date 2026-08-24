@@ -3,13 +3,14 @@ import base64
 import binascii
 import json
 import math
-import struct
 import threading
 import time
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from hvbrowser import HVDriver
@@ -22,6 +23,7 @@ from hvbrowser.runtime import (
 )
 from zendriver import cdp
 
+from ._ponychart_image import PonyChartImageInfo, inspect_ponychart_image
 from ._ponychart_store_process import PonyChartStoreProcessOwner
 from ._ponychart_workers import (
     PonyChartGenerationDescriptor,
@@ -38,15 +40,12 @@ from .ponychart_model_store import (
 
 logger = setup_logger(__name__)
 
-_PONYCHART_DOM_CAPTURE_TIMEOUT_SECONDS = 4.0
-_PONYCHART_SCREENSHOT_TIMEOUT_SECONDS = PROTOCOL_TIMEOUT_SECONDS
 _PONYCHART_MUTATION_TIMEOUT_SECONDS = PROTOCOL_TIMEOUT_SECONDS
 _PONYCHART_INFERENCE_DEADLINE_SECONDS = 5.0
 _PONYCHART_WORKER_PRELOAD_DEADLINE_SECONDS = 15.0
 _PONYCHART_WORKER_CLOSE_DEADLINE_SECONDS = 5.0
 _PONYCHART_UNVERIFIED_TOTAL_DEADLINE_SECONDS = 15.0
 _PONYCHART_MINIMUM_IMAGE_DIMENSION = 50
-_PONYCHART_IMAGE_RETRY_INTERVAL_SECONDS = 0.1
 _PONYCHART_SUBMIT_RETRY_INTERVAL_SECONDS = 0.1
 _PONYCHART_PRE_EXPIRY_RESERVE_SECONDS = 1.0
 _PONYCHART_COUNTDOWN_RESOLUTION_SECONDS = 1.0
@@ -61,7 +60,10 @@ _PONYCHART_LABEL_NAMES = (
     "Pinkie Pie",
     "Applejack",
 )
-_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PONYCHART_NETWORK_TOTAL_BUFFER_BYTES = 32 * 1024 * 1024
+_PONYCHART_NETWORK_RESOURCE_BUFFER_BYTES = 8 * 1024 * 1024
+_PONYCHART_NETWORK_MAX_TRACKED_REQUESTS = 512
+_PONYCHART_NETWORK_LIFECYCLE_TIMEOUT_SECONDS = 4 * PROTOCOL_TIMEOUT_SECONDS
 _PONYCHART_IMAGE_BINDING = "__hvbattle_ponychart_image_changed__"
 _PONYCHART_IMAGE_BINDING_PAGE_ATTRIBUTE = "_hvbattle_ponychart_image_binding"
 _ARM_PONYCHART_IMAGE_READY_JS = r"""
@@ -69,6 +71,7 @@ _ARM_PONYCHART_IMAGE_READY_JS = r"""
     const token = __TOKEN__;
     const wakeBinding = window["__hvbattle_ponychart_image_changed__"];
     const listenerKey = "__hvbattlePonyChartImageListener";
+    const rawMonitorKey = "__hvbattlePonyChartRawResponseReceipt";
     const previous = window[listenerKey];
     const detach = (entry) => {
         if (!entry) return;
@@ -81,6 +84,11 @@ _ARM_PONYCHART_IMAGE_READY_JS = r"""
     };
     detach(previous);
     window[listenerKey] = null;
+    const previousRawMonitor = window[rawMonitorKey];
+    if (previousRawMonitor && previousRawMonitor.cleanup) {
+        previousRawMonitor.cleanup();
+    }
+    window[rawMonitorKey] = null;
 
     const container = document.getElementById("riddleimage");
     const image = container && container.querySelector("img");
@@ -103,13 +111,53 @@ _ARM_PONYCHART_IMAGE_READY_JS = r"""
     const result = {
         ready,
         source,
+        documentUrl: window.location.href || "",
+        monitorToken: ready ? token : null,
         width,
         height,
         renderedWidth,
         renderedHeight,
     };
-    if (ready || !document.documentElement
-            || typeof wakeBinding !== "function") {
+    if (ready) {
+        const documentUrl = window.location.href || "";
+        const monitor = {
+            token,
+            documentRef: document,
+            documentUrl,
+            image,
+            source,
+            changed: false,
+            observer: null,
+            timer: null,
+            cleanup: null,
+        };
+        const changed = () => { monitor.changed = true; };
+        const observer = new MutationObserver(changed);
+        observer.observe(container, {
+            attributes: true,
+            attributeFilter: ["src", "srcset"],
+            childList: true,
+            subtree: true,
+        });
+        image.addEventListener("load", changed);
+        image.addEventListener("error", changed);
+        monitor.observer = observer;
+        monitor.cleanup = () => {
+            clearTimeout(monitor.timer);
+            observer.disconnect();
+            image.removeEventListener("load", changed);
+            image.removeEventListener("error", changed);
+        };
+        monitor.timer = setTimeout(() => {
+            if (window[rawMonitorKey] === monitor) {
+                monitor.cleanup();
+                window[rawMonitorKey] = null;
+            }
+        }, __CLEANUP_MILLISECONDS__);
+        window[rawMonitorKey] = monitor;
+        return result;
+    }
+    if (!document.documentElement || typeof wakeBinding !== "function") {
         return result;
     }
 
@@ -144,135 +192,30 @@ _ARM_PONYCHART_IMAGE_READY_JS = r"""
     return result;
 })()
 """
-_CANVAS_CAPTURE_JS = r"""
+_VERIFY_PONYCHART_RAW_RESPONSE_RECEIPT_JS = r"""
 (() => {
+    const token = __TOKEN__;
     const expectedSource = __EXPECTED_SOURCE__;
+    const expectedDocumentUrl = __EXPECTED_DOCUMENT_URL__;
     const expectedWidth = __EXPECTED_WIDTH__;
     const expectedHeight = __EXPECTED_HEIGHT__;
-    const container = document.getElementById("riddleimage");
-    const image = container && container.querySelector("img");
-    if (!image || !image.complete) {
-        return {status: "stale", errorName: "ImageNotReady"};
-    }
-    const source = image.currentSrc || image.src || "";
-    const width = image.naturalWidth;
-    const height = image.naturalHeight;
-    if (source !== expectedSource
-            || width !== expectedWidth
-            || height !== expectedHeight
-            || !Number.isFinite(width)
-            || !Number.isFinite(height)
-            || width < __MINIMUM_DIMENSION__
-            || height < __MINIMUM_DIMENSION__) {
-        return {status: "stale", errorName: "ImageReceiptChanged"};
-    }
-    try {
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-        const context = canvas.getContext("2d");
-        if (!context) {
-            return {status: "error", errorName: "CanvasContextUnavailable"};
-        }
-        context.drawImage(image, 0, 0, width, height);
-        return {
-            status: "ok",
-            width: canvas.width,
-            height: canvas.height,
-            dataUrl: canvas.toDataURL("image/png"),
-        };
-    } catch (error) {
-        const name = error && typeof error.name === "string"
-            ? error.name : "CanvasError";
-        const message = error && typeof error.message === "string"
-            ? error.message : "";
-        const isSecurityError = name === "SecurityError"
-            || /taint|cross-origin|cross origin|insecure/i.test(message);
-        return {
-            status: isSecurityError ? "security-error" : "error",
-            errorName: name,
-        };
-    }
-})()
-"""
-_PONYCHART_IMAGE_RECT_JS = r"""
-(() => {
-    const monitorId = __MONITOR_ID__;
-    const expectedSource = __EXPECTED_SOURCE__;
-    const expectedWidth = __EXPECTED_WIDTH__;
-    const expectedHeight = __EXPECTED_HEIGHT__;
-    const monitorKey = "__hvbattlePonyChartScreenshotMonitor";
-    const previous = window[monitorKey];
-    if (previous && previous.observer) previous.observer.disconnect();
-    const container = document.getElementById("riddleimage");
-    const image = container && container.querySelector("img");
-    if (!image || !image.complete) {
-        return {status: "stale", errorName: "ImageNotReady"};
-    }
-    const source = image.currentSrc || image.src || "";
-    const naturalWidth = image.naturalWidth;
-    const naturalHeight = image.naturalHeight;
-    if (source !== expectedSource
-            || naturalWidth !== expectedWidth
-            || naturalHeight !== expectedHeight
-            || naturalWidth < __MINIMUM_DIMENSION__
-            || naturalHeight < __MINIMUM_DIMENSION__) {
-        return {status: "stale", errorName: "ImageReceiptChanged"};
-    }
-    const rect = image.getBoundingClientRect();
-    const monitor = {
-        id: monitorId,
-        image,
-        source,
-        naturalWidth,
-        naturalHeight,
-        left: rect.left,
-        top: rect.top,
-        width: rect.width,
-        height: rect.height,
-        changed: false,
-        observer: null,
-    };
-    const observer = new MutationObserver(() => { monitor.changed = true; });
-    observer.observe(container, {
-        attributes: true,
-        attributeFilter: ["src", "srcset"],
-        childList: true,
-        subtree: true,
-    });
-    monitor.observer = observer;
-    window[monitorKey] = monitor;
-    return {
-        status: "ok",
-        x: rect.left + window.scrollX,
-        y: rect.top + window.scrollY,
-        width: rect.width,
-        height: rect.height,
-    };
-})()
-"""
-_VERIFY_PONYCHART_SCREENSHOT_JS = r"""
-(() => {
-    const monitorId = __MONITOR_ID__;
-    const monitorKey = "__hvbattlePonyChartScreenshotMonitor";
+    const monitorKey = "__hvbattlePonyChartRawResponseReceipt";
     const monitor = window[monitorKey];
     window[monitorKey] = null;
-    if (!monitor || monitor.id !== monitorId) return {status: "stale"};
-    if (monitor.observer) monitor.observer.disconnect();
+    if (!monitor || monitor.token !== token) return {status: "stale"};
+    if (monitor.cleanup) monitor.cleanup();
     const container = document.getElementById("riddleimage");
     const image = container && container.querySelector("img");
-    if (!image || image !== monitor.image || !image.complete || monitor.changed) {
-        return {status: "stale"};
-    }
-    const rect = image.getBoundingClientRect();
-    const source = image.currentSrc || image.src || "";
-    const stable = source === monitor.source
-        && image.naturalWidth === monitor.naturalWidth
-        && image.naturalHeight === monitor.naturalHeight
-        && rect.left === monitor.left
-        && rect.top === monitor.top
-        && rect.width === monitor.width
-        && rect.height === monitor.height;
+    const source = image ? (image.currentSrc || image.src || "") : "";
+    const stable = !monitor.changed
+        && document === monitor.documentRef
+        && monitor.documentUrl === expectedDocumentUrl
+        && (window.location.href || "") === expectedDocumentUrl
+        && image === monitor.image
+        && image.complete
+        && source === expectedSource
+        && image.naturalWidth === expectedWidth
+        && image.naturalHeight === expectedHeight;
     return {status: stable ? "stable" : "stale"};
 })()
 """
@@ -1002,14 +945,38 @@ class PonyChartResolutionError(RuntimeError):
     """Raised when a detected timed challenge remains on screen."""
 
 
+class PonyChartImageAcquisitionError(PonyChartResolutionError):
+    """The displayed challenge's original network response was unavailable."""
+
+
 @dataclass(frozen=True, slots=True)
 class _PonyChartImageState:
     ready: bool
     source: str
+    document_url: str
+    monitor_token: str | None
     width: float
     height: float
     rendered_width: float
     rendered_height: float
+
+
+@dataclass(slots=True)
+class _TrackedNetworkRequest:
+    request_id: cdp.network.RequestId
+    urls: set[str] = dataclass_field(default_factory=set)
+    document_urls: set[str] = dataclass_field(default_factory=set)
+    loader_ids: set[cdp.network.LoaderId] = dataclass_field(default_factory=set)
+    frame_ids: set[cdp.page.FrameId] = dataclass_field(default_factory=set)
+    saw_request: bool = False
+    is_image: bool = False
+    response_received: bool = False
+    status: int | None = None
+    mime_type: str | None = None
+    finished: bool = False
+    failure: str | None = None
+    consumed: bool = False
+    sequence: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1656,6 +1623,8 @@ def _decode_image_state(raw: object) -> _PonyChartImageState:
     if not isinstance(raw, dict) or set(raw) != {
         "ready",
         "source",
+        "documentUrl",
+        "monitorToken",
         "width",
         "height",
         "renderedWidth",
@@ -1664,7 +1633,14 @@ def _decode_image_state(raw: object) -> _PonyChartImageState:
         raise ValueError("PonyChart image readiness returned an invalid payload")
     ready = raw["ready"]
     source = raw["source"]
-    if type(ready) is not bool or not isinstance(source, str):
+    document_url = raw["documentUrl"]
+    monitor_token = raw["monitorToken"]
+    if (
+        type(ready) is not bool
+        or not isinstance(source, str)
+        or not isinstance(document_url, str)
+        or (monitor_token is not None and not isinstance(monitor_token, str))
+    ):
         raise ValueError("PonyChart image readiness returned invalid state fields")
     width = _finite_number(raw["width"])
     height = _finite_number(raw["height"])
@@ -1674,13 +1650,19 @@ def _decode_image_state(raw: object) -> _PonyChartImageState:
         raise ValueError("PonyChart image readiness returned negative geometry")
     if ready and (
         not source
+        or not document_url
+        or not monitor_token
         or width < _PONYCHART_MINIMUM_IMAGE_DIMENSION
         or height < _PONYCHART_MINIMUM_IMAGE_DIMENSION
     ):
         raise ValueError("PonyChart image readiness accepted placeholder geometry")
+    if not ready and monitor_token is not None:
+        raise ValueError("PonyChart placeholder readiness armed a raw monitor")
     return _PonyChartImageState(
         ready,
         source,
+        document_url,
+        monitor_token,
         width,
         height,
         rendered_width,
@@ -1697,82 +1679,90 @@ def _finite_number(value: object) -> float:
     return number
 
 
-def _positive_finite_number(value: object) -> float:
-    number = _finite_number(value)
-    if number <= 0:
-        raise ValueError("PonyChart capture returned non-positive dimensions")
-    return number
-
-
-def _validate_png(image: bytes) -> tuple[int, int]:
-    """Validate capture transport integrity without constraining source pixels."""
-
-    if not image.startswith(_PNG_SIGNATURE):
-        raise ValueError("PonyChart capture was not a PNG image")
-
-    offset = len(_PNG_SIGNATURE)
-    dimensions: tuple[int, int] | None = None
-    saw_image_data = False
-    while True:
-        if offset + 12 > len(image):
-            raise ValueError("PonyChart capture contained a truncated PNG chunk")
-
-        chunk_length = struct.unpack_from(">I", image, offset)[0]
-        chunk_type = image[offset + 4 : offset + 8]
-        data_start = offset + 8
-        data_end = data_start + chunk_length
-        chunk_end = data_end + 4
-        if chunk_end > len(image):
-            raise ValueError("PonyChart capture contained a truncated PNG chunk")
-
-        chunk_data = image[data_start:data_end]
-        expected_crc = struct.unpack_from(">I", image, data_end)[0]
-        actual_crc = binascii.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
-        if actual_crc != expected_crc:
-            raise ValueError("PonyChart capture contained an invalid PNG checksum")
-
-        if dimensions is None:
-            if chunk_type != b"IHDR" or chunk_length != 13:
-                raise ValueError("PonyChart capture did not begin with PNG IHDR")
-            width, height = struct.unpack_from(">II", chunk_data)
-            if width <= 0 or height <= 0:
-                raise ValueError("PonyChart PNG dimensions must be positive")
-            dimensions = (width, height)
-        elif chunk_type == b"IHDR":
-            raise ValueError("PonyChart capture contained more than one PNG IHDR")
-
-        if chunk_type == b"IDAT":
-            saw_image_data = True
-        elif chunk_type == b"IEND":
-            if chunk_length != 0 or not saw_image_data:
-                raise ValueError("PonyChart capture contained an incomplete PNG")
-            if chunk_end != len(image):
-                raise ValueError("PonyChart capture had data after PNG IEND")
-            assert dimensions is not None
-            return dimensions
-
-        offset = chunk_end
-
-
-def _decode_png_base64(payload: object) -> tuple[bytes, tuple[int, int]]:
-    if not isinstance(payload, str):
-        raise ValueError("PonyChart capture did not return base64 image data")
+def _network_url_key(url: str, *, description: str) -> str:
     try:
-        image = base64.b64decode(payload, validate=True)
-    except (binascii.Error, ValueError) as error:
-        raise ValueError(
-            "PonyChart capture returned invalid base64 image data"
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as error:
+        raise PonyChartImageAcquisitionError(
+            f"PonyChart {description} URL was invalid"
         ) from error
-    return image, _validate_png(image)
+    scheme = parsed.scheme.casefold()
+    if (
+        scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise PonyChartImageAcquisitionError(
+            f"PonyChart {description} URL was not a trusted HTTP resource"
+        )
+    hostname = parsed.hostname.casefold()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        hostname = f"{hostname}:{port}"
+    return urlunsplit((scheme, hostname, parsed.path or "/", parsed.query, ""))
 
 
-def _decode_png_data_url(payload: object) -> tuple[bytes, tuple[int, int]]:
-    if not isinstance(payload, str):
-        raise ValueError("PonyChart canvas did not return an image data URL")
-    prefix, separator, encoded = payload.partition(",")
-    if separator != "," or prefix.casefold() != "data:image/png;base64":
-        raise ValueError("PonyChart canvas did not return a PNG data URL")
-    return _decode_png_base64(encoded)
+def _decode_network_response_body(raw: object) -> bytes:
+    if (
+        not isinstance(raw, tuple)
+        or len(raw) != 2
+        or not isinstance(raw[0], str)
+        or type(raw[1]) is not bool
+    ):
+        raise PonyChartImageAcquisitionError(
+            "PonyChart Network.getResponseBody returned an invalid payload"
+        )
+    body, base64_encoded = raw
+    if not base64_encoded:
+        raise PonyChartImageAcquisitionError(
+            "PonyChart binary response body was not transported as base64"
+        )
+    try:
+        image = base64.b64decode(body, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise PonyChartImageAcquisitionError(
+            "PonyChart response body contained invalid base64"
+        ) from error
+    if not image:
+        raise PonyChartImageAcquisitionError("PonyChart response body was empty")
+    return image
+
+
+def _validate_response_image(
+    image: bytes,
+    *,
+    mime_type: str,
+    expected_width: float,
+    expected_height: float,
+) -> PonyChartImageInfo:
+    """Bind structural bytes to the browser's independently decoded receipt."""
+
+    try:
+        info = inspect_ponychart_image(image)
+    except ValueError as error:
+        raise PonyChartImageAcquisitionError(
+            "PonyChart response body lacked a valid supported image envelope"
+        ) from error
+    normalized_mime = mime_type.partition(";")[0].strip().casefold()
+    accepted_mimes = {
+        "image/png": frozenset({"image/png"}),
+        "image/jpeg": frozenset({"image/jpeg", "image/jpg", "image/pjpeg"}),
+        "image/webp": frozenset({"image/webp"}),
+    }[info.media_type]
+    if normalized_mime not in accepted_mimes:
+        raise PonyChartImageAcquisitionError(
+            "PonyChart response MIME type did not match its image bytes"
+        )
+    if (info.width, info.height) != (expected_width, expected_height):
+        raise PonyChartImageAcquisitionError(
+            "PonyChart response dimensions did not match the displayed image"
+        )
+    return info
 
 
 _generation_descriptor: PonyChartGenerationDescriptor | None = None
@@ -2089,10 +2079,268 @@ class PonyChart:
             retention_owner if retention_owner is not None else _retention_owner
         )
         self._image_binding_lock = asyncio.Lock()
+        self._network_page: Any | None = None
+        self._network_handlers: tuple[tuple[type[Any], Any], ...] = ()
+        self._network_requests: dict[str, _TrackedNetworkRequest] = {}
+        self._network_changed: asyncio.Event | None = None
+        self._network_sequence = 0
+        self._main_frame_id: cdp.page.FrameId | None = None
+        self._main_loader_id: cdp.network.LoaderId | None = None
+        self._main_navigation_sequence = 0
+        self._network_lifecycle_lock = asyncio.Lock()
+        self._network_lifecycle_epoch = 0
+        self._network_close_requests = 0
 
     @property
     def page(self) -> Any:
         return self.hvdriver.page
+
+    def _tracked_network_request(
+        self,
+        request_id: cdp.network.RequestId,
+    ) -> _TrackedNetworkRequest:
+        key = str(request_id)
+        tracked = self._network_requests.get(key)
+        if tracked is not None:
+            return tracked
+        if len(self._network_requests) >= _PONYCHART_NETWORK_MAX_TRACKED_REQUESTS:
+            removable = min(
+                self._network_requests.items(),
+                key=lambda item: (
+                    not (
+                        item[1].consumed
+                        or item[1].finished
+                        or item[1].failure is not None
+                    ),
+                    item[1].sequence,
+                ),
+            )[0]
+            del self._network_requests[removable]
+        self._network_sequence += 1
+        tracked = _TrackedNetworkRequest(
+            request_id=request_id,
+            sequence=self._network_sequence,
+        )
+        self._network_requests[key] = tracked
+        return tracked
+
+    @staticmethod
+    def _event_url_key(url: object, *, description: str) -> str | None:
+        if not isinstance(url, str) or not url:
+            return None
+        try:
+            return _network_url_key(url, description=description)
+        except PonyChartImageAcquisitionError:
+            return None
+
+    def _signal_network_change(self) -> None:
+        changed = self._network_changed
+        if changed is not None:
+            changed.set()
+
+    async def arm_network_capture(self) -> None:
+        """Serialize Network setup and reject arms overlapped by close."""
+
+        if self._network_close_requests:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart Network arm overlapped handler shutdown"
+            )
+        requested_epoch = self._network_lifecycle_epoch
+        try:
+            async with asyncio.timeout(_PONYCHART_NETWORK_LIFECYCLE_TIMEOUT_SECONDS):
+                await self._network_lifecycle_lock.acquire()
+        except TimeoutError as error:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart Network arm timed out waiting for lifecycle ownership"
+            ) from error
+        try:
+            if (
+                self._network_close_requests
+                or requested_epoch != self._network_lifecycle_epoch
+            ):
+                raise PonyChartImageAcquisitionError(
+                    "PonyChart Network arm was superseded by handler shutdown"
+                )
+            await self._arm_network_capture_locked()
+        finally:
+            self._network_lifecycle_lock.release()
+
+    async def _arm_network_capture_locked(self) -> None:
+        """Enable and subscribe to Network before any battle image can load."""
+
+        page = self.page
+        if self._network_page is page:
+            return
+        if self._network_page is not None:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart Network tracking cannot move to another page"
+            )
+        self._network_changed = asyncio.Event()
+
+        async def request_will_be_sent(
+            event: cdp.network.RequestWillBeSent,
+        ) -> None:
+            tracked = self._tracked_network_request(event.request_id)
+            tracked.saw_request = True
+            tracked.sequence = self._network_sequence = self._network_sequence + 1
+            tracked.loader_ids.add(event.loader_id)
+            if event.frame_id is not None:
+                tracked.frame_ids.add(event.frame_id)
+            request_url = self._event_url_key(
+                event.request.url,
+                description="request",
+            )
+            if request_url is not None:
+                tracked.urls.add(request_url)
+            document_url = self._event_url_key(
+                event.document_url,
+                description="document",
+            )
+            if document_url is not None:
+                tracked.document_urls.add(document_url)
+            if event.type_ is cdp.network.ResourceType.IMAGE:
+                tracked.is_image = True
+            self._signal_network_change()
+
+        async def response_received(event: cdp.network.ResponseReceived) -> None:
+            tracked = self._tracked_network_request(event.request_id)
+            tracked.response_received = True
+            tracked.is_image = event.type_ is cdp.network.ResourceType.IMAGE
+            tracked.status = event.response.status
+            tracked.mime_type = event.response.mime_type
+            tracked.sequence = self._network_sequence = self._network_sequence + 1
+            tracked.loader_ids.add(event.loader_id)
+            if event.frame_id is not None:
+                tracked.frame_ids.add(event.frame_id)
+            response_url = self._event_url_key(
+                event.response.url,
+                description="response",
+            )
+            if response_url is not None:
+                tracked.urls.add(response_url)
+            self._signal_network_change()
+
+        async def loading_finished(event: cdp.network.LoadingFinished) -> None:
+            tracked = self._tracked_network_request(event.request_id)
+            tracked.finished = True
+            tracked.sequence = self._network_sequence = self._network_sequence + 1
+            self._signal_network_change()
+
+        async def loading_failed(event: cdp.network.LoadingFailed) -> None:
+            tracked = self._tracked_network_request(event.request_id)
+            tracked.failure = type(event).__name__
+            tracked.sequence = self._network_sequence = self._network_sequence + 1
+            self._signal_network_change()
+
+        async def frame_navigated(event: cdp.page.FrameNavigated) -> None:
+            if event.frame.parent_id is None:
+                self._main_navigation_sequence += 1
+                self._main_frame_id = event.frame.id_
+                self._main_loader_id = event.frame.loader_id
+                self._signal_network_change()
+
+        handlers: tuple[tuple[type[Any], Any], ...] = (
+            (cdp.network.RequestWillBeSent, request_will_be_sent),
+            (cdp.network.ResponseReceived, response_received),
+            (cdp.network.LoadingFinished, loading_finished),
+            (cdp.network.LoadingFailed, loading_failed),
+            (cdp.page.FrameNavigated, frame_navigated),
+        )
+        for event_type, handler in handlers:
+            page.add_handler(event_type, handler)
+        try:
+            await wait_for_zendriver(
+                page.send(
+                    cdp.network.enable(
+                        max_total_buffer_size=(_PONYCHART_NETWORK_TOTAL_BUFFER_BYTES),
+                        max_resource_buffer_size=(
+                            _PONYCHART_NETWORK_RESOURCE_BUFFER_BYTES
+                        ),
+                        enable_durable_messages=True,
+                    )
+                ),
+                timeout=PROTOCOL_TIMEOUT_SECONDS,
+                owner=page,
+            )
+            await wait_for_zendriver(
+                page.send(cdp.page.enable()),
+                timeout=PROTOCOL_TIMEOUT_SECONDS,
+                owner=page,
+            )
+            navigation_sequence = self._main_navigation_sequence
+            frame_tree = await wait_for_zendriver(
+                page.send(cdp.page.get_frame_tree()),
+                timeout=PROTOCOL_TIMEOUT_SECONDS,
+                owner=page,
+            )
+            if self._main_navigation_sequence == navigation_sequence:
+                self._main_frame_id = frame_tree.frame.id_
+                self._main_loader_id = frame_tree.frame.loader_id
+        except BaseException:
+            for event_type, handler in handlers:
+                page.remove_handlers(event_type, handler)
+            self._network_changed = None
+            self._network_requests.clear()
+            self._network_sequence = 0
+            self._main_frame_id = None
+            self._main_loader_id = None
+            self._main_navigation_sequence = 0
+            raise
+        self._network_page = page
+        self._network_handlers = handlers
+
+    async def close(self) -> None:
+        """Boundedly serialize and idempotently detach local Network handlers."""
+
+        self._network_close_requests += 1
+        self._network_lifecycle_epoch += 1
+        acquired = False
+        try:
+            try:
+                async with asyncio.timeout(
+                    _PONYCHART_NETWORK_LIFECYCLE_TIMEOUT_SECONDS
+                ):
+                    await self._network_lifecycle_lock.acquire()
+                    acquired = True
+            except TimeoutError as error:
+                raise PonyChartImageAcquisitionError(
+                    "PonyChart Network close timed out waiting for lifecycle ownership"
+                ) from error
+            self._close_network_capture_locked()
+        finally:
+            if acquired:
+                self._network_lifecycle_lock.release()
+            self._network_close_requests -= 1
+
+    def _close_network_capture_locked(self) -> None:
+        """Detach handlers while the lifecycle lock is exclusively held."""
+
+        page = self._network_page
+        handlers = self._network_handlers
+        if page is None:
+            return
+        remaining_handlers: list[tuple[type[Any], Any]] = []
+        first_error: Exception | None = None
+        for event_type, handler in handlers:
+            try:
+                page.remove_handlers(event_type, handler)
+            except Exception as error:
+                remaining_handlers.append((event_type, handler))
+                if first_error is None:
+                    first_error = error
+        self._network_handlers = tuple(remaining_handlers)
+        if first_error is not None:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart Network handlers could not be detached"
+            ) from first_error
+        # Network remains enabled because the tab/domain may have other owners.
+        self._network_page = None
+        self._network_changed = None
+        self._network_requests.clear()
+        self._network_sequence = 0
+        self._main_frame_id = None
+        self._main_loader_id = None
+        self._main_navigation_sequence = 0
 
     async def _ensure_image_binding(self, deadline: SemanticDeadline) -> None:
         deadline.require_remaining(
@@ -2239,202 +2487,201 @@ class PonyChart:
                 page.remove_handlers(cdp.page.FrameNavigated, lifecycle_changed)
                 page.remove_handlers(cdp.page.LoadEventFired, lifecycle_changed)
 
+    def _matching_network_requests(
+        self,
+        receipt: _PonyChartImageState,
+    ) -> tuple[_TrackedNetworkRequest, ...]:
+        main_frame_id = self._main_frame_id
+        main_loader_id = self._main_loader_id
+        if main_frame_id is None or main_loader_id is None:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart Network tracking did not identify the current document"
+            )
+        source = _network_url_key(receipt.source, description="image source")
+        document_url = _network_url_key(
+            receipt.document_url,
+            description="document",
+        )
+        return tuple(
+            sorted(
+                (
+                    tracked
+                    for tracked in self._network_requests.values()
+                    if not tracked.consumed
+                    and source in tracked.urls
+                    and main_loader_id in tracked.loader_ids
+                    and (not tracked.frame_ids or main_frame_id in tracked.frame_ids)
+                    and document_url in tracked.document_urls
+                ),
+                key=lambda tracked: tracked.sequence,
+            )
+        )
+
+    async def _wait_for_matching_network_requests(
+        self,
+        receipt: _PonyChartImageState,
+        *,
+        deadline: SemanticDeadline,
+    ) -> tuple[_TrackedNetworkRequest, ...]:
+        changed = self._network_changed
+        if self._network_page is not self.page or changed is None:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart Network tracking was not armed before the image request"
+            )
+
+        def settled(request: _TrackedNetworkRequest) -> bool:
+            return request.saw_request and (
+                request.failure is not None
+                or (request.response_received and request.finished)
+            )
+
+        while True:
+            matching = self._matching_network_requests(receipt)
+            if matching and all(settled(tracked) for tracked in matching):
+                return matching
+            changed.clear()
+            matching = self._matching_network_requests(receipt)
+            if matching and all(settled(tracked) for tracked in matching):
+                return matching
+            try:
+                await asyncio.wait_for(
+                    changed.wait(),
+                    timeout=(
+                        deadline.require_remaining(
+                            "PonyChart response tracking deadline expired"
+                        )
+                    ),
+                )
+            except TimeoutError as error:
+                raise PonyChartImageAcquisitionError(
+                    "PonyChart image request was absent from Network tracking"
+                ) from error
+
+    async def _verify_raw_response_receipt(
+        self,
+        receipt: _PonyChartImageState,
+        *,
+        token: str,
+        deadline: SemanticDeadline,
+    ) -> bool:
+        script = (
+            _VERIFY_PONYCHART_RAW_RESPONSE_RECEIPT_JS.replace(
+                "__TOKEN__",
+                json.dumps(token),
+            )
+            .replace("__EXPECTED_SOURCE__", json.dumps(receipt.source))
+            .replace(
+                "__EXPECTED_DOCUMENT_URL__",
+                json.dumps(receipt.document_url),
+            )
+            .replace("__EXPECTED_WIDTH__", json.dumps(receipt.width))
+            .replace("__EXPECTED_HEIGHT__", json.dumps(receipt.height))
+        )
+        raw = await wait_for_zendriver(
+            self.page.evaluate(script),
+            timeout=protocol_timeout(deadline.remaining()),
+            owner=self.page,
+        )
+        status = raw.get("status") if isinstance(raw, dict) else None
+        if not isinstance(status, str) or status not in {
+            "stable",
+            "stale",
+        }:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart raw response receipt verification returned invalid state"
+            )
+        return status == "stable"
+
     async def _capture_pony_chart_image(
         self,
         *,
         deadline: SemanticDeadline,
     ) -> bytes:
-        """Capture and validate one challenge entirely in memory."""
-        capture_attempts = 0
-        while True:
-            receipt = await self._wait_for_image_loaded(deadline=deadline)
-            capture_attempts += 1
-            canvas_script = (
-                _CANVAS_CAPTURE_JS.replace(
-                    "__EXPECTED_SOURCE__",
-                    json.dumps(receipt.source),
-                )
-                .replace("__EXPECTED_WIDTH__", json.dumps(receipt.width))
-                .replace("__EXPECTED_HEIGHT__", json.dumps(receipt.height))
-                .replace(
-                    "__MINIMUM_DIMENSION__",
-                    str(_PONYCHART_MINIMUM_IMAGE_DIMENSION),
-                )
+        """Return only the displayed image's byte-exact CDP response body."""
+
+        receipt = await self._wait_for_image_loaded(deadline=deadline)
+        token = receipt.monitor_token
+        if token is None:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart readiness did not atomically arm its raw receipt"
             )
-            canvas_timeout = protocol_timeout(
-                min(_PONYCHART_DOM_CAPTURE_TIMEOUT_SECONDS, deadline.remaining())
+        matching = await self._wait_for_matching_network_requests(
+            receipt,
+            deadline=deadline,
+        )
+        if len(matching) != 1:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart image source matched ambiguous Network requests"
             )
-            canvas_result = await wait_for_zendriver(
-                self.page.evaluate(canvas_script),
-                timeout=canvas_timeout,
+        tracked = matching[0]
+        if not tracked.saw_request:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart Network tracking began after the image request"
+            )
+        if tracked.failure is not None:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart image request failed before its body was available"
+            )
+        if not tracked.response_received or not tracked.finished:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart image response did not complete"
+            )
+        if not tracked.is_image:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart response was not classified as an image resource"
+            )
+        if tracked.status is None or tracked.status < 200 or tracked.status >= 300:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart image response did not have a successful status"
+            )
+        if tracked.mime_type is None:
+            raise PonyChartImageAcquisitionError(
+                "PonyChart image response did not include a MIME type"
+            )
+
+        try:
+            raw_body = await wait_for_zendriver(
+                self.page.send(cdp.network.get_response_body(tracked.request_id)),
+                timeout=protocol_timeout(deadline.remaining()),
                 owner=self.page,
             )
-            deadline.require_remaining(
-                "PonyChart image acquisition deadline expired during canvas capture"
-            )
-            if not isinstance(canvas_result, dict):
-                raise ValueError("PonyChart canvas returned an invalid payload")
-
-            status = canvas_result.get("status")
-            if status == "stale":
-                logger.info(
-                    "PonyChart image diagnostic phase=capture attempt=%d "
-                    "status=stale natural=%gx%g rendered=%gx%g",
-                    capture_attempts,
-                    receipt.width,
-                    receipt.height,
-                    receipt.rendered_width,
-                    receipt.rendered_height,
-                )
-                continue
-            if status == "ok":
-                reported_width = _positive_finite_number(canvas_result.get("width"))
-                reported_height = _positive_finite_number(canvas_result.get("height"))
-                image, png_dimensions = _decode_png_data_url(
-                    canvas_result.get("dataUrl")
-                )
-                if png_dimensions != (reported_width, reported_height) or (
-                    reported_width,
-                    reported_height,
-                ) != (receipt.width, receipt.height):
-                    raise ValueError(
-                        "PonyChart canvas dimensions did not match its image receipt"
-                    )
-                capture_method = "canvas"
-            elif status == "security-error":
-                screenshot = await self._capture_pony_chart_screenshot(
-                    receipt=receipt,
-                    deadline=deadline,
-                )
-                if screenshot is None:
-                    remaining = deadline.require_remaining(
-                        "PonyChart screenshot geometry remained unavailable"
-                    )
-                    await asyncio.sleep(
-                        min(_PONYCHART_IMAGE_RETRY_INTERVAL_SECONDS, remaining)
-                    )
-                    continue
-                image = screenshot
-                png_dimensions = _validate_png(image)
-                capture_method = "screenshot"
-            else:
-                error_name = canvas_result.get("errorName")
-                raise ValueError(f"PonyChart canvas capture failed: {error_name!r}")
-
-            deadline.require_remaining(
-                "PonyChart image acquisition deadline expired while validating capture"
-            )
-            if min(png_dimensions) < _PONYCHART_MINIMUM_IMAGE_DIMENSION:
-                raise ValueError("PonyChart capture retained placeholder dimensions")
-            logger.info(
-                "PonyChart image diagnostic phase=capture attempt=%d status=ok "
-                "method=%s natural=%gx%g rendered=%gx%g captured=%dx%d",
-                capture_attempts,
-                capture_method,
-                receipt.width,
-                receipt.height,
-                receipt.rendered_width,
-                receipt.rendered_height,
-                png_dimensions[0],
-                png_dimensions[1],
-            )
-            return image
-
-    async def _capture_pony_chart_screenshot(
-        self,
-        *,
-        receipt: _PonyChartImageState,
-        deadline: SemanticDeadline,
-    ) -> bytes | None:
-        """Fallback for a canvas tainted synchronously by cross-origin pixels."""
-
-        monitor_id = uuid4().hex
-        rect_script = (
-            _PONYCHART_IMAGE_RECT_JS.replace(
-                "__MONITOR_ID__",
-                json.dumps(monitor_id),
-            )
-            .replace("__EXPECTED_SOURCE__", json.dumps(receipt.source))
-            .replace("__EXPECTED_WIDTH__", json.dumps(receipt.width))
-            .replace("__EXPECTED_HEIGHT__", json.dumps(receipt.height))
-            .replace(
-                "__MINIMUM_DIMENSION__",
-                str(_PONYCHART_MINIMUM_IMAGE_DIMENSION),
-            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if is_browser_generation_error(error):
+                raise
+            raise PonyChartImageAcquisitionError(
+                "PonyChart Network response body was unavailable"
+            ) from error
+        image = _decode_network_response_body(raw_body)
+        info = _validate_response_image(
+            image,
+            mime_type=tracked.mime_type,
+            expected_width=receipt.width,
+            expected_height=receipt.height,
         )
-        rect_timeout = protocol_timeout(
-            min(_PONYCHART_DOM_CAPTURE_TIMEOUT_SECONDS, deadline.remaining())
-        )
-        rect = await wait_for_zendriver(
-            self.page.evaluate(rect_script),
-            timeout=rect_timeout,
-            owner=self.page,
-        )
+        if not await self._verify_raw_response_receipt(
+            receipt,
+            token=token,
+            deadline=deadline,
+        ):
+            raise PonyChartImageAcquisitionError(
+                "PonyChart displayed image changed during raw body acquisition"
+            )
+        tracked.consumed = True
         deadline.require_remaining(
-            "PonyChart image acquisition deadline expired before screenshot"
+            "PonyChart image acquisition deadline expired after raw response"
         )
-        if isinstance(rect, dict) and rect.get("status") == "stale":
-            return None
-        if not isinstance(rect, dict) or rect.get("status") != "ok":
-            raise ValueError("PonyChart image did not expose a capturable rectangle")
-        x = _finite_number(rect.get("x"))
-        y = _finite_number(rect.get("y"))
-        width = _positive_finite_number(rect.get("width"))
-        height = _positive_finite_number(rect.get("height"))
-        if min(width, height) < _PONYCHART_MINIMUM_IMAGE_DIMENSION:
-            logger.info(
-                "PonyChart image diagnostic phase=screenshot status=rendered-placeholder "
-                "natural=%gx%g rendered=%gx%g",
-                receipt.width,
-                receipt.height,
-                width,
-                height,
-            )
-            return None
-        screenshot_timeout = protocol_timeout(
-            min(_PONYCHART_SCREENSHOT_TIMEOUT_SECONDS, deadline.remaining())
-        )
-        encoded = await wait_for_zendriver(
-            self.page.send(
-                cdp.page.capture_screenshot(
-                    format_="png",
-                    clip=cdp.page.Viewport(
-                        x=x,
-                        y=y,
-                        width=width,
-                        height=height,
-                        scale=1.0,
-                    ),
-                    from_surface=True,
-                    capture_beyond_viewport=True,
-                )
-            ),
-            timeout=screenshot_timeout,
-            owner=self.page,
-        )
-        deadline.require_remaining(
-            "PonyChart image acquisition deadline expired during screenshot"
-        )
-        image, _ = _decode_png_base64(encoded)
-        verify_script = _VERIFY_PONYCHART_SCREENSHOT_JS.replace(
-            "__MONITOR_ID__",
-            json.dumps(monitor_id),
-        )
-        verify_timeout = protocol_timeout(deadline.remaining())
-        verification = await wait_for_zendriver(
-            self.page.evaluate(verify_script),
-            timeout=verify_timeout,
-            owner=self.page,
-        )
-        if not isinstance(verification, dict) or verification.get("status") not in {
-            "stable",
-            "stale",
-        }:
-            raise ValueError("PonyChart screenshot verification returned invalid state")
-        if verification["status"] == "stale":
-            return None
-        deadline.require_remaining(
-            "PonyChart image acquisition deadline expired while validating screenshot"
+        logger.info(
+            "PonyChart image diagnostic phase=capture attempt=1 status=ok "
+            "method=network-response format=%s natural=%gx%g "
+            "rendered=%gx%g response_bytes=%d",
+            info.extension.removeprefix("."),
+            receipt.width,
+            receipt.height,
+            receipt.rendered_width,
+            receipt.rendered_height,
+            len(image),
         )
         return image
 
@@ -2909,19 +3156,9 @@ class PonyChart:
             if not self.hvdriver.headless:
                 notify("PonyChart", "PonyChart detected")
 
-            try:
-                image = await self._capture_pony_chart_image(
-                    deadline=receipt_context.deadline
-                )
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                if await self._reconcile_natural_expiration(
-                    receipt_context,
-                    deadline=receipt_context.expiration_classification_deadline,
-                ):
-                    return PonyChartResolutionOutcome.EXPIRED_WITHOUT_SUBMISSION
-                raise
+            image = await self._capture_pony_chart_image(
+                deadline=receipt_context.deadline
+            )
 
             try:
                 labels = await self._predict_labels(

@@ -157,6 +157,8 @@ class BattleSession:
         self._last_reported_round_progress: tuple[int, int] | None = None
         self._classifier_prepared = False
         self._browser_hooks_initialized = False
+        self._browser_hooks_lock = asyncio.Lock()
+        self._browser_hooks_closing = False
         self.turn = -1
         self.round = -1
         self._initialize_battle_components()
@@ -188,6 +190,9 @@ class BattleSession:
         return await self.hentaiverse.realm.current() is Realm.ISEKAI
 
     async def __aenter__(self) -> Self:
+        async with self._browser_hooks_lock:
+            self._browser_hooks_closing = False
+
         async def capture(operation: Awaitable[Any]) -> BaseException | None:
             try:
                 await operation
@@ -218,7 +223,7 @@ class BattleSession:
         cleanup_cause = delayed_cancellation or primary_error
         assert cleanup_cause is not None
         cleanup_task = asyncio.create_task(
-            self.hentaiverse.__aexit__(
+            self.__aexit__(
                 type(cleanup_cause),
                 cleanup_cause,
                 cleanup_cause.__traceback__,
@@ -334,14 +339,26 @@ class BattleSession:
         exc_value: Any,
         traceback: Any,
     ) -> None:
-        await self.hentaiverse.__aexit__(exc_type, exc_value, traceback)
+        self._browser_hooks_closing = True
+        async with self._browser_hooks_lock:
+            try:
+                await self._ponychart.close()
+            finally:
+                self._browser_hooks_initialized = False
+                await self.hentaiverse.__aexit__(exc_type, exc_value, traceback)
 
     async def _on_browser_ready(self) -> None:
-        if self._browser_hooks_initialized:
-            return
-        if self.auto_accept_dialogs:
-            await self._setup_alert_handler()
-        self._browser_hooks_initialized = True
+        if self._browser_hooks_closing:
+            raise RuntimeError("BattleSession browser hooks are closing")
+        async with self._browser_hooks_lock:
+            if self._browser_hooks_closing:
+                raise RuntimeError("BattleSession browser hooks are closing")
+            if self._browser_hooks_initialized:
+                return
+            await self._ponychart.arm_network_capture()
+            if self.auto_accept_dialogs:
+                await self._setup_alert_handler()
+            self._browser_hooks_initialized = True
 
     def _initialize_battle_components(self) -> None:
         """Create battle adapters without parsing a non-battle login page."""

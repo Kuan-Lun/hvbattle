@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from hvbrowser import Realm
 from hvbrowser.runtime import ZendriverOperationTimeout
+from zendriver import cdp
 
 from hvbattle import ArenaOption, GrindfestOption
 from hvbattle._timing import SemanticDeadline
@@ -191,15 +192,32 @@ class PonyChartHangProtectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_capture_pony_chart_image_times_out_instead_of_hanging_forever(
         self,
     ) -> None:
-        pony_chart = object.__new__(PonyChart)
-        pony_chart.hvdriver = Mock()
-        pony_chart.hvdriver.page = _HangingPage()
-        pony_chart._image_directory = None
+        driver = Mock()
+        driver.page = _HangingPage()
+        pony_chart = PonyChart(driver)
         pony_chart._wait_for_image_loaded = AsyncMock(
             return_value=SimpleNamespace(
-                source="challenge",
+                source="https://hentaiverse.org/pony-chart.png",
+                document_url="https://hentaiverse.org/battle",
+                monitor_token="raw-monitor",
                 width=640,
                 height=480,
+                rendered_width=640,
+                rendered_height=480,
+            )
+        )
+        pony_chart._wait_for_matching_network_requests = AsyncMock(
+            return_value=(
+                SimpleNamespace(
+                    saw_request=True,
+                    failure=None,
+                    response_received=True,
+                    finished=True,
+                    is_image=True,
+                    status=200,
+                    mime_type="image/png",
+                    request_id=cdp.network.RequestId("pony-request"),
+                ),
             )
         )
 

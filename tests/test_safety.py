@@ -104,11 +104,20 @@ class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_browser_ready_installs_dialog_handler_when_enabled(self) -> None:
         session = BattleSession(headless=True, auto_accept_dialogs=True)
-        session._setup_alert_handler = AsyncMock()
+        events: list[str] = []
+        session._ponychart.arm_network_capture = AsyncMock(
+            side_effect=lambda: events.append("network")
+        )
+        session._setup_alert_handler = AsyncMock(
+            side_effect=lambda: events.append("dialog")
+        )
 
         await session._on_browser_ready()
+        await session._on_browser_ready()
 
+        session._ponychart.arm_network_capture.assert_awaited_once_with()
         session._setup_alert_handler.assert_awaited_once_with()
+        self.assertEqual(events, ["network", "dialog"])
 
     async def test_dialog_log_records_category_without_raw_server_message(
         self,

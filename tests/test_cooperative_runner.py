@@ -22,6 +22,7 @@ from hvbattle import (
     BattleStopped,
     BattleTurnPhase,
     BattleTurnState,
+    PonyChartResolutionOutcome,
     TurnDecision,
 )
 
@@ -32,7 +33,7 @@ class _StepSession:
         *phases: BattleTurnPhase,
         active: bool = True,
         presence: BattlePresence | None = None,
-        ponychart_results: tuple[bool, ...] = (),
+        ponychart_results: tuple[PonyChartResolutionOutcome, ...] = (),
     ) -> None:
         self._phases = deque(phases)
         self._active = active
@@ -76,10 +77,10 @@ class _StepSession:
         self.turn = -1
         self.battle_completion_observed = False
 
-    async def resolve_ponychart(self) -> bool:
+    async def resolve_ponychart(self) -> PonyChartResolutionOutcome:
         if self._ponychart_results:
             return self._ponychart_results.popleft()
-        return False
+        return PonyChartResolutionOutcome.NOT_PRESENT
 
     async def prepare_turn_state(
         self,
@@ -158,7 +159,7 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         session = _StepSession(
             BattleTurnPhase.ACTIVE,
-            ponychart_results=(True,),
+            ponychart_results=(PonyChartResolutionOutcome.SUBMISSION_CONFIRMED,),
         )
         strategy = Mock()
         strategy.take_turn = AsyncMock(return_value=TurnDecision.ACTED)
@@ -184,12 +185,65 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.prepare_calls, 0)
         strategy.take_turn.assert_not_awaited()
 
+    async def test_expired_ponychart_is_not_reported_as_resolved(self) -> None:
+        session = _StepSession(
+            BattleTurnPhase.ACTIVE,
+            ponychart_results=(PonyChartResolutionOutcome.EXPIRED_WITHOUT_SUBMISSION,),
+        )
+        strategy = Mock()
+        strategy.take_turn = AsyncMock(return_value=TurnDecision.ACTED)
+
+        result = await BattleRunner(  # type: ignore[arg-type]
+            session,
+            strategy,
+            sleep=AsyncMock(),
+        ).step()
+
+        self.assertEqual(
+            result,
+            BattleStepProgress(
+                kind=(BattleStepProgressKind.PONYCHART_EXPIRED_WITHOUT_SUBMISSION),
+                is_isekai=None,
+                decision_count=0,
+                current_round=1,
+                total_rounds=10,
+            ),
+        )
+        self.assertIsNot(
+            result.kind,
+            BattleStepProgressKind.PONYCHART_RESOLVED,
+        )
+        self.assertEqual(session.battle_probes, 0)
+        self.assertEqual(session.realm_probes, 0)
+        self.assertEqual(session.prepare_calls, 0)
+        strategy.take_turn.assert_not_awaited()
+
+    async def test_boolean_ponychart_result_is_rejected(self) -> None:
+        session = _StepSession(BattleTurnPhase.ACTIVE)
+        session.resolve_ponychart = AsyncMock(return_value=False)
+        strategy = Mock()
+        strategy.take_turn = AsyncMock(return_value=TurnDecision.ACTED)
+
+        with self.assertRaises(BattleInterruptedError) as raised:
+            await BattleRunner(  # type: ignore[arg-type]
+                session,
+                strategy,
+                sleep=AsyncMock(),
+            ).step()
+
+        self.assertIsInstance(raised.exception.__cause__, TypeError)
+        self.assertIn(
+            "PonyChartResolutionOutcome",
+            str(raised.exception.__cause__),
+        )
+        strategy.take_turn.assert_not_awaited()
+
     async def test_pause_services_ponychart_before_returning_deferred_state(
         self,
     ) -> None:
         session = _StepSession(
             BattleTurnPhase.ACTIVE,
-            ponychart_results=(True,),
+            ponychart_results=(PonyChartResolutionOutcome.SUBMISSION_CONFIRMED,),
         )
         strategy = Mock()
         strategy.take_turn = AsyncMock(return_value=TurnDecision.ACTED)
@@ -626,7 +680,9 @@ class CooperativeBattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         first = await runner.step()
-        session._ponychart_results.append(True)
+        session._ponychart_results.append(
+            PonyChartResolutionOutcome.SUBMISSION_CONFIRMED
+        )
         now = 1.0
         challenge = await runner.step()
         now = 100.0

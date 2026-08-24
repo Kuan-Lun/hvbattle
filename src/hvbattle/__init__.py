@@ -1,6 +1,10 @@
 """Public battle-domain API."""
 
-from .battle_launcher import BattleRouteReadinessError
+from .battle_launcher import (
+    BattleFormOutcomeUnknownError,
+    BattleNavigationSafetyError,
+    BattleRouteReadinessError,
+)
 from .contracts import (
     ArenaOption,
     BattleAbsent,
@@ -21,6 +25,7 @@ from .contracts import (
     BattleTurnPhase,
     BattleTurnState,
     GrindfestOption,
+    PonyChartResolutionOutcome,
     RingOfBloodChallenge,
     RingOfBloodOption,
     RingOfBloodSnapshot,
@@ -47,7 +52,9 @@ __all__ = [
     "BattleActionOutcomeUnknownError",
     "BattleActionRecoveryEvidence",
     "BattleCompleted",
+    "BattleFormOutcomeUnknownError",
     "BattleInterruptedError",
+    "BattleNavigationSafetyError",
     "BattlePresence",
     "BattleRecoveryExhaustedError",
     "BattleRouteReadinessError",
@@ -70,6 +77,7 @@ __all__ = [
     "PonyChartArtifactError",
     "PonyChartRefreshOutcome",
     "PonyChartResolutionError",
+    "PonyChartResolutionOutcome",
     "RingOfBloodChallenge",
     "RingOfBloodOption",
     "RingOfBloodSnapshot",

@@ -16,6 +16,7 @@ from hvbattle import (
     BattleStopped,
     BattleTurnPhase,
     BattleTurnState,
+    PonyChartResolutionOutcome,
     TurnDecision,
 )
 from hvbattle.hv_battle_action_manager import (
@@ -1674,8 +1675,8 @@ class _RunnerSession:
     def reset_battle_tracking(self) -> None:
         self.turn = -1
 
-    async def resolve_ponychart(self) -> bool:
-        return False
+    async def resolve_ponychart(self) -> PonyChartResolutionOutcome:
+        return PonyChartResolutionOutcome.NOT_PRESENT
 
     async def prepare_turn_state(
         self,

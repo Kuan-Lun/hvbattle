@@ -130,10 +130,19 @@ class BattlePresence(StrEnum):
     COMPLETION = "completion"
 
 
+class PonyChartResolutionOutcome(StrEnum):
+    """The authoritative outcome of one PonyChart resolution attempt."""
+
+    NOT_PRESENT = "not-present"
+    SUBMISSION_CONFIRMED = "submission-confirmed"
+    EXPIRED_WITHOUT_SUBMISSION = "expired-without-submission"
+
+
 class BattleStepProgressKind(StrEnum):
     """A safe cooperative yield boundary reached while a battle remains active."""
 
     PONYCHART_RESOLVED = "ponychart-resolved"
+    PONYCHART_EXPIRED_WITHOUT_SUBMISSION = "ponychart-expired-without-submission"
     TURN_ACTION_CONFIRMED = "turn-action-confirmed"
     NEXT_FLOOR_CONFIRMED = "next-floor-confirmed"
     RECOVERY_RECONCILED = "recovery-reconciled"
@@ -143,8 +152,8 @@ class BattleStepProgressKind(StrEnum):
 class BattleStepProgress:
     """One confirmed progress boundary after which another actor may run safely.
 
-    ``is_isekai`` is unknown only when a PonyChart challenge was resolved before
-    the runner could inspect the battle realm.
+    ``is_isekai`` is unknown only when a PonyChart challenge returned to battle
+    before the runner could inspect the battle realm.
     """
 
     kind: BattleStepProgressKind

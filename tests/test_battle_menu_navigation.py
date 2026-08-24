@@ -178,18 +178,20 @@ class _Browser:
         self.direct_destination: str | None = None
         self.get_error: Exception | None = None
         self.get_calls: list[str] = []
-        self.get_deadlines: list[object] = []
-        self.get_remaining: list[float] = []
+        self.navigation_budgets: list[float] = []
         self.wait_calls: list[object] = []
         self.diagnostic_calls: list[str] = []
         self.diagnostic_path: Path | None = None
         self.diagnostic_error: Exception | None = None
 
-    async def get(self, url: str, *, deadline: object | None = None) -> None:
+    async def navigate_with_budget(
+        self,
+        url: str,
+        *,
+        budget_seconds: float,
+    ) -> None:
         self.get_calls.append(url)
-        self.get_deadlines.append(deadline)
-        if deadline is not None:
-            self.get_remaining.append(float(deadline.remaining()))  # type: ignore[attr-defined]
+        self.navigation_budgets.append(budget_seconds)
         if self.get_error is not None:
             raise self.get_error
         self.page.current_url = self.direct_destination or url
@@ -624,8 +626,7 @@ class BattleDirectNavigationTests(unittest.IsolatedAsyncioTestCase):
             reached = await launcher.goto_arena(expected_realm=Realm.PERSISTENT)
 
         self.assertTrue(reached)
-        self.assertEqual(browser.get_deadlines, [deadline])
-        self.assertEqual(browser.get_remaining, [6.0])
+        self.assertEqual(browser.navigation_budgets, [6.0])
 
     async def test_transient_unknown_documents_are_polled_until_trusted(self) -> None:
         launcher, browser, page = _launcher()

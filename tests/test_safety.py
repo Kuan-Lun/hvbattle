@@ -34,6 +34,7 @@ from hvbattle import (
     BattleTurnState,
     GrindfestOption,
     PonyChartResolutionError,
+    PonyChartResolutionOutcome,
     RingOfBloodChallenge,
     RingOfBloodOption,
     RingOfBloodSnapshot,
@@ -994,8 +995,8 @@ class _FakeSession:
         self.turn += 1
         return BattleTurnState(BattleTurnPhase.ACTIVE)
 
-    async def resolve_ponychart(self) -> bool:
-        return False
+    async def resolve_ponychart(self) -> PonyChartResolutionOutcome:
+        return PonyChartResolutionOutcome.NOT_PRESENT
 
 
 class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
@@ -1095,13 +1096,13 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         events: list[str] = []
         challenge_count = 0
 
-        async def resolve_ponychart() -> bool:
+        async def resolve_ponychart() -> PonyChartResolutionOutcome:
             nonlocal challenge_count
             challenge_count += 1
             events.append("ponychart")
             if challenge_count == 1:
-                return True
-            return False
+                return PonyChartResolutionOutcome.SUBMISSION_CONFIRMED
+            return PonyChartResolutionOutcome.NOT_PRESENT
 
         session.resolve_ponychart = resolve_ponychart  # type: ignore[method-assign]
         strategy = Mock()
@@ -1404,10 +1405,12 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         session = _FakeSession(active=True)
         challenge_checks = 0
 
-        async def resolve_ponychart() -> bool:
+        async def resolve_ponychart() -> PonyChartResolutionOutcome:
             nonlocal challenge_checks
             challenge_checks += 1
-            return challenge_checks == 3
+            if challenge_checks == 3:
+                return PonyChartResolutionOutcome.SUBMISSION_CONFIRMED
+            return PonyChartResolutionOutcome.NOT_PRESENT
 
         session.resolve_ponychart = resolve_ponychart  # type: ignore[method-assign]
         strategy = Mock()
@@ -2289,7 +2292,14 @@ class PonyChartResolutionTests(unittest.IsolatedAsyncioTestCase):
         challenge._check = AsyncMock(return_value=True)
         challenge._capture_pony_chart_image = AsyncMock(return_value=b"pony")
         challenge._predict_labels = AsyncMock(return_value=("Twilight",))
-        challenge._arm_challenge_receipt_monitor = AsyncMock(return_value=True)
+        receipt_context = SimpleNamespace(
+            monitor_id="monitor",
+            deadline=SemanticDeadline.after(30.0),
+            expiration_classification_deadline=SemanticDeadline.after(30.0),
+        )
+        challenge._arm_challenge_receipt_monitor = AsyncMock(
+            return_value=receipt_context
+        )
         challenge._select_and_submit_answer = AsyncMock(return_value=True)
         challenge._wait_for_challenge_receipt = AsyncMock(
             side_effect=PonyChartResolutionError("still present")

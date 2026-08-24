@@ -29,6 +29,7 @@ from .contracts import (
     BattleStopped,
     BattleTurnPhase,
     BattleTurnState,
+    PonyChartResolutionOutcome,
     TurnDecision,
 )
 from .session import BattleSession
@@ -208,10 +209,9 @@ class BattleRunner:
                 if prepared.phase is not BattleTurnPhase.ABSENT:
                     self._clear_state_readiness()
                     self._clear_transition_confirmation()
-                if await self.session.resolve_ponychart():
-                    return self._confirmed_progress(
-                        BattleStepProgressKind.PONYCHART_RESOLVED
-                    )
+                ponychart_progress = await self._resolve_ponychart_progress()
+                if ponychart_progress is not None:
+                    return ponychart_progress
                 if prepared.phase is BattleTurnPhase.CHALLENGE:
                     # The challenge may have disappeared between the state
                     # probe and the second resolver call. Refresh before policy
@@ -324,8 +324,9 @@ class BattleRunner:
             raise TypeError("BattleSession returned an unsupported battle presence")
         self.session.reset_battle_tracking()
 
-        if await self.session.resolve_ponychart():
-            return self._confirmed_progress(BattleStepProgressKind.PONYCHART_RESOLVED)
+        ponychart_progress = await self._resolve_ponychart_progress()
+        if ponychart_progress is not None:
+            return ponychart_progress
 
         self._presence_initialized = True
         self._clear_transition_confirmation()
@@ -597,9 +598,27 @@ class BattleRunner:
     ) -> BattleStepProgress | BattleStepIdle | None:
         """Resolve a timed challenge before cooperatively deferring for Pause."""
 
-        if await self.session.resolve_ponychart():
-            return self._confirmed_progress(BattleStepProgressKind.PONYCHART_RESOLVED)
+        ponychart_progress = await self._resolve_ponychart_progress()
+        if ponychart_progress is not None:
+            return ponychart_progress
         return self._defer_if_paused()
+
+    async def _resolve_ponychart_progress(self) -> BattleStepProgress | None:
+        outcome = await self.session.resolve_ponychart()
+        if not isinstance(outcome, PonyChartResolutionOutcome):
+            raise TypeError(
+                "BattleSession.resolve_ponychart() must return "
+                "PonyChartResolutionOutcome"
+            )
+        if outcome is PonyChartResolutionOutcome.NOT_PRESENT:
+            return None
+        if outcome is PonyChartResolutionOutcome.SUBMISSION_CONFIRMED:
+            kind = BattleStepProgressKind.PONYCHART_RESOLVED
+        elif outcome is PonyChartResolutionOutcome.EXPIRED_WITHOUT_SUBMISSION:
+            kind = BattleStepProgressKind.PONYCHART_EXPIRED_WITHOUT_SUBMISSION
+        else:
+            raise TypeError("Unsupported PonyChartResolutionOutcome")
+        return self._confirmed_progress(kind)
 
     def _defer_if_paused(self) -> BattleStepIdle | None:
         """Read the local pause gate without issuing another browser probe."""

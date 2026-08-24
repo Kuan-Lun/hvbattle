@@ -32,6 +32,8 @@ class PublicApiTests(unittest.TestCase):
         self.assertTrue(hasattr(hvbattle, "BattleStateReadinessError"))
         self.assertTrue(hasattr(hvbattle, "BattleActionOutcomeUnknownError"))
         self.assertTrue(hasattr(hvbattle, "BattleRouteReadinessError"))
+        self.assertTrue(hasattr(hvbattle, "BattleNavigationSafetyError"))
+        self.assertTrue(hasattr(hvbattle, "BattleFormOutcomeUnknownError"))
         self.assertTrue(hasattr(hvbattle, "TurnDecision"))
         self.assertTrue(hasattr(hvbattle, "ArenaOption"))
         self.assertTrue(hasattr(hvbattle, "GrindfestOption"))
@@ -42,6 +44,7 @@ class PublicApiTests(unittest.TestCase):
         self.assertTrue(hasattr(hvbattle, "PonyChartArtifactError"))
         self.assertTrue(hasattr(hvbattle, "PonyChartRefreshOutcome"))
         self.assertTrue(hasattr(hvbattle, "PonyChartResolutionError"))
+        self.assertTrue(hasattr(hvbattle, "PonyChartResolutionOutcome"))
         self.assertTrue(hasattr(hvbattle, "refresh_ponychart_classifier"))
 
     def test_strategy_annotations_resolve_at_runtime(self) -> None:

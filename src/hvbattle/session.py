@@ -31,6 +31,7 @@ from .contracts import (
     BattleTurnPhase,
     BattleTurnState,
     GrindfestOption,
+    PonyChartResolutionOutcome,
     RingOfBloodOption,
     RingOfBloodSnapshot,
     RingOfBloodStartOutcome,
@@ -828,7 +829,7 @@ class BattleSession:
         """Whether the game's explicit final-battle control was observed."""
         return self._completion_observed
 
-    async def resolve_ponychart(self) -> bool:
+    async def resolve_ponychart(self) -> PonyChartResolutionOutcome:
         return await self._ponychart.check()
 
     async def goto_arena(self, *, expected_realm: Realm) -> bool:

@@ -117,11 +117,11 @@ class BattleRouteReadinessError(RuntimeError):
         )
 
 
-class _BattleNavigationSafetyError(RuntimeError):
+class BattleNavigationSafetyError(RuntimeError):
     """Battle state, origin, path, or realm could not be trusted."""
 
 
-class _BattleFormOutcomeUnknownError(RuntimeError):
+class BattleFormOutcomeUnknownError(RuntimeError):
     """A submitted form lacked a trusted battle-state receipt."""
 
 
@@ -382,7 +382,7 @@ class BattleLauncher:
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
-            raise _BattleFormOutcomeUnknownError(
+            raise BattleFormOutcomeUnknownError(
                 "Battle form receipt observation was invalid"
             ) from error
         try:
@@ -390,7 +390,7 @@ class BattleLauncher:
                 "Battle form receipt deadline expired during marker observation"
             )
         except TimeoutError as error:
-            raise _BattleFormOutcomeUnknownError(
+            raise BattleFormOutcomeUnknownError(
                 "Battle form receipt marker arrived after its deadline"
             ) from error
         state = self._classify_battle_route_readiness(
@@ -402,7 +402,7 @@ class BattleLauncher:
             state is not _BattleRouteReadinessState.BLOCKED
             or observation.blocker is None
         ):
-            raise _BattleFormOutcomeUnknownError(
+            raise BattleFormOutcomeUnknownError(
                 "Battle form receipt did not expose a trusted battle marker; "
                 f"route={route}; state={state.value}"
             )
@@ -411,7 +411,7 @@ class BattleLauncher:
                 "Battle form receipt classification completed after its deadline"
             )
         except TimeoutError as error:
-            raise _BattleFormOutcomeUnknownError(
+            raise BattleFormOutcomeUnknownError(
                 "Battle form receipt classification completed after its deadline"
             ) from error
         logger.debug(
@@ -493,10 +493,12 @@ class BattleLauncher:
         try:
             await lifecycle.enable(deadline=deadline)
             lifecycle.trigger()
-            # HVDriver accepts hbrowser's nominal Deadline type, but only uses
-            # its ``remaining()`` protocol. Passing the same object keeps its
-            # internal navigation phases inside this absolute route deadline.
-            await self.browser.get(direct_url, deadline=cast(Any, deadline))
+            await self.browser.navigate_with_budget(
+                direct_url,
+                budget_seconds=deadline.require_remaining(
+                    "Battle route deadline expired before browser navigation"
+                ),
+            )
             await lifecycle.wait(deadline)
             deadline.require_remaining(
                 "Battle route navigation deadline expired at lifecycle receipt"
@@ -506,7 +508,7 @@ class BattleLauncher:
                 error
             ):
                 raise
-            raise _BattleNavigationSafetyError(
+            raise BattleNavigationSafetyError(
                 f"The direct {_BATTLE_ROUTE_LABELS[route]} navigation outcome is "
                 "unknown"
             ) from error
@@ -529,7 +531,7 @@ class BattleLauncher:
                 error
             ):
                 raise
-            raise _BattleNavigationSafetyError(
+            raise BattleNavigationSafetyError(
                 f"Unable to observe trusted Battle navigation state {context}"
             ) from error
 
@@ -545,22 +547,22 @@ class BattleLauncher:
         context: str,
     ) -> None:
         if observation.realm is None:
-            raise _BattleNavigationSafetyError(
+            raise BattleNavigationSafetyError(
                 f"Battle navigation has an untrusted origin {context}"
             )
         if observation.realm is not expected_realm:
-            raise _BattleNavigationSafetyError(
+            raise BattleNavigationSafetyError(
                 f"Battle navigation is in the wrong realm {context}"
             )
         try:
             path = urlsplit(observation.url).path
         except ValueError as error:
-            raise _BattleNavigationSafetyError(
+            raise BattleNavigationSafetyError(
                 f"Battle navigation URL is invalid {context}"
             ) from error
         expected_path = "/isekai/" if expected_realm is Realm.ISEKAI else "/"
         if path != expected_path:
-            raise _BattleNavigationSafetyError(
+            raise BattleNavigationSafetyError(
                 f"Battle navigation landed on an unexpected path {context}"
             )
 
@@ -1359,4 +1361,9 @@ class BattleLauncher:
         return True
 
 
-__all__ = ["BattleLauncher"]
+__all__ = [
+    "BattleFormOutcomeUnknownError",
+    "BattleLauncher",
+    "BattleNavigationSafetyError",
+    "BattleRouteReadinessError",
+]

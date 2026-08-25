@@ -942,6 +942,7 @@ class BaseControlPanel(ABC):
     @abstractmethod
     def get_toggle(self, name: str) -> bool: ...
 
+    @abstractmethod
     def register_integer(
         self,
         name: str,
@@ -951,14 +952,13 @@ class BaseControlPanel(ABC):
         minimum: int | None = None,
         maximum: int | None = None,
         group: str = "Options",
-    ) -> None:
-        """Register an integer control when the implementation supports it."""
-        raise NotImplementedError("This control panel has no integer controls")
+    ) -> None: ...
 
+    @abstractmethod
     def get_integer(self, name: str) -> int:
-        """Return a committed integer value when supported."""
-        raise NotImplementedError("This control panel has no integer controls")
+        """Return a committed integer value."""
 
+    @abstractmethod
     def set_checklist(
         self,
         name: str,
@@ -968,18 +968,15 @@ class BaseControlPanel(ABC):
         *,
         status: str | None = None,
     ) -> None:
-        """Replace a named checklist when the implementation supports it."""
-        raise NotImplementedError("This control panel has no checklist controls")
+        """Replace a named checklist."""
 
+    @abstractmethod
     def get_checklist_selection(self, name: str) -> tuple[str, ...]:
         """Return one ordered, atomically committed checklist selection."""
-        raise NotImplementedError("This control panel has no checklist controls")
 
+    @abstractmethod
     def pause(self) -> None:
-        """Request a pause when the implementation supports interaction."""
-        raise NotImplementedError(
-            "This control panel cannot be paused programmatically"
-        )
+        """Request a pause at the next safe boundary."""
 
     @abstractmethod
     def set_actions(

@@ -5,7 +5,7 @@ import time
 import unittest
 from unittest.mock import AsyncMock, Mock, call, patch
 
-from hvbattle import BaseControlPanel, ControlPanel, NullControlPanel
+from hvbattle import ControlPanel, NullControlPanel
 from hvbattle.control_panel import (
     _IPC_HEADER,
     ControlPanelProcessOwnershipError,
@@ -1041,61 +1041,6 @@ class NullControlPanelTests(unittest.TestCase):
     def test_unknown_checklist_name_is_not_silently_defaulted(self) -> None:
         with self.assertRaisesRegex(KeyError, "Unknown checklist control"):
             NullControlPanel().get_checklist_selection("ring")
-
-    def test_legacy_subclass_does_not_need_integer_methods(self) -> None:
-        class LegacyPanel(BaseControlPanel):
-            def __init__(self) -> None:
-                self.disabled = frozenset[str]()
-
-            def set_title(self, title: str) -> None:
-                del title
-
-            def register_toggle(
-                self,
-                name: str,
-                label: str,
-                default: bool = False,
-                *,
-                group: str = "Options",
-            ) -> None:
-                del name, label, default, group
-
-            def get_toggle(self, name: str) -> bool:
-                del name
-                return False
-
-            def set_actions(self, action_groups, disabled) -> None:  # type: ignore[no-untyped-def]
-                del action_groups
-                self.disabled = frozenset(disabled)
-
-            def get_disabled_actions(self) -> frozenset[str]:
-                return self.disabled
-
-            def is_paused(self) -> bool:
-                return False
-
-            async def wait_if_paused(self) -> None:
-                return
-
-            async def aclose(self, *, expires_at: float | None = None) -> None:
-                del expires_at
-                return
-
-            def destroy(self) -> None:
-                return
-
-        panel = LegacyPanel()
-        panel.set_actions({"Items": ["mystic gem"]}, {"mystic gem"})
-
-        self.assertEqual(panel.get_disabled_actions(), frozenset({"mystic gem"}))
-        with self.assertRaises(NotImplementedError):
-            panel.register_integer("target", "Target")
-        with self.assertRaises(NotImplementedError):
-            panel.set_checklist("challenges", "Challenges", ())
-        with self.assertRaises(NotImplementedError):
-            panel.get_checklist_selection("challenges")
-        with self.assertRaises(NotImplementedError):
-            panel.pause()
 
 
 if __name__ == "__main__":

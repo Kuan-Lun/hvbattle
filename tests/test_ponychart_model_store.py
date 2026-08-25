@@ -288,7 +288,7 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
     def _pointer(self) -> dict[str, object]:
         return json.loads((self.root / "current.json").read_text())
 
-    def test_startup_ignores_legacy_canonical_pair_and_fetches_full_bundle(
+    def test_startup_removes_legacy_canonical_pair_and_fetches_full_bundle(
         self,
     ) -> None:
         self._write_legacy_canonical(
@@ -309,6 +309,13 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
         pointer = self._pointer()
 
         self.assertEqual(pointer["generation"], loaded.generation)
+        for legacy_name in (
+            "model.onnx",
+            "model.onnx.etag",
+            "thresholds.json",
+            "thresholds.json.etag",
+        ):
+            self.assertFalse((self.root / legacy_name).exists())
         generation = self.root / "generations" / loaded.generation
         self.assertEqual((generation / "model.onnx").read_bytes(), b"remote-model")
         self.assertTrue((generation / "manifest.json").is_file())

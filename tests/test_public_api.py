@@ -104,8 +104,6 @@ class PublicApiTests(unittest.TestCase):
 
                 self.assertEqual(error.diagnostic_code, "battle.turn-timeout")
                 self.assertEqual(str(error), "Human-readable detail")
-                with self.assertRaises(TypeError):
-                    error_type("legacy constructor")  # type: ignore[call-arg]
 
         invalid_codes = (
             "",

@@ -228,7 +228,7 @@ ordinary log. The exact listing query remains mandatory when no blocker exists.
 `ABSENT` is accepted only after the deadline observer reaches the validated
 realm-scoped route with its Arena DOM and no blocker.
 
-This atomic observation contract is the `hvbattle` 0.13 / `hvbrowser` 0.9
+This atomic observation contract is the `hvbattle` 0.14 / `hvbrowser` 0.9
 package line; the dependency range intentionally rejects older or newer minor
 lines with different navigation contracts.
 
@@ -248,10 +248,11 @@ or last server option.
 
 `BaseControlPanel`, `ControlPanel`, and `NullControlPanel` provide reusable
 pause, named-action, named-toggle, and validated integer mechanisms. The
-`set_actions()` API is the generic spelling; the older `set_skills()` spelling
-remains available as a compatibility alias. Integer edits become live only
-after Apply or Enter, so partially typed mutation amounts are never published.
-Closing the interactive window sets the pause flag before the GUI exits.
+`set_actions()` API configures named action permissions. Integer edits become
+live only after Apply or Enter, so partially typed mutation amounts are never
+published. Closing the interactive window sets the pause flag before the GUI
+exits. Custom `BaseControlPanel` subclasses must implement every declared
+toggle, checklist, integer, action, pause, and lifecycle capability.
 
 The package does not register campaign choices or choose their defaults: a
 calling application owns the control names, labels, initial values, and the

@@ -89,6 +89,24 @@ def _presence(
     )
 
 
+def _ring_snapshot(
+    tokens_of_blood: int,
+    options: tuple[RingOfBloodOption, ...],
+    challenges: tuple[RingOfBloodChallenge, ...] | None = None,
+) -> RingOfBloodSnapshot:
+    if challenges is None:
+        challenges = tuple(
+            RingOfBloodChallenge(
+                option.challenge_name,
+                option.exp_multiplier,
+                option.entry_cost,
+                option,
+            )
+            for option in options
+        )
+    return RingOfBloodSnapshot(tokens_of_blood, options, challenges)
+
+
 class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
     def test_arena_option_keeps_old_positional_constructor(self) -> None:
         option = ArenaOption(12, "token")
@@ -1865,7 +1883,18 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         client.page = Mock()
         launcher = BattleLauncher(client, Mock())
         client.page.evaluate = AsyncMock(
-            return_value=["init_battle(12, 34)", "init_battle(56, 78, 'token')"]
+            return_value=[
+                {
+                    "onclick": "init_battle(12, 34)",
+                    "challengeName": "",
+                    "expText": "",
+                },
+                {
+                    "onclick": "init_battle(56, 78, 'token')",
+                    "challengeName": "",
+                    "expText": "",
+                },
+            ]
         )
 
         options = await launcher.list_arena_options()
@@ -1916,7 +1945,15 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         launcher = BattleLauncher(client, Mock())
         secret = "secret-battle-token"
         malformed = f"init_battle(bad, 34, '{secret}')"
-        client.page.evaluate = AsyncMock(return_value=[malformed])
+        client.page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "onclick": malformed,
+                    "challengeName": "Malformed",
+                    "expText": "X1.0",
+                }
+            ]
+        )
 
         with patch("hvbattle.battle_launcher.logger") as launcher_logger:
             options = await launcher.list_arena_options()
@@ -2013,7 +2050,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             snapshot,
-            RingOfBloodSnapshot(
+            _ring_snapshot(
                 1_234,
                 (option,),
                 (
@@ -2137,7 +2174,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_returns_insufficient_tokens_without_submission(self) -> None:
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
-        snapshot = RingOfBloodSnapshot(3, (option,))
+        snapshot = _ring_snapshot(3, (option,))
         page.evaluate = AsyncMock(return_value="insufficient-tokens")
 
         outcome = await launcher.start_ring_of_blood(
@@ -2152,7 +2189,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_returns_unavailable_when_option_disappears(self) -> None:
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
-        snapshot = RingOfBloodSnapshot(20, (option,))
+        snapshot = _ring_snapshot(20, (option,))
         page.evaluate = AsyncMock(return_value="option-unavailable")
 
         outcome = await launcher.start_ring_of_blood(
@@ -2167,7 +2204,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_returns_state_changed_before_submission(self) -> None:
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
-        snapshot = RingOfBloodSnapshot(20, (option,))
+        snapshot = _ring_snapshot(20, (option,))
         page.evaluate = AsyncMock(return_value="state-changed")
 
         outcome = await launcher.start_ring_of_blood(
@@ -2184,7 +2221,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
-        snapshot = RingOfBloodSnapshot(20, (option,))
+        snapshot = _ring_snapshot(20, (option,))
         page.evaluate = AsyncMock(return_value="submitted")
 
         outcome = await launcher.start_ring_of_blood(
@@ -2227,7 +2264,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_submits_from_exact_isekai_ring_url(self) -> None:
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
-        snapshot = RingOfBloodSnapshot(20, (option,))
+        snapshot = _ring_snapshot(20, (option,))
         page.evaluate = AsyncMock(return_value="submitted")
 
         outcome = await launcher.start_ring_of_blood(
@@ -2260,7 +2297,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
                     1.0,
                     10,
                 )
-                snapshot = RingOfBloodSnapshot(20, (option,))
+                snapshot = _ring_snapshot(20, (option,))
                 page.evaluate = AsyncMock(return_value=atomic_result)
 
                 outcome = await launcher.start_ring_of_blood(
@@ -2287,7 +2324,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
                     1.0,
                     10,
                 )
-                snapshot = RingOfBloodSnapshot(20, (option,))
+                snapshot = _ring_snapshot(20, (option,))
                 page.evaluate = AsyncMock(return_value=atomic_result)
 
                 with self.assertRaises(BattleFormOutcomeUnknownError):
@@ -2300,7 +2337,7 @@ class RingOfBloodLauncherTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_submission_exception_propagates(self) -> None:
         launcher, page = self._launcher()
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
-        snapshot = RingOfBloodSnapshot(20, (option,))
+        snapshot = _ring_snapshot(20, (option,))
         submission_error = ValueError("navigation destroyed context")
         launcher._confirm_battle_form_receipt.side_effect = TimeoutError(
             "receipt missing"

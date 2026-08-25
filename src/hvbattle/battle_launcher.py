@@ -860,24 +860,17 @@ class BattleLauncher:
         )
         options: list[ArenaOption] = []
         for payload in row_payloads or ():
-            if isinstance(payload, str):
-                onclick = payload
-                challenge_name = None
-                exp_multiplier = None
-            elif isinstance(payload, dict):
-                onclick_value = payload.get("onclick")
-                onclick = onclick_value if isinstance(onclick_value, str) else ""
-                challenge_value = payload.get("challengeName")
-                challenge_name = (
-                    challenge_value.strip()
-                    if isinstance(challenge_value, str) and challenge_value.strip()
-                    else None
-                )
-                exp_multiplier = _parse_optional_exp_multiplier(payload.get("expText"))
-            else:
-                onclick = ""
-                challenge_name = None
-                exp_multiplier = None
+            if not isinstance(payload, dict):
+                continue
+            onclick_value = payload.get("onclick")
+            onclick = onclick_value if isinstance(onclick_value, str) else ""
+            challenge_value = payload.get("challengeName")
+            challenge_name = (
+                challenge_value.strip()
+                if isinstance(challenge_value, str) and challenge_value.strip()
+                else None
+            )
+            exp_multiplier = _parse_optional_exp_multiplier(payload.get("expText"))
             match = _ARENA_ACTION_PATTERN.fullmatch(onclick.strip())
             if match is None:
                 logger.debug(

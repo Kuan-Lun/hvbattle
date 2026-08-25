@@ -9,6 +9,7 @@ from hvbrowser import HentaiVerseSession, HVDriver, Realm
 
 import hvbattle.session as session_module
 from hvbattle import (
+    RingOfBloodChallenge,
     RingOfBloodOption,
     RingOfBloodSnapshot,
     RingOfBloodStartOutcome,
@@ -454,7 +455,11 @@ class BattleSessionCompositionTests(unittest.IsolatedAsyncioTestCase):
         hentaiverse = HentaiVerseSession(browser=HVDriver(headless=True))
         session = BattleSession(hentaiverse=hentaiverse)
         option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
-        snapshot = RingOfBloodSnapshot(20, (option,))
+        snapshot = RingOfBloodSnapshot(
+            20,
+            (option,),
+            (RingOfBloodChallenge("Triple Trio and the Tree", 1.0, 10, option),),
+        )
         session._launcher.goto_ring_of_blood = AsyncMock(return_value=True)
         session._launcher.inspect_ring_of_blood = AsyncMock(return_value=snapshot)
         session._launcher.start_ring_of_blood = AsyncMock(

@@ -59,24 +59,12 @@ class RingOfBloodSnapshot:
 
     tokens_of_blood: int
     options: tuple[RingOfBloodOption, ...]
-    challenges: tuple[RingOfBloodChallenge, ...] = ()
+    challenges: tuple[RingOfBloodChallenge, ...]
 
     def __post_init__(self) -> None:
-        challenges = self.challenges
-        if not challenges:
-            challenges = tuple(
-                RingOfBloodChallenge(
-                    option.challenge_name,
-                    option.exp_multiplier,
-                    option.entry_cost,
-                    option,
-                )
-                for option in self.options
-            )
-            object.__setattr__(self, "challenges", challenges)
         derived_options = tuple(
             challenge.start_action
-            for challenge in challenges
+            for challenge in self.challenges
             if challenge.start_action is not None
         )
         if derived_options != self.options:

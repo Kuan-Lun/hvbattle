@@ -104,6 +104,8 @@ class PublicApiTests(unittest.TestCase):
 
                 self.assertEqual(error.diagnostic_code, "battle.turn-timeout")
                 self.assertEqual(str(error), "Human-readable detail")
+                with self.assertRaises(TypeError):
+                    error_type("missing diagnostic code")  # type: ignore[call-arg]
 
         invalid_codes = (
             "",
@@ -120,6 +122,13 @@ class PublicApiTests(unittest.TestCase):
                         "detail",
                         diagnostic_code=diagnostic_code,
                     )
+
+    def test_ring_snapshot_requires_explicit_challenges(self) -> None:
+        from hvbattle import RingOfBloodOption, RingOfBloodSnapshot
+
+        option = RingOfBloodOption(112, "Triple Trio and the Tree", 1.0, 10)
+        with self.assertRaises(TypeError):
+            RingOfBloodSnapshot(20, (option,))  # type: ignore[call-arg]
 
     def test_state_readiness_error_has_fixed_safe_diagnostic(self) -> None:
         from hvbattle import BattleStateReadinessError

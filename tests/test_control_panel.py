@@ -631,7 +631,7 @@ class ControlPanelStateTests(unittest.TestCase):
             ],
         )
 
-    def test_skill_mutation_and_read_are_acknowledged(self) -> None:
+    def test_action_mutation_and_read_are_acknowledged(self) -> None:
         panel = _owned_panel()
         groups = {"Debuffs": ["imperil", "weaken"]}
         with patch.object(
@@ -639,8 +639,8 @@ class ControlPanelStateTests(unittest.TestCase):
             "_rpc",
             side_effect=(None, ("imperil",)),
         ) as rpc:
-            panel.set_skills(groups, {"imperil"})
-            self.assertEqual(panel.get_forbidden_skills(), frozenset({"imperil"}))
+            panel.set_actions(groups, {"imperil"})
+            self.assertEqual(panel.get_disabled_actions(), frozenset({"imperil"}))
 
         self.assertEqual(rpc.call_count, 2)
 
@@ -1064,11 +1064,11 @@ class NullControlPanelTests(unittest.TestCase):
                 del name
                 return False
 
-            def set_skills(self, skill_groups, forbidden) -> None:  # type: ignore[no-untyped-def]
-                del skill_groups
-                self.disabled = frozenset(forbidden)
+            def set_actions(self, action_groups, disabled) -> None:  # type: ignore[no-untyped-def]
+                del action_groups
+                self.disabled = frozenset(disabled)
 
-            def get_forbidden_skills(self) -> frozenset[str]:
+            def get_disabled_actions(self) -> frozenset[str]:
                 return self.disabled
 
             def is_paused(self) -> bool:

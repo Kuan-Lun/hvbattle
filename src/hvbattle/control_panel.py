@@ -367,7 +367,7 @@ def _run_gui(channel: socket.socket, auth_token: str) -> None:
     ] = {}
     checklist_observed_revisions: dict[str, int] = {}
     checklist_lock = threading.RLock()
-    skill_dict: dict[str, bool] = {}
+    action_dict: dict[str, bool] = {}
 
     root = tk.Tk()
     root.title("Battle Control Panel")
@@ -386,8 +386,8 @@ def _run_gui(channel: socket.socket, auth_token: str) -> None:
 
     controls_container = tk.Frame(body)
     controls_container.grid(row=0, column=0, sticky="nsew")
-    skill_container = tk.Frame(controls_container)
-    skill_container.pack(pady=(0, 5), fill="x")
+    action_container = tk.Frame(controls_container)
+    action_container.pack(pady=(0, 5), fill="x")
     toggle_container = tk.Frame(controls_container)
     toggle_container.pack(pady=(5, 0), fill="x")
 
@@ -396,7 +396,7 @@ def _run_gui(channel: socket.socket, auth_token: str) -> None:
     checklist_container.rowconfigure(0, weight=1)
     body.columnconfigure(1, weight=1)
 
-    local_skills: dict[str, tk.BooleanVar] = {}
+    local_actions: dict[str, tk.BooleanVar] = {}
     local_toggles: dict[str, tk.BooleanVar] = {}
     toggle_groups: dict[str, tk.LabelFrame] = {}
     checklist_frames: dict[str, tk.LabelFrame] = {}
@@ -784,35 +784,35 @@ def _run_gui(channel: socket.socket, auth_token: str) -> None:
                     raise KeyError(f"Unknown checklist control: {arguments}") from None
                 checklist_observed_revisions[arguments] = revision
                 return revision, selected
-            case "set_skills":
-                skill_groups, forbidden = arguments
-                for widget in skill_container.winfo_children():
+            case "set_actions":
+                action_groups, disabled = arguments
+                for widget in action_container.winfo_children():
                     widget.destroy()
-                local_skills.clear()
-                skill_dict.clear()
-                for column, (group_name, skills) in enumerate(skill_groups.items()):
-                    frame = tk.LabelFrame(skill_container, text=group_name)
+                local_actions.clear()
+                action_dict.clear()
+                for column, (group_name, actions) in enumerate(action_groups.items()):
+                    frame = tk.LabelFrame(action_container, text=group_name)
                     frame.grid(row=0, column=column, padx=5, pady=3, sticky="nsew")
-                    for skill in skills:
-                        skill_variable = tk.BooleanVar(value=skill not in forbidden)
-                        local_skills[skill] = skill_variable
-                        skill_dict[skill] = skill_variable.get()
+                    for action in actions:
+                        action_variable = tk.BooleanVar(value=action not in disabled)
+                        local_actions[action] = action_variable
+                        action_dict[action] = action_variable.get()
                         tk.Checkbutton(
                             frame,
-                            text=skill,
-                            variable=skill_variable,
+                            text=action,
+                            variable=action_variable,
                             command=partial(
                                 _publish_boolean,
-                                skill_dict,
-                                skill,
-                                skill_variable,
+                                action_dict,
+                                action,
+                                action_variable,
                             ),
                         ).pack(anchor="w", padx=5, pady=1)
-                    skill_container.columnconfigure(column, weight=1)
+                    action_container.columnconfigure(column, weight=1)
                 schedule_checklist_reflow()
-            case "get_forbidden_skills":
+            case "get_disabled_actions":
                 return tuple(
-                    name for name, enabled in skill_dict.items() if not enabled
+                    name for name, enabled in action_dict.items() if not enabled
                 )
             case "set_title":
                 root.title(arguments)
@@ -981,23 +981,13 @@ class BaseControlPanel(ABC):
             "This control panel cannot be paused programmatically"
         )
 
+    @abstractmethod
     def set_actions(
         self, action_groups: dict[str, list[str]], disabled: Iterable[str]
-    ) -> None:
-        """Configure named action permissions using the legacy skill channel."""
-        self.set_skills(action_groups, disabled)
-
-    def get_disabled_actions(self) -> frozenset[str]:
-        """Return disabled named actions using the legacy skill channel."""
-        return self.get_forbidden_skills()
-
-    @abstractmethod
-    def set_skills(
-        self, skill_groups: dict[str, list[str]], forbidden: Iterable[str]
     ) -> None: ...
 
     @abstractmethod
-    def get_forbidden_skills(self) -> frozenset[str]: ...
+    def get_disabled_actions(self) -> frozenset[str]: ...
 
     @abstractmethod
     def is_paused(self) -> bool:
@@ -1450,19 +1440,19 @@ class ControlPanel(BaseControlPanel):
         self._expect_none(self._rpc("pause"))
         logger.info("Battle control panel pause requested")
 
-    def set_skills(
-        self, skill_groups: dict[str, list[str]], forbidden: Iterable[str]
+    def set_actions(
+        self, action_groups: dict[str, list[str]], disabled: Iterable[str]
     ) -> None:
-        forbidden_set = frozenset(forbidden)
-        self._expect_none(self._rpc("set_skills", (skill_groups, forbidden_set)))
+        disabled_set = frozenset(disabled)
+        self._expect_none(self._rpc("set_actions", (action_groups, disabled_set)))
 
-    def get_forbidden_skills(self) -> frozenset[str]:
-        value = self._rpc("get_forbidden_skills")
+    def get_disabled_actions(self) -> frozenset[str]:
+        value = self._rpc("get_disabled_actions")
         if not isinstance(value, tuple) or any(
             not isinstance(name, str) for name in value
         ):
             self._mark_closing()
-            raise RuntimeError("Battle control panel returned invalid skill state")
+            raise RuntimeError("Battle control panel returned invalid action state")
         return frozenset(value)
 
     def is_paused(self) -> bool:
@@ -1572,7 +1562,7 @@ class NullControlPanel(BaseControlPanel):
         self._toggles: dict[str, bool] = {}
         self._integers: dict[str, int] = {}
         self._checklists: dict[str, tuple[str, ...]] = {}
-        self._forbidden_skills: frozenset[str] = frozenset()
+        self._disabled_actions: frozenset[str] = frozenset()
 
     def set_title(self, title: str) -> None:
         del title
@@ -1638,14 +1628,14 @@ class NullControlPanel(BaseControlPanel):
     def pause(self) -> None:
         return
 
-    def set_skills(
-        self, skill_groups: dict[str, list[str]], forbidden: Iterable[str]
+    def set_actions(
+        self, action_groups: dict[str, list[str]], disabled: Iterable[str]
     ) -> None:
-        del skill_groups
-        self._forbidden_skills = frozenset(forbidden)
+        del action_groups
+        self._disabled_actions = frozenset(disabled)
 
-    def get_forbidden_skills(self) -> frozenset[str]:
-        return self._forbidden_skills
+    def get_disabled_actions(self) -> frozenset[str]:
+        return self._disabled_actions
 
     def is_paused(self) -> bool:
         return False

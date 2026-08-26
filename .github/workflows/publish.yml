@@ -79,33 +79,6 @@ jobs:
           print("publish=true")
           PY
 
-      - name: Install project
-        if: steps.version.outputs.publish == 'true'
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if python -m pip install --no-cache-dir --editable ".[dev]"; then
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              exit 1
-            fi
-            sleep 30
-          done
-
-      - name: Check formatting and lint
-        if: steps.version.outputs.publish == 'true'
-        run: |
-          python -m black --check src/hvbattle tests
-          python -m ruff check src/hvbattle tests
-
-      - name: Check types
-        if: steps.version.outputs.publish == 'true'
-        run: python -m mypy src/hvbattle
-
-      - name: Run tests
-        if: steps.version.outputs.publish == 'true'
-        run: python -m pytest
-
       - name: Build distributions
         if: steps.version.outputs.publish == 'true'
         run: |

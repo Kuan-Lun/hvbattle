@@ -28,13 +28,6 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      - name: Install release tooling
-        run: >-
-          python -m pip install
-          "build==1.5.0"
-          "check-wheel-contents==0.6.3"
-          "twine==7.0.0"
-
       - name: Install project
         run: |
           for attempt in 1 2 3 4 5; do
@@ -47,19 +40,7 @@ jobs:
             sleep 30
           done
 
-      - name: Check formatting and lint
-        run: |
-          python -m black --check src/hvbattle tests
-          python -m ruff check src/hvbattle tests
-
-      - name: Check types
-        run: python -m mypy src/hvbattle
-
-      - name: Run tests
+      # Local hooks and scripts own lint, formatting, typing, formal-model, and
+      # distribution checks. This lane keeps only the Linux-specific test signal.
+      - name: Run Linux compatibility tests
         run: python -m pytest
-
-      - name: Build distributions
-        run: |
-          python -m build
-          python -m twine check dist/*
-          check-wheel-contents dist/*.whl

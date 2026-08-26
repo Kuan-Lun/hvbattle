@@ -286,9 +286,9 @@ overlay editable checkouts in dependency order:
 
 ```bash
 uv pip install --python .venv/bin/python --reinstall --no-deps --editable \
-  /Users/kuanlun_wang/Desktop/git-repo/hbrowser.clone
+  /path/to/hbrowser
 uv pip install --python .venv/bin/python --reinstall --no-deps --editable \
-  /Users/kuanlun_wang/Desktop/git-repo/hvbrowser.clone
+  /path/to/hvbrowser
 ```
 
 Commands that must preserve these editable overlays use `uv run --no-sync`.

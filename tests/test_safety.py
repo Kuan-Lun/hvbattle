@@ -1277,8 +1277,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             exc_info=True,
         )
         runner_logger.error.assert_called_once_with(
-            "Battle turn timed out; no unclassified timeout is retried "
-            "error_type=%s",
+            "Battle turn timed out; no unclassified timeout is retried error_type=%s",
             "TimeoutError",
         )
         session.prepare_turn_state.assert_awaited_once()

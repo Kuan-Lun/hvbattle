@@ -910,7 +910,10 @@ class BattleLauncher:
                     || expIndex < 0
                     || entryCostIndex < 0
                 ) {
-                    return {tokenText: normalize(tokenContainer.textContent), rows: null};
+                    return {
+                        tokenText: normalize(tokenContainer.textContent),
+                        rows: null,
+                    };
                 }
                 return {
                     tokenText: normalize(tokenContainer.textContent),

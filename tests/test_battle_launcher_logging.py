@@ -33,9 +33,9 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         return launcher, client.page
 
     @staticmethod
-    def _ring_values() -> (
-        tuple[RingOfBloodOption, RingOfBloodSnapshot, dict[str, object]]
-    ):
+    def _ring_values() -> tuple[
+        RingOfBloodOption, RingOfBloodSnapshot, dict[str, object]
+    ]:
         option = RingOfBloodOption(105, "Konata", 1.0, 1)
         snapshot = RingOfBloodSnapshot(
             20,
@@ -109,7 +109,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
                 "https://hentaiverse.org/?s=Battle&ss=gr",
             ),
         )
-        for kind, method_name, option, expected_url in cases:
+        for kind, method_name, option, _expected_url in cases:
             with self.subTest(kind=kind):
                 launcher, page = self._launcher()
                 page.evaluate = AsyncMock(return_value="unexpected-page")
@@ -151,7 +151,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        for kind, method_name, option, expected_url in cases:
+        for kind, method_name, option, _expected_url in cases:
             with self.subTest(kind=kind):
                 launcher, page = self._launcher()
                 page.evaluate = AsyncMock(return_value="form-unavailable")
@@ -191,7 +191,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        for kind, method_name, option, expected_url in cases:
+        for kind, method_name, option, _expected_url in cases:
             with self.subTest(kind=kind):
                 launcher, page = self._launcher()
                 submission_error = RuntimeError(
@@ -242,7 +242,7 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        for method_name, option, expected_url, message in cases:
+        for method_name, option, _expected_url, message in cases:
             with self.subTest(method=method_name):
                 launcher, page = self._launcher()
                 page.evaluate = AsyncMock(return_value="submitted")

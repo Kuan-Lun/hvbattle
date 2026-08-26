@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# Rebuild a clean development environment whose hvbrowser dependency comes
-# from PyPI. Install local editable dependencies manually afterwards when
-# cross-repository development is required.
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
-rm -rf .venv .mypy_cache .ruff_cache .pytest_cache
-find . -type d -name __pycache__ -exec rm -rf {} +
-uv cache clean --force
-uv venv --python 3.14
-uv pip install -e ".[dev]"
+repository_root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repository_root"
+
+command -v uv >/dev/null || {
+    printf 'rebuild-env: uv is required\n' >&2
+    exit 1
+}
+command -v npm >/dev/null || {
+    printf 'rebuild-env: npm is required\n' >&2
+    exit 1
+}
+
+# Resolve only from project manifests; neither uv.lock nor package-lock.json is
+# read or generated.
+# uv reads project.requires-python and selects a compatible interpreter.
+uv venv --clear .venv
+uv pip install --python .venv/bin/python --upgrade --reinstall -e '.[dev]'
+npm install --package-lock=false

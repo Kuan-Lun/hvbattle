@@ -17,30 +17,10 @@
       "Bash(cat > *)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(uv run *)",
-      "Bash(uv run python -c ' *)",
-      "Bash(python3 -)",
-      "Bash(python3 -c ' *)",
-      "Bash(echo \"exit: $?\")"
+      "Bash(uv run *)"
     ],
     "additionalDirectories": [
       "/tmp"
-    ]
-  },
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "scripts/hooks/finalize-python.sh"
-          },
-          {
-            "type": "command",
-            "command": "scripts/hooks/finalize-markdown.sh"
-          }
-        ]
-      }
     ]
   }
 }

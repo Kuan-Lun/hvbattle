@@ -132,8 +132,7 @@ class BattleSession:
             raise TypeError("audit_event_bus must be AuditEventBus")
         if hentaiverse is not None and (args or kwargs):
             raise TypeError(
-                "Browser options cannot be combined with an injected "
-                "HentaiVerseSession"
+                "Browser options cannot be combined with an injected HentaiVerseSession"
             )
         self.hentaiverse = (
             hentaiverse

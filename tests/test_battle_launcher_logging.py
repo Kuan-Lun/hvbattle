@@ -97,7 +97,9 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             (
                 "arena",
                 "start_arena",
-                ArenaOption(12, "secret-arena-token"),
+                ArenaOption(
+                    12, "secret-arena-token", challenge_name=None, exp_multiplier=None
+                ),
                 "https://hentaiverse.org/?s=Battle&ss=ar",
             ),
             (
@@ -136,7 +138,9 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             (
                 "arena",
                 "start_arena",
-                ArenaOption(12, "secret-arena-token"),
+                ArenaOption(
+                    12, "secret-arena-token", challenge_name=None, exp_multiplier=None
+                ),
                 "https://hentaiverse.org/?s=Battle&ss=ar",
             ),
             (
@@ -174,7 +178,9 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
             (
                 "arena",
                 "start_arena",
-                ArenaOption(12, "secret-arena-token"),
+                ArenaOption(
+                    12, "secret-arena-token", challenge_name=None, exp_multiplier=None
+                ),
                 "https://hentaiverse.org/?s=Battle&ss=ar",
             ),
             (
@@ -222,7 +228,9 @@ class BattleLauncherLoggingTests(unittest.IsolatedAsyncioTestCase):
         cases = (
             (
                 "start_arena",
-                ArenaOption(12, "secret-arena-token"),
+                ArenaOption(
+                    12, "secret-arena-token", challenge_name=None, exp_multiplier=None
+                ),
                 "https://hentaiverse.org/?s=Battle&ss=ar",
                 "Submitted Arena battle form id=%s",
             ),

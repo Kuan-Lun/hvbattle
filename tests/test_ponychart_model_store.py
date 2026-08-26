@@ -18,6 +18,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.error import URLError
 
+import ponychart_classifier
+import ponychart_classifier.inference.artifacts as classifier_artifacts
+
 import hvbattle.hv_battle_ponychart as ponychart_module
 import hvbattle.ponychart_model_store as store_module
 from hvbattle.ponychart_model_store import (
@@ -223,7 +226,7 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._temporary.cleanup()
 
-    def _write_legacy_canonical(
+    def _write_classifier_canonical(
         self,
         model: bytes = b"model-v1",
         thresholds: bytes = b'{"Twilight Sparkle":0.5}',
@@ -288,10 +291,10 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
     def _pointer(self) -> dict[str, object]:
         return json.loads((self.root / "current.json").read_text())
 
-    def test_startup_removes_legacy_canonical_pair_and_fetches_full_bundle(
+    def test_startup_preserves_classifier_canonical_pair_and_fetches_full_bundle(
         self,
     ) -> None:
-        self._write_legacy_canonical(
+        self._write_classifier_canonical(
             model=b"legacy-model",
             thresholds=b"legacy-thresholds",
             model_etag='"remote-model"',
@@ -309,13 +312,19 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
         pointer = self._pointer()
 
         self.assertEqual(pointer["generation"], loaded.generation)
-        for legacy_name in (
-            "model.onnx",
-            "model.onnx.etag",
-            "thresholds.json",
-            "thresholds.json.etag",
-        ):
-            self.assertFalse((self.root / legacy_name).exists())
+        self.assertEqual((self.root / "model.onnx").read_bytes(), b"legacy-model")
+        self.assertEqual(
+            (self.root / "model.onnx.etag").read_text(),
+            '"remote-model"',
+        )
+        self.assertEqual(
+            (self.root / "thresholds.json").read_bytes(),
+            b"legacy-thresholds",
+        )
+        self.assertEqual(
+            (self.root / "thresholds.json.etag").read_text(),
+            '"remote-thresholds"',
+        )
         generation = self.root / "generations" / loaded.generation
         self.assertEqual((generation / "model.onnx").read_bytes(), b"remote-model")
         self.assertTrue((generation / "manifest.json").is_file())
@@ -345,6 +354,39 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
             second_factory.candidates[-1].model_path,
             generation / "model.onnx",
         )
+        no_network.assert_not_called()
+
+    def test_classifier_clear_preserves_committed_generation(self) -> None:
+        _remote, _store, loaded = self._initial_store()
+        self._write_classifier_canonical()
+        pointer_before = (self.root / "current.json").read_bytes()
+        generation = self.root / "generations" / loaded.generation
+        manifest_before = (generation / "manifest.json").read_bytes()
+
+        with patch.object(
+            classifier_artifacts,
+            "DEFAULT_ARTIFACT_DIR",
+            self.root,
+        ):
+            ponychart_classifier.clear_artifacts()
+
+        for canonical_name in (
+            "model.onnx",
+            "model.onnx.etag",
+            "thresholds.json",
+            "thresholds.json.etag",
+        ):
+            self.assertFalse((self.root / canonical_name).exists())
+        self.assertEqual((self.root / "current.json").read_bytes(), pointer_before)
+        self.assertEqual((generation / "manifest.json").read_bytes(), manifest_before)
+
+        no_network = Mock(side_effect=AssertionError("pointer load must be local"))
+        reloaded = PonyChartGenerationStore(
+            root=self.root,
+            candidate_factory=_CandidateFactory(),
+            urlopen=no_network,
+        ).load_or_bootstrap()
+        self.assertEqual(reloaded.generation, loaded.generation)
         no_network.assert_not_called()
 
     def test_head_etags_without_get_etags_remain_non_authoritative(self) -> None:

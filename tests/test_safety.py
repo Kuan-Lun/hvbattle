@@ -108,21 +108,39 @@ def _ring_snapshot(
 
 
 class BattleSessionSafetyTests(unittest.IsolatedAsyncioTestCase):
-    def test_arena_option_keeps_old_positional_constructor(self) -> None:
-        option = ArenaOption(12, "token")
+    def test_arena_option_requires_metadata_and_compares_the_full_observation(
+        self,
+    ) -> None:
+        with self.assertRaises(TypeError):
+            ArenaOption(12, "token")  # type: ignore[call-arg]
+
+        option = ArenaOption(
+            12,
+            "token",
+            challenge_name=None,
+            exp_multiplier=None,
+        )
 
         self.assertEqual(option.battle_id, 12)
         self.assertEqual(option.token, "token")
         self.assertIsNone(option.challenge_name)
         self.assertIsNone(option.exp_multiplier)
-        enriched = ArenaOption(
+        named = ArenaOption(
             12,
             "token",
             challenge_name="Challenge",
+            exp_multiplier=None,
+        )
+        multiplied = ArenaOption(
+            12,
+            "token",
+            challenge_name=None,
             exp_multiplier=2.0,
         )
-        self.assertEqual(option, enriched)
-        self.assertEqual(hash(option), hash(enriched))
+        self.assertNotEqual(option, named)
+        self.assertNotEqual(option, multiplied)
+        self.assertNotEqual(named, multiplied)
+        self.assertEqual(len({option, named, multiplied}), 3)
         parameters = inspect.signature(ArenaOption).parameters
         self.assertIs(parameters["challenge_name"].kind, inspect.Parameter.KEYWORD_ONLY)
         self.assertIs(parameters["exp_multiplier"].kind, inspect.Parameter.KEYWORD_ONLY)
@@ -1544,7 +1562,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         client.page.evaluate = AsyncMock(return_value="form-unavailable")
 
         started = await launcher.start_arena(
-            ArenaOption(12),
+            ArenaOption(12, challenge_name=None, exp_multiplier=None),
             expected_realm=Realm.PERSISTENT,
         )
 
@@ -1622,7 +1640,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             started = await launcher.start_arena(
-                ArenaOption(12),
+                ArenaOption(12, challenge_name=None, exp_multiplier=None),
                 expected_realm=Realm.PERSISTENT,
             )
 
@@ -1670,7 +1688,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertRaisesRegex(TimeoutError, "before marker observation"),
         ):
             await launcher.start_arena(
-                ArenaOption(12),
+                ArenaOption(12, challenge_name=None, exp_multiplier=None),
                 expected_realm=Realm.PERSISTENT,
             )
 
@@ -1700,7 +1718,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "trusted battle marker"):
             await launcher.start_arena(
-                ArenaOption(12),
+                ArenaOption(12, challenge_name=None, exp_multiplier=None),
                 expected_realm=Realm.PERSISTENT,
             )
 
@@ -1771,7 +1789,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
                 with self.assertRaisesRegex(RuntimeError, "trusted battle marker"):
                     await launcher.start_arena(
-                        ArenaOption(12),
+                        ArenaOption(12, challenge_name=None, exp_multiplier=None),
                         expected_realm=Realm.PERSISTENT,
                     )
 
@@ -1801,7 +1819,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("hvbattle.battle_launcher.logger") as launcher_logger:
             started = await launcher.start_arena(
-                ArenaOption(12),
+                ArenaOption(12, challenge_name=None, exp_multiplier=None),
                 expected_realm=Realm.PERSISTENT,
             )
 
@@ -1825,7 +1843,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(TimeoutError, "new document missing"):
             await launcher.start_arena(
-                ArenaOption(12),
+                ArenaOption(12, challenge_name=None, exp_multiplier=None),
                 expected_realm=Realm.PERSISTENT,
             )
 
@@ -1843,7 +1861,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
         client.page.evaluate = AsyncMock(return_value="form-unavailable")
 
         started = await launcher.start_arena(
-            ArenaOption(12),
+            ArenaOption(12, challenge_name=None, exp_multiplier=None),
             expected_realm=Realm.ISEKAI,
         )
 
@@ -1874,7 +1892,7 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, "destroyed context"):
             await launcher.start_arena(
-                ArenaOption(12),
+                ArenaOption(12, challenge_name=None, exp_multiplier=None),
                 expected_realm=Realm.PERSISTENT,
             )
 
@@ -1899,7 +1917,13 @@ class BattleRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         options = await launcher.list_arena_options()
 
-        self.assertEqual(options, (ArenaOption(12), ArenaOption(56, "token")))
+        self.assertEqual(
+            options,
+            (
+                ArenaOption(12, challenge_name=None, exp_multiplier=None),
+                ArenaOption(56, "token", challenge_name=None, exp_multiplier=None),
+            ),
+        )
 
     async def test_arena_options_include_row_metadata_in_server_order(self) -> None:
         client = Mock()

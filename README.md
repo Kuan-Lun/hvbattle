@@ -128,7 +128,7 @@ metadata rather than a cryptographic server-side bundle manifest. A fixed
 advisory lock serializes pointer decisions across processes, preventing a
 slower updater from replacing a newer commit. With no committed pointer, the
 complete remote bundle is always fetched; uncommitted canonical cache files are
-not adopted.
+not adopted or deleted because they remain owned by `ponychart-classifier`.
 
 `refresh_ponychart_classifier()` first adopts an already committed generation
 from another process, then checks remote metadata and downloads only when

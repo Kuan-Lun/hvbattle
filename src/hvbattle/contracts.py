@@ -14,8 +14,8 @@ class ArenaOption:
 
     battle_id: int
     token: str | None = None
-    challenge_name: str | None = field(default=None, kw_only=True, compare=False)
-    exp_multiplier: float | None = field(default=None, kw_only=True, compare=False)
+    challenge_name: str | None = field(kw_only=True)
+    exp_multiplier: float | None = field(kw_only=True)
 
 
 @dataclass(frozen=True, slots=True)

@@ -322,7 +322,12 @@ class BattleLauncherHangProtectionTests(unittest.IsolatedAsyncioTestCase):
         ):
             await asyncio.wait_for(
                 launcher.start_arena(
-                    ArenaOption(battle_id=1, token=None),
+                    ArenaOption(
+                        battle_id=1,
+                        token=None,
+                        challenge_name=None,
+                        exp_multiplier=None,
+                    ),
                     expected_realm=Realm.PERSISTENT,
                 ),
                 timeout=1,

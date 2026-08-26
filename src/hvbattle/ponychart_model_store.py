@@ -484,7 +484,6 @@ class PonyChartGenerationStore:
         return self._bootstrap(deadline=deadline)
 
     def _bootstrap(self, *, deadline: float) -> LoadedPonyChartGeneration:
-        self._remove_legacy_canonical_files()
         remote_before = self._remote_metadata(deadline=deadline)
         self._require_refresh_budget(
             deadline,
@@ -501,16 +500,6 @@ class PonyChartGenerationStore:
             deadline=deadline,
         )
         return loaded
-
-    def _remove_legacy_canonical_files(self) -> None:
-        """Delete the pre-generation canonical pair left at the store root."""
-
-        for filename in (_MODEL_FILENAME, _THRESHOLDS_FILENAME):
-            for path in (
-                self._root / filename,
-                self._root / f"{filename}.etag",
-            ):
-                path.unlink(missing_ok=True)
 
     def refresh(
         self,

@@ -614,7 +614,11 @@ class PonyChartGenerationStoreTests(unittest.TestCase):
             self.assertLessEqual(kwargs["timeout"], 4.25)
         get_responses = [
             response
-            for (method, _, _), response in zip(remote.calls, remote.responses)
+            for (method, _, _), response in zip(
+                remote.calls,
+                remote.responses,
+                strict=False,
+            )
             if method == "GET"
         ]
         self.assertGreater(len(get_responses), 0)

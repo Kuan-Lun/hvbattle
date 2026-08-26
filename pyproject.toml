@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.32.0,<2"]
+requires = ["hatchling>=1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,9 +8,13 @@ version = "0.14.1"
 description = "Reusable battle-domain APIs for HentaiVerse."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
-license = "AGPL-3.0-or-later"
+license = "GPL-3.0-only"
 license-files = ["LICENSE"]
-requires-python = ">=3.14,!=3.14.1,<3.15"
+# The runtime suite passes on CPython 3.14.1, but standard pip resolution is
+# blocked while the direct ponychart-classifier dependency publishes the same
+# Requires-Python exclusion. Provenance:
+# https://github.com/Kuan-Lun/ponychart-classifier/commit/557f4180c6f79798210e37f5bd786a36837f9d81
+requires-python = ">=3.14,!=3.14.1"
 dependencies = [
     "hvbrowser>=0.9.7,<0.10",
     "hv-bie>=0.7.3,<0.8",
@@ -22,17 +26,18 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
-    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
     "Programming Language :: Python :: 3.14",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "black>=26.5.1",
-    "ruff>=0.16.4",
+    "build>=1.3.0",
+    "hatchling>=1.32.0",
     "mypy>=2.3.1",
-    "pymarkdownlnt>=0.9.39",
+    "packaging>=26.0",
     "pytest>=9.1.1",
+    "ruff>=0.16.4",
 ]
 
 [project.urls]
@@ -47,7 +52,32 @@ include = ["/LICENSE", "/README.md", "/pyproject.toml", "/src", "/tests"]
 
 [tool.ruff]
 line-length = 88
+target-version = "py314"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
-extend-ignore = ["E203", "E226", "E501"]
+select = ["B", "C4", "E", "F", "I", "PIE", "RUF", "SIM", "UP"]
+# Traditional Chinese prose legitimately uses full-width punctuation. SIM
+# rewrites are advisory and can obscure lifecycle/safety sequencing whose
+# lexical order is audited.
+ignore = ["RUF001", "RUF002", "RUF003", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Embedded JavaScript regular-expression literals must remain physically
+# contiguous; wrapping them would change the browser-side program.
+"src/hvbattle/battle_launcher.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.14"
+files = ["src/hvbattle"]
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["hv_bie.*", "ponychart_classifier.*", "zendriver.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.h2h.version]
+release-paths = ["LICENSE", "formal/**", "src/**"]

@@ -1494,7 +1494,8 @@ class ControlPanel(BaseControlPanel):
         state_acquired = self._state_lock.acquire(timeout=_remaining(expires_at))
         if not state_acquired:
             raise ControlPanelProcessOwnershipError(
-                "Battle control panel close deadline expired waiting for state ownership"
+                "Battle control panel close deadline expired "
+                "waiting for state ownership"
             )
         try:
             if _remaining(expires_at) <= 0:
@@ -1676,8 +1677,8 @@ def _validate_integer_configuration(
 def _validate_checklist_configuration(
     name: str,
     label: str,
-    choices: Iterable[tuple[str, str]],
-    selected: Iterable[str],
+    choices: object,
+    selected: object,
     status: str | None,
 ) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
     if not isinstance(name, str):

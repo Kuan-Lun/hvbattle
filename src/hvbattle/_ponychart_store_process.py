@@ -703,9 +703,11 @@ class PonyChartStoreProcessOwner:
                 )
             )
         )
-        returncode, cleanup_error, delayed_cancellation = (
-            await _settle_task_despite_cancellation(shutdown)
-        )
+        (
+            returncode,
+            cleanup_error,
+            delayed_cancellation,
+        ) = await _settle_task_despite_cancellation(shutdown)
         if cleanup_error is not None:
             raise PonyChartStoreProcessOwnershipError(
                 "PonyChart store process-tree cleanup failed"

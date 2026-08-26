@@ -69,7 +69,7 @@ class PublicApiTests(unittest.TestCase):
             [
                 sys.executable,
                 "-c",
-                "import sys, hvbattle; " "print('ponychart_classifier' in sys.modules)",
+                "import sys, hvbattle; print('ponychart_classifier' in sys.modules)",
             ],
             check=True,
             capture_output=True,
@@ -83,7 +83,10 @@ class PublicApiTests(unittest.TestCase):
             [
                 sys.executable,
                 "-c",
-                "import sys; sys.modules['tkinter'] = None; import hvbattle; print('ok')",
+                "import sys; "
+                "sys.modules['tkinter'] = None; "
+                "import hvbattle; "
+                "print('ok')",
             ],
             check=True,
             capture_output=True,

@@ -235,8 +235,7 @@ class BattleStateReadinessError(BattleInterruptedError):
         self.diagnostic_path = diagnostic_path
         self.diagnostic_error_type = diagnostic_error_type
         super().__init__(
-            "Battle state did not become ready before the bounded readiness "
-            "deadline",
+            "Battle state did not become ready before the bounded readiness deadline",
             diagnostic_code="battle.state-readiness-exhausted",
         )
 

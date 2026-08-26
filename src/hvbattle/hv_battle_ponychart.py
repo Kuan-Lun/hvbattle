@@ -585,7 +585,10 @@ _PONYCHART_PAGE_HELPERS_JS = r"""
         }
     };
 """
-_ARM_PONYCHART_RECEIPT_JS = "(() => {\n" + _PONYCHART_PAGE_HELPERS_JS + r"""
+_ARM_PONYCHART_RECEIPT_JS = (
+    "(() => {\n"
+    + _PONYCHART_PAGE_HELPERS_JS
+    + r"""
     const monitorId = __MONITOR_ID__;
     const previous = window[receiptKey];
     if (previous && typeof previous.detach === "function") previous.detach();
@@ -712,7 +715,11 @@ _ARM_PONYCHART_RECEIPT_JS = "(() => {\n" + _PONYCHART_PAGE_HELPERS_JS + r"""
     };
 })()
 """
-_READ_PONYCHART_RECEIPT_JS = "(() => {\n" + _PONYCHART_PAGE_HELPERS_JS + r"""
+)
+_READ_PONYCHART_RECEIPT_JS = (
+    "(() => {\n"
+    + _PONYCHART_PAGE_HELPERS_JS
+    + r"""
     const monitorId = __MONITOR_ID__;
     const present = Boolean(resolveSubmit().element);
     const battlePresent = Boolean(document.getElementById("battle_main"));
@@ -745,7 +752,11 @@ _READ_PONYCHART_RECEIPT_JS = "(() => {\n" + _PONYCHART_PAGE_HELPERS_JS + r"""
     };
 })()
 """
-_SELECT_AND_SUBMIT_PONYCHART_JS = "(() => {\n" + _PONYCHART_PAGE_HELPERS_JS + r"""
+)
+_SELECT_AND_SUBMIT_PONYCHART_JS = (
+    "(() => {\n"
+    + _PONYCHART_PAGE_HELPERS_JS
+    + r"""
     const monitorId = __MONITOR_ID__;
     const predictedLabels = __PREDICTED_LABELS__;
     const expectedLabels = __EXPECTED_LABELS__;
@@ -918,6 +929,7 @@ _SELECT_AND_SUBMIT_PONYCHART_JS = "(() => {\n" + _PONYCHART_PAGE_HELPERS_JS + r"
     }
 })()
 """
+)
 
 
 def _render_ponychart_page_script(
@@ -2444,19 +2456,26 @@ class PonyChart:
                 "PonyChart image did not finish loading before its deadline"
             )
             token = uuid4().hex
-            changed = asyncio.get_running_loop().create_future()
+            changed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
 
-            async def binding_called(event: cdp.runtime.BindingCalled) -> None:
+            async def binding_called(
+                event: cdp.runtime.BindingCalled,
+                expected_token: str = token,
+                change_event: asyncio.Future[None] = changed,
+            ) -> None:
                 if (
                     event.name == _PONYCHART_IMAGE_BINDING
-                    and event.payload == token
-                    and not changed.done()
+                    and event.payload == expected_token
+                    and not change_event.done()
                 ):
-                    changed.set_result(None)
+                    change_event.set_result(None)
 
-            async def lifecycle_changed(_event: object) -> None:
-                if not changed.done():
-                    changed.set_result(None)
+            async def lifecycle_changed(
+                _event: object,
+                change_event: asyncio.Future[None] = changed,
+            ) -> None:
+                if not change_event.done():
+                    change_event.set_result(None)
 
             page = self.page
             page.add_handler(cdp.runtime.BindingCalled, binding_called)
@@ -3111,8 +3130,7 @@ class PonyChart:
             )
         if last_error is not None:
             logger.debug(
-                "PonyChart pre-submit transition reconciliation failed "
-                "error_type=%s",
+                "PonyChart pre-submit transition reconciliation failed error_type=%s",
                 type(last_error).__name__,
             )
         return False

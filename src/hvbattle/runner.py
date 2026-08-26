@@ -6,6 +6,7 @@ import logging
 import math
 import time
 from collections.abc import Awaitable, Callable
+from typing import cast
 
 from hvbrowser.runtime import (
     ZendriverOperationTimeout,
@@ -32,7 +33,7 @@ from .contracts import (
     TurnDecision,
 )
 from .session import BattleSession
-from .strategy import BattleStrategy
+from .strategy import BattleLifecycle, BattleStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +340,10 @@ class BattleRunner:
         )
         if lifecycle_declared is not None:
             try:
-                on_battle_started = getattr(self.strategy, "on_battle_started")
+                on_battle_started = cast(
+                    BattleLifecycle,
+                    self.strategy,
+                ).on_battle_started
                 lifecycle_result = on_battle_started(self.session)
                 if not inspect.isawaitable(lifecycle_result):
                     raise TypeError("BattleLifecycle.on_battle_started() must be async")

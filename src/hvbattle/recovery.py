@@ -277,7 +277,8 @@ class BattleRecoveryCoordinator:
                         if isinstance(error, TimeoutError):
                             logger.error(
                                 "Reloaded active battle parse timed out; refusing "
-                                "another parse while the browser command may remain live"
+                                "another parse while the browser command "
+                                "may remain live"
                             )
                             logger.debug(
                                 "Reloaded active battle parse timeout error detail",

@@ -1716,7 +1716,8 @@ class PonyChartInferenceOwner:
                     spawning = self._spawning
                 if _remaining(expires_at) <= 0:
                     raise PonyChartWorkerOwnershipError(
-                        "PonyChart inference spawn snapshot completed after close deadline"
+                        "PonyChart inference spawn snapshot completed "
+                        "after close deadline"
                     )
                 if spawning == 0:
                     break
@@ -2396,9 +2397,7 @@ class PonyChartRetentionOwner:
                         time.monotonic() + drain_budget,
                     ),
                 )
-            if process.is_alive():
-                await _terminate_process_async(process, expires_at=expires_at)
-            elif isinstance(process, _SupervisedProcess):
+            if process.is_alive() or isinstance(process, _SupervisedProcess):
                 await _terminate_process_async(process, expires_at=expires_at)
             elif not _join_reaped(process):
                 raise PonyChartWorkerOwnershipError(
@@ -2542,9 +2541,7 @@ class PonyChartRetentionOwner:
                     )
             else:
                 process.join(drain_budget)
-            if process.is_alive():
-                _terminate_process_sync(process, expires_at=expires_at)
-            elif isinstance(process, _SupervisedProcess):
+            if process.is_alive() or isinstance(process, _SupervisedProcess):
                 _terminate_process_sync(process, expires_at=expires_at)
             elif not _join_reaped(process):
                 raise PonyChartWorkerOwnershipError(

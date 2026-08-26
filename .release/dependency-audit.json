@@ -1,0 +1,142 @@
+{
+  "checked_at": "2026-08-26T08:39:33+00:00",
+  "manifest_sha256": "ae3c52dd7496c8f6ddc37ca79e763b7dcfd1852617f593e18ac5d34253c8bf5d",
+  "node": [
+    {
+      "declared": ">=0.18.1",
+      "latest": "0.23.2",
+      "latest_satisfies": true,
+      "name": "markdownlint-cli2",
+      "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
+    }
+  ],
+  "project_version": "0.14.2",
+  "python": [
+    {
+      "declared": "hatchling>=1.32.0",
+      "group": "build",
+      "latest": "1.32.0",
+      "latest_satisfies": true,
+      "name": "hatchling",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/hatchling/",
+      "release_notes": "https://hatch.pypa.io/dev/history/hatchling/",
+      "url": "https://pypi.org/project/hatchling/"
+    },
+    {
+      "declared": "hvbrowser>=0.9.7,<0.10",
+      "group": "runtime",
+      "latest": "0.9.7",
+      "latest_satisfies": true,
+      "name": "hvbrowser",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/hvbrowser/",
+      "release_notes": null,
+      "url": "https://pypi.org/project/hvbrowser/"
+    },
+    {
+      "declared": "hv-bie>=0.7.3,<0.8",
+      "group": "runtime",
+      "latest": "0.7.3",
+      "latest_satisfies": true,
+      "name": "hv-bie",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/hv-bie/",
+      "release_notes": null,
+      "url": "https://pypi.org/project/hv-bie/"
+    },
+    {
+      "declared": "ponychart-classifier>=0.14.1,<0.15",
+      "group": "runtime",
+      "latest": "0.14.1",
+      "latest_satisfies": true,
+      "name": "ponychart-classifier",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/ponychart-classifier/",
+      "release_notes": null,
+      "url": "https://pypi.org/project/ponychart-classifier/"
+    },
+    {
+      "declared": "zendriver>=0.16.0,<0.17",
+      "group": "runtime",
+      "latest": "0.16.0",
+      "latest_satisfies": true,
+      "name": "zendriver",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/zendriver/",
+      "release_notes": null,
+      "url": "https://pypi.org/project/zendriver/"
+    },
+    {
+      "declared": "build>=1.3.0",
+      "group": "optional:dev",
+      "latest": "1.5.0",
+      "latest_satisfies": true,
+      "name": "build",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/build/",
+      "release_notes": "https://build.pypa.io/en/stable/changelog.html",
+      "url": "https://pypi.org/project/build/"
+    },
+    {
+      "declared": "hatchling>=1.32.0",
+      "group": "optional:dev",
+      "latest": "1.32.0",
+      "latest_satisfies": true,
+      "name": "hatchling",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/hatchling/",
+      "release_notes": "https://hatch.pypa.io/dev/history/hatchling/",
+      "url": "https://pypi.org/project/hatchling/"
+    },
+    {
+      "declared": "mypy>=2.3.1",
+      "group": "optional:dev",
+      "latest": "2.3.1",
+      "latest_satisfies": true,
+      "name": "mypy",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/mypy/",
+      "release_notes": "https://github.com/python/mypy/blob/master/CHANGELOG.md",
+      "url": "https://pypi.org/project/mypy/"
+    },
+    {
+      "declared": "packaging>=26.0",
+      "group": "optional:dev",
+      "latest": "26.3",
+      "latest_satisfies": true,
+      "name": "packaging",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/packaging/",
+      "release_notes": null,
+      "url": "https://pypi.org/project/packaging/"
+    },
+    {
+      "declared": "pytest>=9.1.1",
+      "group": "optional:dev",
+      "latest": "9.1.1",
+      "latest_satisfies": true,
+      "name": "pytest",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/pytest/",
+      "release_notes": "https://docs.pytest.org/en/stable/changelog.html",
+      "url": "https://pypi.org/project/pytest/"
+    },
+    {
+      "declared": "ruff>=0.16.4",
+      "group": "optional:dev",
+      "latest": "0.16.4",
+      "latest_satisfies": true,
+      "name": "ruff",
+      "python_3_14": true,
+      "registry_url": "https://pypi.org/project/ruff/",
+      "release_notes": "https://github.com/astral-sh/ruff/blob/main/CHANGELOG.md",
+      "url": "https://pypi.org/project/ruff/"
+    }
+  ],
+  "review": {
+    "note": "Reviewed every build, runtime, dev, and Node direct dependency against global registry latest and available release notes; no latest release is outside a declared upper bound and all latest distributions declare CPython 3.14 support. The 3.14.1 exclusion is retained solely to match ponychart-classifier metadata provenance, while the clean 3.14.7 full gate passed 636 tests, Lean, and wheel smoke.",
+    "status": "reviewed"
+  },
+  "schema": "h2h.dependency-audit.v1"
+}

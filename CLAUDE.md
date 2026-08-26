@@ -1,7 +1,4 @@
 # CLAUDE.md
 
-## Git Workflow
-
-- Do not create or switch to a development branch.
-- Perform all development work directly on the repository's primary branch
-  (`main`).
+開始任何工作前，必須完整閱讀並遵守 [AGENTS.md](AGENTS.md)。
+本檔不得複製或覆寫另一套repository政策。

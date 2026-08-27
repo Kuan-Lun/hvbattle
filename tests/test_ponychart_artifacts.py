@@ -239,8 +239,11 @@ class _ImageEventPage:
             name=ponychart_module._PONYCHART_IMAGE_BINDING,
             payload=self.token,
         )
-        for handler in tuple(self.handlers[cdp.runtime.BindingCalled]):
-            await handler(event)
+        await self.emit(cdp.runtime.BindingCalled, event)
+
+    async def emit(self, event_type: type[Any], event: object) -> None:
+        for handler in tuple(self.handlers[event_type]):
+            await handler(event, self)
 
 
 class _NetworkCapturePage:
@@ -1029,6 +1032,50 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(receipt.source, "challenge")
         self.assertEqual(driver.page.snapshot_calls, 2)
+        self.assertTrue(all(not handlers for handlers in driver.page.handlers.values()))
+
+    async def test_lifecycle_events_wake_placeholder_wait_with_connection(
+        self,
+    ) -> None:
+        for event_type in (cdp.page.FrameNavigated, cdp.page.LoadEventFired):
+            with self.subTest(event_type=event_type.__name__):
+                driver = Mock(headless=True)
+                page = _ImageEventPage(
+                    {
+                        "ready": False,
+                        "source": "placeholder",
+                        "width": 1,
+                        "height": 1,
+                        "renderedWidth": 1,
+                        "renderedHeight": 1,
+                    }
+                )
+                driver.page = page
+                challenge = PonyChart(driver)
+                waiter = asyncio.create_task(
+                    challenge._wait_for_image_loaded(
+                        deadline=SemanticDeadline.after(1.0),
+                    )
+                )
+                await asyncio.wait_for(page.observer_armed.wait(), timeout=1.0)
+                self.assertFalse(waiter.done())
+
+                page.state = {
+                    "ready": True,
+                    "source": "challenge",
+                    "width": 640,
+                    "height": 480,
+                    "renderedWidth": 640,
+                    "renderedHeight": 480,
+                }
+                await page.emit(event_type, SimpleNamespace())
+                receipt = await waiter
+
+                self.assertEqual(receipt.source, "challenge")
+                self.assertEqual(page.snapshot_calls, 2)
+                self.assertTrue(
+                    all(not handlers for handlers in page.handlers.values())
+                )
 
     async def test_one_pixel_is_never_sent_to_classifier_before_valid_load(
         self,

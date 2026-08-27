@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-08-26T08:39:33+00:00",
+  "checked_at": "2026-08-27T10:41:11+00:00",
   "manifest_sha256": "ae3c52dd7496c8f6ddc37ca79e763b7dcfd1852617f593e18ac5d34253c8bf5d",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.14.2",
+  "project_version": "0.14.3",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -26,7 +26,7 @@
     {
       "declared": "hvbrowser>=0.9.7,<0.10",
       "group": "runtime",
-      "latest": "0.9.7",
+      "latest": "0.9.8",
       "latest_satisfies": true,
       "name": "hvbrowser",
       "python_3_14": true,
@@ -135,7 +135,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every build, runtime, dev, and Node direct dependency against global registry latest and available release notes; no latest release is outside a declared upper bound and all latest distributions declare CPython 3.14 support. The 3.14.1 exclusion is retained solely to match ponychart-classifier metadata provenance, while the clean 3.14.7 full gate passed 636 tests, Lean, and wheel smoke.",
+    "note": "Reviewed current registry candidates and compatibility for the PonyChart callback fix; no direct dependency changes are required.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

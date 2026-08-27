@@ -2460,6 +2460,8 @@ class PonyChart:
 
             async def binding_called(
                 event: cdp.runtime.BindingCalled,
+                _connection: object,
+                *,
                 expected_token: str = token,
                 change_event: asyncio.Future[None] = changed,
             ) -> None:
@@ -2472,6 +2474,8 @@ class PonyChart:
 
             async def lifecycle_changed(
                 _event: object,
+                _connection: object,
+                *,
                 change_event: asyncio.Future[None] = changed,
             ) -> None:
                 if not change_event.done():

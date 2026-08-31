@@ -15,6 +15,15 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _MERGE_SCRIPT = _PROJECT_ROOT / "scripts" / "git-flow-merge.sh"
 _PRIMARY_SCRIPT = _PROJECT_ROOT / "scripts" / "detect-primary-branch.sh"
 _TASK_BRANCH = "task/example"
+_GIT_LOCAL_ENVIRONMENT_VARIABLES = frozenset(
+    subprocess.run(
+        ("git", "rev-parse", "--local-env-vars"),
+        cwd=_PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+)
 
 
 def _run(
@@ -26,6 +35,8 @@ def _run(
     process_env = os.environ.copy()
     if env is not None:
         process_env.update(env)
+    for variable in _GIT_LOCAL_ENVIRONMENT_VARIABLES:
+        process_env.pop(variable, None)
     return subprocess.run(
         command,
         cwd=cwd,
@@ -172,6 +183,36 @@ def test_ancestor_noop_removes_linked_task_worktree(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert not task_worktree.exists()
     assert _git_stdout(repository, "rev-parse", "main") == primary_oid
+    _assert_branch_missing(repository, _TASK_BRANCH)
+    assert not gate_log.exists()
+
+
+def test_git_subprocesses_discard_hook_local_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leaked_path = str(tmp_path / "outer-repository-state")
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "outer-index"))
+    for variable in _GIT_LOCAL_ENVIRONMENT_VARIABLES - {"GIT_INDEX_FILE"}:
+        monkeypatch.setenv(variable, leaked_path)
+
+    repository, initial_oid, gate_log = _initialize_repository(tmp_path)
+    task_worktree = tmp_path / "task-worktree"
+    _git(
+        repository,
+        "worktree",
+        "add",
+        "-b",
+        _TASK_BRANCH,
+        str(task_worktree),
+        "main",
+    )
+
+    result = _run_merge_script(task_worktree, gate_log)
+
+    assert result.returncode == 0, result.stderr
+    assert not task_worktree.exists()
+    assert _git_stdout(repository, "rev-parse", "main") == initial_oid
     _assert_branch_missing(repository, _TASK_BRANCH)
     assert not gate_log.exists()
 

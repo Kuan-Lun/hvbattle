@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-08-27T10:41:11+00:00",
-  "manifest_sha256": "ae3c52dd7496c8f6ddc37ca79e763b7dcfd1852617f593e18ac5d34253c8bf5d",
+  "checked_at": "2026-08-31T21:02:15+00:00",
+  "manifest_sha256": "17eb016d440a79638860628eb008ea339d94c841efabb67a4fffabee38e8512c",
   "node": [
     {
       "declared": ">=0.18.1",
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.14.3",
+  "project_version": "0.15.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -24,10 +24,10 @@
       "url": "https://pypi.org/project/hatchling/"
     },
     {
-      "declared": "hvbrowser>=0.9.7,<0.10",
+      "declared": "hvbrowser>=0.10.0,<0.11",
       "group": "runtime",
       "latest": "0.9.8",
-      "latest_satisfies": true,
+      "latest_satisfies": false,
       "name": "hvbrowser",
       "python_3_14": true,
       "registry_url": "https://pypi.org/project/hvbrowser/",
@@ -70,7 +70,7 @@
     {
       "declared": "build>=1.3.0",
       "group": "optional:dev",
-      "latest": "1.5.0",
+      "latest": "1.6.0",
       "latest_satisfies": true,
       "name": "build",
       "python_3_14": true,
@@ -125,7 +125,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.4",
+      "latest": "0.16.5",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -135,7 +135,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed current registry candidates and compatibility for the PonyChart callback fix; no direct dependency changes are required.",
+    "note": "Reviewed all build, runtime, dev, and Node direct dependencies against registry metadata. The new hvbrowser 0.10.0 compatibility line is a coordinated locally merged candidate pending registry publication; it passed its full offline gate (218 tests plus sdist/wheel smoke) against hbrowser 0.44.0. hvbattle session-composition tests passed with that local cohort and Zendriver 0.16.0; all other current direct dependency releases were reviewed against their declared constraints.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

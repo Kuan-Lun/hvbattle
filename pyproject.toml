@@ -16,7 +16,7 @@ license-files = ["LICENSE"]
 # https://github.com/Kuan-Lun/ponychart-classifier/commit/557f4180c6f79798210e37f5bd786a36837f9d81
 requires-python = ">=3.14,!=3.14.1"
 dependencies = [
-    "hvbrowser>=0.9.7,<0.10",
+    "hvbrowser>=0.10.0,<0.11",
     "hv-bie>=0.7.3,<0.8",
     "ponychart-classifier>=0.14.1,<0.15",
     "zendriver>=0.16.0,<0.17",

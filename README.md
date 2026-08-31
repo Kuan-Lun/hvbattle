@@ -228,7 +228,7 @@ ordinary log. The exact listing query remains mandatory when no blocker exists.
 `ABSENT` is accepted only after the deadline observer reaches the validated
 realm-scoped route with its Arena DOM and no blocker.
 
-This atomic observation contract is the `hvbattle` 0.14 / `hvbrowser` 0.9
+This atomic observation contract is the `hvbattle` 0.15 / `hvbrowser` 0.10
 package line; the dependency range intentionally rejects older or newer minor
 lines with different navigation contracts.
 

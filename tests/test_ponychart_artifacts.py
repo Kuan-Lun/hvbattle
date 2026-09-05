@@ -21,6 +21,7 @@ from zendriver import cdp
 import hvbattle.hv_battle_ponychart as ponychart_module
 from hvbattle import (
     ActionIntentRecordedAuditEvent,
+    ActionNotSubmittedAuditEvent,
     ActionSubmittedAuditEvent,
     AuditEvent,
     BattleActionKind,
@@ -85,7 +86,7 @@ def _image_receipt(
 def _receipt_context(
     *,
     deadline: SemanticDeadline | None = None,
-    expiration_deadline: SemanticDeadline | None = None,
+    reconciliation_deadline: SemanticDeadline | None = None,
 ) -> object:
     active_deadline = deadline or SemanticDeadline.after(15.0)
     return ponychart_module._PonyChartReceiptContext(
@@ -93,7 +94,7 @@ def _receipt_context(
         "https://hentaiverse.org/battle",
         "https://hentaiverse.org",
         active_deadline,
-        expiration_deadline or active_deadline,
+        reconciliation_deadline or active_deadline,
     )
 
 
@@ -137,17 +138,8 @@ def _page_diagnostic(**overrides: object) -> dict[str, object]:
                 strict=True,
             )
         ],
-        "countdownSeconds": 20,
-        "countdownSource": "riddlecounter-class-sprite",
-        "countdownCandidateCount": 1,
         "storageAvailable": True,
         "initialSubmitDisabled": True,
-        "initialCountdownSeconds": 30,
-        "initialCountdownSource": "riddlecounter-class-sprite",
-        "initialCountdownCandidateCount": 1,
-        "countdownAtSubmitSeconds": 22,
-        "countdownAtSubmitSource": "riddlecounter-class-sprite",
-        "countdownAtSubmitCandidateCount": 1,
         "elapsedMs": 100,
         "submitEnabledElapsedMs": 40,
         "selectionElapsedMs": 50,
@@ -201,6 +193,25 @@ def _submit_acknowledgement(
     if selected_count is not None:
         acknowledgement["selectedCount"] = selected_count
     return acknowledgement
+
+
+def _pre_submit_acknowledgement(
+    status: str,
+    **diagnostic_overrides: object,
+) -> dict[str, object]:
+    diagnostic: dict[str, object] = {
+        "submitCommandElapsedMs": None,
+        "clickEventElapsedMs": None,
+        "formSubmitEventElapsedMs": None,
+        "transitionElapsedMs": None,
+        "submitInvocationCount": 0,
+        "commandClickEventCount": 0,
+        "commandFormSubmitEventCount": 0,
+        "commandSubmitterMatchCount": 0,
+        "commandFormSubmitPreventedCount": 0,
+    }
+    diagnostic.update(diagnostic_overrides)
+    return _submit_acknowledgement(status, diagnostic_overrides=diagnostic)
 
 
 class _ImageEventPage:
@@ -550,38 +561,6 @@ class FakeEventTarget {
     }
 }
 
-const spriteCounter = (seconds) => ({
-    id: "riddlecounter",
-    className: "",
-    textContent: "",
-    value: "",
-    children: [{
-        className: "fc f4b",
-        children: String(seconds).split("").map((digit) => ({
-            className: `c4${digit}`,
-        })),
-    }],
-    getAttribute: () => null,
-});
-const inlineSpriteCounter = (seconds) => ({
-    id: "riddlecounter",
-    className: "",
-    textContent: "",
-    value: "",
-    children: [{
-        className: "",
-        children: String(seconds).split("").reverse().map((digit) => ({
-            className: "",
-            style: {
-                background: `transparent url(font.png) 0px -${12 * Number(digit)}px`,
-                backgroundPosition: `0px -${12 * Number(digit)}px`,
-                backgroundPositionY: `-${12 * Number(digit)}px`,
-            },
-        })),
-    }],
-    getAttribute: () => null,
-});
-
 class FakeDocument extends FakeEventTarget {
     constructor({challenge = true, battle = false, autoEnable = true} = {}) {
         super();
@@ -589,7 +568,8 @@ class FakeDocument extends FakeEventTarget {
         this.documentElement = {};
         this.challenge = challenge;
         this.battle = battle;
-        this.counter = spriteCounter(30);
+        this.counter = null;
+        this.timerQueries = 0;
         this.timerCandidates = [];
         this.form = {};
         this.autoEnable = autoEnable;
@@ -686,12 +666,12 @@ class FakeDocument extends FakeEventTarget {
             && selected.has("Twilight Sparkle")
         );
     }
-    setCounterSeconds(seconds) {
-        this.counter = spriteCounter(seconds);
-    }
     getElementById(id) {
         if (id === "riddlesubmit") return this.challenge ? this.submit : null;
-        if (id === "riddlecounter") return this.challenge ? this.counter : null;
+        if (id === "riddlecounter") {
+            this.timerQueries += 1;
+            throw new Error("PonyChart must not inspect the countdown");
+        }
         if (id === "riddlemaster") return this.challenge ? this.master : null;
         if (id === "riddler1") return this.challenge ? this.options : null;
         if (id === "battle_main") return this.battle ? {} : null;
@@ -702,7 +682,8 @@ class FakeDocument extends FakeEventTarget {
             return this.challenge ? [...this.labels, this.externalLabel] : [];
         }
         if (selector.includes('[id*="countdown"]')) {
-            return this.challenge ? this.timerCandidates : [];
+            this.timerQueries += 1;
+            throw new Error("PonyChart must not search for countdowns");
         }
         if (selector.includes('input[type="submit"]')) {
             return this.challenge ? [this.submit] : [];
@@ -757,7 +738,6 @@ const clicksWhileDisabled = document.submitClicks;
 const labelClicksBeforeRetry = document.labelClicks;
 clock += 4000;
 document.submit.disabled = false;
-document.setCounterSeconds(26);
 triggerMutations();
 const submitted = eval(expressions.submit);
 const labelClicksAfterRetry = document.labelClicks;
@@ -785,23 +765,15 @@ const fastSubmitted = eval(expressions.submit);
 const fastClickCount = document.submitClicks;
 clock += 20;
 transitionToBattleDocument();
-clock += 5980;
+clock += 250;
 const navigationReceipt = eval(expressions.read);
 
 freshChallenge();
-const delayedExecutionArmed = eval(expressions.arm);
-clock += 29500;
-document.setCounterSeconds(1);
-const delayedExecutionSubmit = eval(expressions.submit);
-const delayedExecutionClicks = document.submitClicks;
-
-freshChallenge();
-const staleTimerArmed = eval(expressions.arm);
-clock += 28000;
-const staleTimerSubmitted = eval(expressions.submit);
-clock += 2000;
+eval(expressions.arm);
+const lateTransitionSubmitted = eval(expressions.submit);
+clock += 5001;
 transitionToBattleDocument();
-const staleTimerReceipt = eval(expressions.read);
+const lateTransitionReceipt = eval(expressions.read);
 
 freshChallenge();
 const naturalArmed = eval(expressions.arm);
@@ -809,44 +781,35 @@ clock += 30000;
 transitionToBattleDocument();
 const naturalReceipt = eval(expressions.read);
 
+const unreadableCounterCases = [];
+for (const counter of [null, {textContent: ""}, {textContent: "0"}, {
+    textContent: "not-a-time",
+    children: [{children: [{className: "c4x"}]}],
+}]) {
+    freshChallenge();
+    document.counter = counter;
+    const armed = eval(expressions.arm);
+    clock += 784;
+    const submitted = eval(expressions.submit);
+    const repeated = eval(expressions.submit);
+    const labelClicks = document.labelClicks;
+    const submitClicks = document.submitClicks;
+    const timerQueries = document.timerQueries;
+    clock += 250;
+    transitionToBattleDocument();
+    const receipt = eval(expressions.read);
+    unreadableCounterCases.push({
+        armed, submitted, repeated, labelClicks, submitClicks, timerQueries, receipt,
+    });
+}
 freshChallenge();
-document.counter.textContent = "Time Left: 27";
-document.counter.children = [];
-const embeddedCounter = eval(expressions.arm);
-freshChallenge();
-document.counter = inlineSpriteCounter(27);
-const inlineSpriteCounterReceipt = eval(expressions.arm);
-freshChallenge();
-document.counter.textContent = "20 / 30";
-document.counter.children = [];
-const ambiguousCounter = eval(expressions.arm);
-freshChallenge();
-document.counter.textContent = "not-a-time";
-document.counter.children = [];
-const malformedCounter = eval(expressions.arm);
-freshChallenge();
-document.counter = null;
-document.timerCandidates = [{
-    id: "status",
-    className: "countdown-primary",
-    textContent: "17",
-    value: "",
-    getAttribute: () => null,
-}];
-const fallbackCounter = eval(expressions.arm);
-freshChallenge();
-document.counter.textContent = "";
-document.counter.children = [{
-    className: "fc f4b",
-    children: [{className: "c42"}, {className: "c4x"}],
-}];
-const malformedSpriteCounter = eval(expressions.arm);
-const malformedSpriteSubmit = eval(expressions.submit);
-const malformedSpriteClicks = document.submitClicks;
-freshChallenge();
-document.counter = inlineSpriteCounter(27);
-document.counter.children[0].children[0].style.backgroundPositionY = "-13px";
-const malformedInlineSpriteCounter = eval(expressions.arm);
+eval(expressions.arm);
+eval(expressions.submit);
+clock += 100;
+transitionToBattleDocument();
+clock += 4901;
+const delayedReadyReceipt = eval(expressions.read);
+
 freshChallenge();
 document.labels[0].control.form = {};
 const foreignFormArmed = eval(expressions.arm);
@@ -869,23 +832,12 @@ process.stdout.write(JSON.stringify({
     fastSubmitted,
     fastClickCount,
     navigationReceipt,
-    delayedExecutionArmed,
-    delayedExecutionSubmit,
-    delayedExecutionClicks,
-    staleTimerArmed,
-    staleTimerSubmitted,
-    staleTimerReceipt,
+    lateTransitionSubmitted,
+    lateTransitionReceipt,
     naturalArmed,
     naturalReceipt,
-    embeddedCounter,
-    inlineSpriteCounterReceipt,
-    ambiguousCounter,
-    malformedCounter,
-    fallbackCounter,
-    malformedSpriteCounter,
-    malformedSpriteSubmit,
-    malformedSpriteClicks,
-    malformedInlineSpriteCounter,
+    unreadableCounterCases,
+    delayedReadyReceipt,
     foreignFormArmed,
     foreignFormSubmit,
 }));
@@ -1519,18 +1471,18 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(detected, PonyChartResolutionOutcome.SUBMISSION_CONFIRMED)
         self.assertEqual(events, ["arm", "capture"])
 
-    async def test_countdown_deadline_shrinks_across_all_mutation_phases(
+    async def test_preparation_deadline_shrinks_across_all_mutation_phases(
         self,
     ) -> None:
         now = 0.0
         deadline = SemanticDeadline(expires_at=10.0, _clock=lambda: now)
-        expiration_deadline = SemanticDeadline(
+        reconciliation_deadline = SemanticDeadline(
             expires_at=12.0,
             _clock=lambda: now,
         )
         context = _receipt_context(
             deadline=deadline,
-            expiration_deadline=expiration_deadline,
+            reconciliation_deadline=reconciliation_deadline,
         )
         driver = Mock(headless=True)
         challenge = PonyChart(driver)
@@ -1579,7 +1531,12 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
         challenge._select_and_submit_answer = AsyncMock(side_effect=submit)
         challenge._wait_for_challenge_receipt = AsyncMock(side_effect=receipt)
 
-        outcome = await challenge.check()
+        with patch.object(
+            ponychart_module.asyncio,
+            "get_running_loop",
+            return_value=SimpleNamespace(time=lambda: now),
+        ):
+            outcome = await challenge.check()
 
         self.assertIs(outcome, PonyChartResolutionOutcome.SUBMISSION_CONFIRMED)
         self.assertEqual(
@@ -1592,7 +1549,56 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
                 for _, _, observed_deadline in observed[:3]
             )
         )
-        self.assertIs(observed[-1][2], expiration_deadline)
+        self.assertIsNot(observed[-1][2], reconciliation_deadline)
+
+    async def test_late_submit_ack_receives_its_own_receipt_budget(self) -> None:
+        now = 14.0
+        context = _receipt_context(
+            deadline=SemanticDeadline(expires_at=15.0, _clock=lambda: now),
+            reconciliation_deadline=SemanticDeadline(
+                expires_at=20.0, _clock=lambda: now
+            ),
+        )
+        challenge = PonyChart(Mock(headless=True))
+        challenge._check = AsyncMock(return_value=True)
+        challenge._arm_challenge_receipt_monitor = AsyncMock(return_value=context)
+        challenge._capture_pony_chart_image = AsyncMock(return_value=b"challenge")
+        challenge._predict_labels = AsyncMock(return_value=("Applejack",))
+
+        async def acknowledge_late(
+            _labels: tuple[str, ...],
+            *,
+            monitor_id: str,
+            deadline: SemanticDeadline,
+            audit_trail: object,
+        ) -> bool:
+            nonlocal now
+            del monitor_id, audit_trail
+            self.assertEqual(deadline.remaining(), 1.0)
+            now = 17.0
+            return True
+
+        async def read_receipt(
+            _context: object,
+            *,
+            deadline: SemanticDeadline,
+        ) -> None:
+            self.assertEqual(deadline.remaining(), 5.0)
+            self.assertEqual(deadline.expires_at, 22.0)
+
+        challenge._select_and_submit_answer = AsyncMock(side_effect=acknowledge_late)
+        challenge._wait_for_challenge_receipt = AsyncMock(side_effect=read_receipt)
+
+        with patch.object(
+            ponychart_module.asyncio,
+            "get_running_loop",
+            return_value=SimpleNamespace(time=lambda: now),
+        ):
+            outcome = await challenge.check()
+
+        self.assertIs(outcome, PonyChartResolutionOutcome.SUBMISSION_CONFIRMED)
+        challenge._select_and_submit_answer.assert_awaited_once()
+        challenge._wait_for_challenge_receipt.assert_awaited_once()
 
     async def test_configured_directory_retains_successful_classifier_input(
         self,
@@ -2007,7 +2013,7 @@ class PonyChartArtifactTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
-    async def test_arm_derives_action_and_expiry_deadlines_from_counter(self) -> None:
+    async def test_arm_uses_fixed_preparation_and_reconciliation_budgets(self) -> None:
         driver = Mock()
         driver.page = Mock()
         driver.page.evaluate = AsyncMock(
@@ -2016,9 +2022,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
                 "present": True,
                 "documentUrl": "https://hentaiverse.org/battle",
                 "origin": "https://hentaiverse.org",
-                "diagnostic": _page_diagnostic(
-                    initialCountdownSeconds=20,
-                ),
+                "diagnostic": _page_diagnostic(),
             }
         )
         challenge = PonyChart(driver)
@@ -2027,10 +2031,10 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(context)
         assert context is not None
-        self.assertAlmostEqual(context.deadline.remaining(), 19.0, delta=0.1)
+        self.assertAlmostEqual(context.deadline.remaining(), 15.0, delta=0.1)
         self.assertAlmostEqual(
-            context.expiration_classification_deadline.remaining(),
-            21.0,
+            context.reconciliation_deadline.remaining(),
+            20.0,
             delta=0.1,
         )
 
@@ -2047,7 +2051,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
             "present": True,
             "documentUrl": "https://hentaiverse.org/battle",
             "origin": "https://hentaiverse.org",
-            "diagnostic": _page_diagnostic(initialCountdownSeconds=20),
+            "diagnostic": _page_diagnostic(),
         }
 
         async def return_after_dispatch(
@@ -2078,10 +2082,10 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(context)
         assert context is not None
-        self.assertAlmostEqual(context.deadline.remaining(), 16.0)
+        self.assertAlmostEqual(context.deadline.remaining(), 12.0)
         self.assertAlmostEqual(
-            context.expiration_classification_deadline.remaining(),
-            21.0,
+            context.reconciliation_deadline.remaining(),
+            20.0,
         )
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for JS test")
@@ -2123,11 +2127,6 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["autoEnableClicks"], 1)
         self.assertEqual(result["armed"]["status"], "armed")
         self.assertTrue(result["armed"]["diagnostic"]["initialSubmitDisabled"])
-        self.assertEqual(result["armed"]["diagnostic"]["initialCountdownSeconds"], 30)
-        self.assertEqual(
-            result["armed"]["diagnostic"]["initialCountdownSource"],
-            "riddlecounter-class-sprite",
-        )
         self.assertEqual(result["armed"]["diagnostic"]["labelScope"], "riddler1")
         self.assertEqual(result["armed"]["diagnostic"]["labelCount"], 6)
         self.assertEqual(result["armed"]["diagnostic"]["globalLabelCount"], 7)
@@ -2156,11 +2155,6 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted_diagnostic["commandClickEventCount"], 1)
         self.assertEqual(submitted_diagnostic["commandFormSubmitEventCount"], 1)
         self.assertEqual(submitted_diagnostic["commandSubmitterMatchCount"], 1)
-        self.assertEqual(submitted_diagnostic["countdownAtSubmitSeconds"], 26)
-        self.assertEqual(
-            submitted_diagnostic["countdownAtSubmitSource"],
-            "riddlecounter-class-sprite",
-        )
         self.assertEqual(
             result["sameDocumentReceipt"]["diagnostic"]["transitionElapsedMs"],
             4050,
@@ -2179,38 +2173,6 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
             navigation["diagnostic"]["formSubmitEventElapsedMs"] + 20,
         )
 
-        delayed = result["delayedExecutionSubmit"]
-        self.assertEqual(delayed["status"], "challenge-expiring")
-        self.assertEqual(result["delayedExecutionClicks"], 0)
-        self.assertEqual(delayed["diagnostic"]["submitInvocationCount"], 0)
-        self.assertEqual(delayed["diagnostic"]["commandClickEventCount"], 0)
-        self.assertEqual(delayed["diagnostic"]["countdownAtSubmitSeconds"], 0.5)
-        self.assertEqual(
-            delayed["diagnostic"]["countdownAtSubmitSource"],
-            "armed-elapsed",
-        )
-
-        stale_timer = result["staleTimerSubmitted"]
-        self.assertEqual(stale_timer["status"], "submitted")
-        self.assertEqual(stale_timer["diagnostic"]["countdownAtSubmitSeconds"], 2)
-        self.assertEqual(
-            stale_timer["diagnostic"]["countdownAtSubmitSource"],
-            "armed-elapsed",
-        )
-        driver = Mock()
-        driver.page = Mock()
-        driver.page.evaluate = AsyncMock(return_value=result["staleTimerReceipt"])
-        challenge = PonyChart(driver)
-        with self.assertRaises(BattleInterruptedError) as raised:
-            await challenge._read_challenge_receipt(
-                _receipt_context(),
-                deadline=SemanticDeadline.after(1.0),
-            )
-        self.assertEqual(
-            raised.exception.diagnostic_code,
-            "battle.ponychart.receipt-timing-inconclusive",
-        )
-
         natural = result["naturalReceipt"]
         self.assertFalse(natural["monitorFound"])
         self.assertTrue(natural["storageFound"])
@@ -2218,55 +2180,38 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(natural["diagnostic"]["commandClickEventCount"], 0)
         self.assertEqual(natural["diagnostic"]["commandFormSubmitEventCount"], 0)
 
-        self.assertEqual(
-            result["embeddedCounter"]["diagnostic"]["initialCountdownSeconds"],
-            27,
-        )
-        self.assertEqual(
-            result["embeddedCounter"]["diagnostic"]["initialCountdownSource"],
-            "riddlecounter",
-        )
-        self.assertEqual(
-            result["inlineSpriteCounterReceipt"]["diagnostic"][
-                "initialCountdownSeconds"
-            ],
-            27,
-        )
-        self.assertEqual(
-            result["inlineSpriteCounterReceipt"]["diagnostic"][
-                "initialCountdownSource"
-            ],
-            "riddlecounter-inline-sprite",
-        )
-        for key in ("ambiguousCounter", "malformedCounter"):
-            with self.subTest(counter=key):
-                diagnostic = result[key]["diagnostic"]
-                self.assertIsNone(diagnostic["initialCountdownSeconds"])
-                self.assertEqual(diagnostic["initialCountdownSource"], "none")
-                self.assertEqual(diagnostic["initialCountdownCandidateCount"], 1)
-        self.assertEqual(
-            result["fallbackCounter"]["diagnostic"]["initialCountdownSeconds"],
-            17,
-        )
-        self.assertEqual(
-            result["fallbackCounter"]["diagnostic"]["initialCountdownSource"],
-            "id:status",
-        )
-        malformed_sprite = result["malformedSpriteCounter"]["diagnostic"]
-        self.assertIsNone(malformed_sprite["initialCountdownSeconds"])
-        self.assertEqual(malformed_sprite["initialCountdownSource"], "none")
-        self.assertEqual(
-            result["malformedSpriteSubmit"]["status"],
-            "countdown-unverified",
-        )
-        self.assertEqual(result["malformedSpriteClicks"], 0)
-        self.assertEqual(
-            result["malformedSpriteSubmit"]["diagnostic"]["submitInvocationCount"],
-            0,
-        )
-        malformed_inline = result["malformedInlineSpriteCounter"]["diagnostic"]
-        self.assertIsNone(malformed_inline["initialCountdownSeconds"])
-        self.assertEqual(malformed_inline["initialCountdownSource"], "none")
+        for index, unreadable in enumerate(result["unreadableCounterCases"]):
+            with self.subTest(counter=index):
+                self.assertEqual(unreadable["armed"]["status"], "armed")
+                self.assertEqual(unreadable["submitted"]["status"], "submitted")
+                self.assertEqual(unreadable["repeated"]["status"], "already-submitted")
+                self.assertEqual(unreadable["labelClicks"], 2)
+                self.assertEqual(unreadable["submitClicks"], 1)
+                self.assertEqual(unreadable["timerQueries"], 0)
+                page = Mock()
+                page.evaluate = AsyncMock(return_value=unreadable["receipt"])
+                challenge = PonyChart(Mock(page=page))
+                self.assertTrue(
+                    await challenge._read_challenge_receipt(
+                        _receipt_context(), deadline=SemanticDeadline.after(1.0)
+                    )
+                )
+
+        self.assertEqual(result["lateTransitionSubmitted"]["status"], "submitted")
+        for receipt in ("lateTransitionReceipt", "delayedReadyReceipt"):
+            with self.subTest(receipt=receipt):
+                page = Mock()
+                page.evaluate = AsyncMock(return_value=result[receipt])
+                challenge = PonyChart(Mock(page=page))
+                with self.assertRaises(BattleInterruptedError) as raised:
+                    await challenge._read_challenge_receipt(
+                        _receipt_context(), deadline=SemanticDeadline.after(1.0)
+                    )
+                self.assertEqual(
+                    raised.exception.diagnostic_code,
+                    "battle.ponychart.receipt-timing-inconclusive",
+                )
+
         self.assertFalse(
             result["foreignFormArmed"]["diagnostic"]["labelDescriptors"][0]["sameForm"]
         )
@@ -2512,6 +2457,7 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
                         "submitInvocationCount": 0,
                         "commandClickEventCount": 0,
                         "commandFormSubmitEventCount": 0,
+                        "commandSubmitterMatchCount": 0,
                     },
                 ),
                 _submit_acknowledgement("submitted", selected_count=2),
@@ -2558,6 +2504,171 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         )
         driver.page.evaluate.assert_awaited_once()
 
+    async def test_document_readiness_retries_preserve_one_action_intent(self) -> None:
+        events: list[AuditEvent] = []
+        page = Mock()
+        page.evaluate = AsyncMock(
+            side_effect=[
+                _pre_submit_acknowledgement("document-not-ready"),
+                _pre_submit_acknowledgement("document-not-ready"),
+                _submit_acknowledgement("submitted", selected_count=2),
+            ]
+        )
+        challenge = PonyChart(
+            Mock(page=page),
+            audit_event_bus=TestingAuditEventBus(events.append),
+        )
+
+        with patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()):
+            submitted = await challenge._select_and_submit_answer(
+                ("Applejack", "Twilight Sparkle"),
+                monitor_id=_AUDIT_ACTION_ID,
+                deadline=SemanticDeadline.after(15.0),
+            )
+
+        self.assertTrue(submitted)
+        self.assertEqual(page.evaluate.await_count, 3)
+        self.assertEqual(
+            len({invocation.args[0] for invocation in page.evaluate.await_args_list}),
+            1,
+        )
+        self.assertEqual(
+            [type(event) for event in events],
+            [ActionIntentRecordedAuditEvent, ActionSubmittedAuditEvent],
+        )
+
+    async def test_document_readiness_retries_share_the_original_deadline(
+        self,
+    ) -> None:
+        now = 14.75
+        events: list[AuditEvent] = []
+        page = Mock()
+        page.evaluate = AsyncMock(
+            return_value=_pre_submit_acknowledgement("document-not-ready")
+        )
+        challenge = PonyChart(
+            Mock(page=page),
+            audit_event_bus=TestingAuditEventBus(events.append),
+        )
+        deadline = SemanticDeadline(expires_at=15.0, _clock=lambda: now)
+
+        async def advance_clock(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        with (
+            patch.object(
+                ponychart_module.asyncio, "sleep", side_effect=advance_clock
+            ) as sleep,
+            self.assertRaises(BattleInterruptedError) as raised,
+        ):
+            await challenge._select_and_submit_answer(
+                ("Applejack", "Twilight Sparkle"),
+                monitor_id=_AUDIT_ACTION_ID,
+                deadline=deadline,
+            )
+
+        self.assertEqual(
+            raised.exception.diagnostic_code,
+            "battle.ponychart.document-not-ready",
+        )
+        self.assertEqual(page.evaluate.await_count, 3)
+        self.assertEqual(sleep.await_count, 3)
+        self.assertAlmostEqual(sleep.await_args_list[-1].args[0], 0.05)
+        self.assertEqual(now, deadline.expires_at)
+        self.assertEqual(
+            [type(event) for event in events],
+            [ActionIntentRecordedAuditEvent, ActionNotSubmittedAuditEvent],
+        )
+
+    async def test_document_readiness_ack_at_deadline_is_not_retried(self) -> None:
+        now = 14.9
+        page = Mock()
+
+        async def acknowledge_at_deadline(_script: str) -> dict[str, object]:
+            nonlocal now
+            now = 15.0
+            return _pre_submit_acknowledgement("document-not-ready")
+
+        page.evaluate = AsyncMock(side_effect=acknowledge_at_deadline)
+        challenge = PonyChart(Mock(page=page))
+        deadline = SemanticDeadline(expires_at=15.0, _clock=lambda: now)
+
+        with (
+            patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()) as sleep,
+            self.assertRaises(BattleInterruptedError) as raised,
+        ):
+            await challenge._select_and_submit_answer(
+                ("Applejack", "Twilight Sparkle"),
+                monitor_id=_AUDIT_ACTION_ID,
+                deadline=deadline,
+            )
+
+        self.assertEqual(
+            raised.exception.diagnostic_code,
+            "battle.ponychart.document-not-ready",
+        )
+        page.evaluate.assert_awaited_once()
+        sleep.assert_not_awaited()
+
+    async def test_retry_ack_with_submit_evidence_is_never_replayed(self) -> None:
+        for status in (
+            "document-not-ready",
+            "label-controls-not-ready",
+            "labels-not-ready",
+            "submit-not-ready",
+        ):
+            for field in (
+                "submitInvocationCount",
+                "commandClickEventCount",
+                "commandFormSubmitEventCount",
+                "commandSubmitterMatchCount",
+                "commandFormSubmitPreventedCount",
+            ):
+                with self.subTest(status=status, field=field):
+                    page = Mock()
+                    page.evaluate = AsyncMock(
+                        return_value=_pre_submit_acknowledgement(status, **{field: 1})
+                    )
+                    challenge = PonyChart(Mock(page=page))
+
+                    with self.assertRaises(BattleInterruptedError) as raised:
+                        await challenge._select_and_submit_answer(
+                            ("Applejack", "Twilight Sparkle"),
+                            monitor_id=_AUDIT_ACTION_ID,
+                            deadline=SemanticDeadline.after(15.0),
+                        )
+
+                    self.assertEqual(
+                        raised.exception.diagnostic_code,
+                        "battle.ponychart.submit-outcome-unknown",
+                    )
+                    page.evaluate.assert_awaited_once()
+
+    async def test_readiness_retry_operation_timeout_is_not_replayed(self) -> None:
+        timeout = ZendriverOperationTimeout(timeout_seconds=5.0)
+        page = Mock()
+        page.evaluate = AsyncMock(
+            side_effect=[
+                _pre_submit_acknowledgement("document-not-ready"),
+                timeout,
+            ]
+        )
+        challenge = PonyChart(Mock(page=page))
+
+        with (
+            patch.object(ponychart_module.asyncio, "sleep", new=AsyncMock()),
+            self.assertRaises(ZendriverOperationTimeout) as raised,
+        ):
+            await challenge._select_and_submit_answer(
+                ("Applejack", "Twilight Sparkle"),
+                monitor_id=_AUDIT_ACTION_ID,
+                deadline=SemanticDeadline.after(15.0),
+            )
+
+        self.assertIs(raised.exception, timeout)
+        self.assertEqual(page.evaluate.await_count, 2)
+
     async def test_invalid_label_contract_has_a_specific_diagnostic(self) -> None:
         driver = Mock()
         driver.page = Mock()
@@ -2578,37 +2689,6 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
             "battle.ponychart.label-contract-invalid",
         )
         driver.page.evaluate.assert_awaited_once()
-
-    async def test_pre_submit_countdown_stop_has_a_specific_diagnostic(
-        self,
-    ) -> None:
-        cases = {
-            "challenge-expiring": ("battle.ponychart.challenge-expiring-before-submit"),
-            "countdown-unverified": (
-                "battle.ponychart.countdown-unverified-before-submit"
-            ),
-        }
-        for status, diagnostic_code in cases.items():
-            with self.subTest(status=status):
-                driver = Mock()
-                driver.page = Mock()
-                driver.page.evaluate = AsyncMock(
-                    return_value=_submit_acknowledgement(status)
-                )
-                challenge = PonyChart(driver)
-
-                with self.assertRaises(BattleInterruptedError) as raised:
-                    await challenge._select_and_submit_answer(
-                        ("Twilight Sparkle",),
-                        monitor_id=_AUDIT_ACTION_ID,
-                        deadline=SemanticDeadline.after(15.0),
-                    )
-
-                self.assertEqual(
-                    raised.exception.diagnostic_code,
-                    diagnostic_code,
-                )
-                driver.page.evaluate.assert_awaited_once()
 
     async def test_submission_timeout_is_not_replayed(self) -> None:
         driver = Mock()
@@ -2779,12 +2859,12 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(raised.exception, timeout)
         challenge._read_challenge_receipt.assert_awaited_once()
 
-    async def test_pre_submit_countdown_stop_waits_for_natural_expiration(
+    async def test_pre_submit_readiness_stop_can_confirm_no_submission(
         self,
     ) -> None:
         for diagnostic_code in (
-            "battle.ponychart.challenge-expiring-before-submit",
-            "battle.ponychart.countdown-unverified-before-submit",
+            "battle.ponychart.submit-not-ready",
+            "battle.ponychart.document-not-ready",
         ):
             with self.subTest(diagnostic_code=diagnostic_code):
                 driver = Mock(headless=True)
@@ -2822,6 +2902,29 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
                 _receipt_observation(),
                 True,
             ),
+            "interactive-battle": (
+                _receipt_observation(
+                    diagnostic_overrides={"readyState": "interactive"}
+                ),
+                True,
+            ),
+            "battle-still-loading": (
+                _receipt_observation(diagnostic_overrides={"readyState": "loading"}),
+                False,
+            ),
+            "battle-readiness-unknown": (
+                _receipt_observation(diagnostic_overrides={"readyState": "unknown"}),
+                False,
+            ),
+            "battle-at-five-second-boundary": (
+                _receipt_observation(
+                    diagnostic_overrides={
+                        "transitionElapsedMs": 5_080,
+                        "elapsedMs": 5_080,
+                    }
+                ),
+                True,
+            ),
             "absence-without-submission": (
                 _receipt_observation(
                     selectionApplied=False,
@@ -2835,6 +2938,26 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
                         "commandClickEventCount": 0,
                         "commandFormSubmitEventCount": 0,
                     },
+                ),
+                False,
+            ),
+            "selected-without-own-submit": (
+                _receipt_observation(
+                    diagnostic_overrides={
+                        "submitCommandElapsedMs": None,
+                        "clickEventElapsedMs": None,
+                        "formSubmitEventElapsedMs": None,
+                        "submitInvocationCount": 0,
+                        "commandClickEventCount": 0,
+                        "commandFormSubmitEventCount": 0,
+                        "commandSubmitterMatchCount": 0,
+                    }
+                ),
+                False,
+            ),
+            "form-event-has-another-submitter": (
+                _receipt_observation(
+                    diagnostic_overrides={"commandSubmitterMatchCount": 0}
                 ),
                 False,
             ),
@@ -2883,20 +3006,22 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_receipt_timing_oracle_fails_closed(self) -> None:
         cases = {
-            "zero-at-submit": {
-                "countdownAtSubmitSeconds": 0,
+            "transition-before-submit": {
+                "transitionElapsedMs": 79,
             },
-            "late-natural-transition": {
-                "countdownAtSubmitSeconds": 2,
-                "transitionElapsedMs": 1_500,
+            "transition-later-than-five-seconds": {
+                "transitionElapsedMs": 5_081,
+                "elapsedMs": 5_090,
             },
-            "counter-unverified": {
-                "initialCountdownSeconds": None,
-                "initialCountdownSource": "none",
-                "initialCountdownCandidateCount": 1,
-                "countdownAtSubmitSeconds": None,
-                "countdownAtSubmitSource": "none",
-                "countdownAtSubmitCandidateCount": 1,
+            "ready-battle-observed-after-five-seconds": {
+                "transitionElapsedMs": 100,
+                "elapsedMs": 5_081,
+            },
+            "missing-transition-evidence": {
+                "transitionElapsedMs": None,
+            },
+            "transition-after-receipt-observation": {
+                "transitionElapsedMs": 101,
             },
         }
         for name, diagnostic_overrides in cases.items():
@@ -2921,28 +3046,9 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
                     "battle.ponychart.receipt-timing-inconclusive",
                 )
 
-    async def test_countdown_source_decoder_accepts_only_bounded_safe_metadata(
+    async def test_slow_six_second_receipt_cannot_exceed_five_second_budget(
         self,
     ) -> None:
-        decoded = ponychart_module._decode_page_diagnostic(
-            _page_diagnostic(
-                countdownSource="id:status",
-                initialCountdownSource="class:countdown-primary",
-                countdownAtSubmitSource="id:remaining",
-            )
-        )
-
-        self.assertEqual(decoded.countdown_source, "id:status")
-        self.assertEqual(
-            decoded.initial_countdown_source,
-            "class:countdown-primary",
-        )
-        with self.assertRaisesRegex(ValueError, "countdown source"):
-            ponychart_module._decode_page_diagnostic(
-                _page_diagnostic(countdownSource="id:<unsafe>")
-            )
-
-    async def test_slow_six_second_receipt_is_accepted(self) -> None:
         now = 0.0
         driver = Mock()
         challenge = PonyChart(driver)
@@ -2962,15 +3068,18 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
         challenge._read_challenge_receipt = AsyncMock(side_effect=read_receipt)
         deadline = SemanticDeadline.after(15.0, clock=lambda: now)
 
-        with patch.object(ponychart_module.asyncio, "sleep", side_effect=advance):
+        with (
+            patch.object(ponychart_module.asyncio, "sleep", side_effect=advance),
+            self.assertRaises(PonyChartResolutionError),
+        ):
             await challenge._wait_for_challenge_receipt(
                 _receipt_context(),
                 deadline=deadline,
                 check_interval=1.0,
             )
 
-        self.assertEqual(now, 6.0)
-        self.assertEqual(challenge._read_challenge_receipt.await_count, 7)
+        self.assertEqual(now, 5.0)
+        self.assertEqual(challenge._read_challenge_receipt.await_count, 5)
 
     async def test_receipt_total_deadline_does_not_stack_per_probe(self) -> None:
         now = 0.0
@@ -2998,8 +3107,31 @@ class PonyChartReceiptTests(unittest.IsolatedAsyncioTestCase):
                 check_interval=1.0,
             )
 
-        self.assertEqual(now, 15.0)
-        self.assertEqual(starts, [0.0, 5.0, 10.0])
+        self.assertEqual(now, 5.0)
+        self.assertEqual(starts, [0.0])
+
+    async def test_receipt_timeout_never_extends_shorter_outer_deadline(self) -> None:
+        now = 0.0
+        page = Mock()
+        challenge = PonyChart(Mock(page=page))
+        challenge._read_challenge_receipt = AsyncMock(return_value=False)
+
+        async def advance(delay: float) -> None:
+            nonlocal now
+            now += delay
+
+        with (
+            patch.object(ponychart_module.asyncio, "sleep", side_effect=advance),
+            self.assertRaises(PonyChartResolutionError),
+        ):
+            await challenge._wait_for_challenge_receipt(
+                _receipt_context(),
+                deadline=SemanticDeadline.after(2.0, clock=lambda: now),
+                check_interval=1.0,
+            )
+
+        self.assertEqual(now, 2.0)
+        self.assertEqual(challenge._read_challenge_receipt.await_count, 2)
 
     async def test_final_receipt_probe_cannot_accept_after_deadline(self) -> None:
         now = 14.0

@@ -55,14 +55,10 @@ _PONYCHART_MUTATION_TIMEOUT_SECONDS = PROTOCOL_TIMEOUT_SECONDS
 _PONYCHART_INFERENCE_DEADLINE_SECONDS = 5.0
 _PONYCHART_WORKER_PRELOAD_DEADLINE_SECONDS = 15.0
 _PONYCHART_WORKER_CLOSE_DEADLINE_SECONDS = 5.0
-_PONYCHART_UNVERIFIED_TOTAL_DEADLINE_SECONDS = 15.0
+_PONYCHART_PREPARATION_DEADLINE_SECONDS = 15.0
+_PONYCHART_RECEIPT_TIMEOUT_SECONDS = 5.0
 _PONYCHART_MINIMUM_IMAGE_DIMENSION = 50
 _PONYCHART_SUBMIT_RETRY_INTERVAL_SECONDS = 0.1
-_PONYCHART_PRE_EXPIRY_RESERVE_SECONDS = 1.0
-_PONYCHART_COUNTDOWN_RESOLUTION_SECONDS = 1.0
-_PONYCHART_EXPIRY_SAFETY_MARGIN_MILLISECONDS = (
-    _PONYCHART_PRE_EXPIRY_RESERVE_SECONDS * 1_000
-)
 _PONYCHART_LABEL_NAMES = (
     "Twilight Sparkle",
     "Rarity",
@@ -260,129 +256,6 @@ _PONYCHART_PAGE_HELPERS_JS = r"""
         return ["submit", "button", "reset"].includes(value)
             ? value : "other";
     };
-    const parseCountdownText = (raw, allowEmbeddedNumber) => {
-        const text = String(raw || "").trim();
-        if (!text) return null;
-        const clockMatch = text.match(/^(\d{1,2}):(\d{1,2})$/);
-        if (clockMatch) {
-            const clockSeconds = Number(clockMatch[1]) * 60
-                + Number(clockMatch[2]);
-            return Number.isFinite(clockSeconds) && clockSeconds <= 600
-                ? clockSeconds : null;
-        }
-        const numericTokens = text.match(/\d+(?:\.\d+)?/g) || [];
-        if (numericTokens.length !== 1) return null;
-        if (!allowEmbeddedNumber
-                && !/(?:seconds?|secs?|s)(?:\D|$)/i.test(text)) {
-            return null;
-        }
-        const seconds = Number(numericTokens[0]);
-        return Number.isFinite(seconds) && seconds >= 0 && seconds <= 600
-            ? seconds : null;
-    };
-    const readCountdown = () => {
-        const missing = {seconds: null, source: "none", candidateCount: 0};
-        if (typeof document.querySelectorAll !== "function") return missing;
-        const exactCounter = document.getElementById("riddlecounter");
-        let candidates = exactCounter ? [exactCounter] : [];
-        try {
-            candidates.push(...Array.from(document.querySelectorAll(
-                '[id*="countdown"], [class*="countdown"], '
-                + '[id*="timer"], [class*="timer"]'
-            )).filter((candidate) => candidate !== exactCounter).slice(0, 19));
-        } catch (_error) {
-            candidates = exactCounter ? [exactCounter] : [];
-        }
-        const parseExactSpriteCounter = (counter) => {
-            const wrappers = counter && counter.children
-                ? Array.from(counter.children) : [];
-            if (wrappers.length !== 1 || !wrappers[0].children) return null;
-            const glyphs = Array.from(wrappers[0].children);
-            if (glyphs.length < 1 || glyphs.length > 3) return null;
-            const classDigits = [];
-            for (const glyph of glyphs) {
-                const tokens = String(glyph.className || "")
-                    .trim().split(/\s+/).filter(Boolean);
-                const digitTokens = tokens.filter((token) => /^c4[0-9]$/.test(token));
-                if (digitTokens.length !== 1) {
-                    classDigits.length = 0;
-                    break;
-                }
-                classDigits.push(digitTokens[0].slice(2));
-            }
-            if (classDigits.length === glyphs.length) {
-                const seconds = Number(classDigits.join(""));
-                return Number.isFinite(seconds) && seconds >= 0 && seconds <= 600
-                    ? {seconds, source: "riddlecounter-class-sprite"} : null;
-            }
-            const inlineDigits = [];
-            for (const glyph of glyphs) {
-                const style = glyph && glyph.style;
-                if (!style || !String(style.background || "").trim()) return null;
-                let yPosition = String(style.backgroundPositionY || "").trim();
-                if (!yPosition) {
-                    const positionTokens = String(
-                        style.backgroundPosition || ""
-                    ).trim().split(/\s+/).filter(Boolean);
-                    if (positionTokens.length !== 2
-                            || !/^0(?:px)?$/.test(positionTokens[0])) return null;
-                    yPosition = positionTokens[1];
-                }
-                if (!/^-?\d+(?:\.\d+)?px$/.test(yPosition)) return null;
-                const yOffset = Number(yPosition.slice(0, -2));
-                const digit = Math.abs(yOffset) / 12;
-                if (!Number.isFinite(yOffset)
-                        || yOffset > 0 || yOffset < -108
-                        || !Number.isInteger(digit)) return null;
-                inlineDigits.push(String(digit));
-            }
-            const seconds = Number(inlineDigits.reverse().join(""));
-            return Number.isFinite(seconds) && seconds >= 0 && seconds <= 600
-                ? {seconds, source: "riddlecounter-inline-sprite"} : null;
-        };
-        const candidateSource = (candidate) => {
-            if (candidate === exactCounter) return "riddlecounter";
-            const safeToken = (value) => {
-                const normalized = String(value || "").trim().toLowerCase();
-                return /^[a-z0-9_-]{1,32}$/.test(normalized)
-                    ? normalized : null;
-            };
-            const safeId = safeToken(candidate.id);
-            if (safeId) return `id:${safeId}`;
-            const safeClass = String(candidate.className || "")
-                .split(/\s+/)
-                .map(safeToken)
-                .find((token) => token
-                    && (token.includes("countdown") || token.includes("timer")));
-            return safeClass ? `class:${safeClass}` : "timer-candidate";
-        };
-        for (const candidate of candidates) {
-            const primaryText = String(candidate.textContent || "").trim()
-                || String(candidate.value || "").trim()
-                || String(candidate.getAttribute
-                    ? candidate.getAttribute("aria-label") : "").trim();
-            let seconds = parseCountdownText(
-                primaryText,
-                true,
-            );
-            let source = candidateSource(candidate);
-            if (seconds === null && candidate === exactCounter) {
-                const sprite = parseExactSpriteCounter(candidate);
-                if (sprite !== null) {
-                    seconds = sprite.seconds;
-                    source = sprite.source;
-                }
-            }
-            if (seconds !== null) {
-                return {
-                    seconds,
-                    source,
-                    candidateCount: candidates.length,
-                };
-            }
-        }
-        return {...missing, candidateCount: candidates.length};
-    };
     const resolveSubmit = () => {
         const byId = document.getElementById("riddlesubmit");
         if (byId) return {element: byId, source: "riddlesubmit"};
@@ -490,7 +363,6 @@ _PONYCHART_PAGE_HELPERS_JS = r"""
                     ? descriptor.control.form === submit.form : null,
             };
         });
-        const countdown = readCountdown();
         return {
             readyState: safeReadyState(),
             labelCount: labels.length,
@@ -517,9 +389,6 @@ _PONYCHART_PAGE_HELPERS_JS = r"""
             riddleOptionsPresent: labelScope.optionsPresent,
             globalLabelCount: labelScope.globalLabelCount,
             labelDescriptors,
-            countdownSeconds: countdown.seconds,
-            countdownSource: countdown.source,
-            countdownCandidateCount: countdown.candidateCount,
         };
     };
     const pageDiagnostic = (state, storageAvailable) => {
@@ -529,18 +398,6 @@ _PONYCHART_PAGE_HELPERS_JS = r"""
             storageAvailable: storageAvailable === true,
             initialSubmitDisabled: state
                 ? state.initialSubmitDisabled : null,
-            initialCountdownSeconds: state
-                ? state.initialCountdownSeconds : null,
-            initialCountdownSource: state
-                ? state.initialCountdownSource : "none",
-            initialCountdownCandidateCount: state
-                ? state.initialCountdownCandidateCount : 0,
-            countdownAtSubmitSeconds: state
-                ? state.countdownAtSubmitSeconds : null,
-            countdownAtSubmitSource: state
-                ? state.countdownAtSubmitSource : "none",
-            countdownAtSubmitCandidateCount: state
-                ? state.countdownAtSubmitCandidateCount : 0,
             elapsedMs: state ? elapsed(state) : 0,
             submitEnabledElapsedMs: state
                 ? optionalElapsed(state.submitEnabledElapsedMs) : null,
@@ -605,12 +462,6 @@ _ARM_PONYCHART_RECEIPT_JS = (
         selectedCount: 0,
         selectionApplied: false,
         initialSubmitDisabled: initial.submitDisabled,
-        initialCountdownSeconds: initial.countdownSeconds,
-        initialCountdownSource: initial.countdownSource,
-        initialCountdownCandidateCount: initial.countdownCandidateCount,
-        countdownAtSubmitSeconds: null,
-        countdownAtSubmitSource: "none",
-        countdownAtSubmitCandidateCount: 0,
         submitEnabledElapsedMs: initial.submitDisabled === false ? 0 : null,
         selectionElapsedMs: null,
         submitCommandElapsedMs: null,
@@ -859,50 +710,7 @@ _SELECT_AND_SUBMIT_PONYCHART_JS = (
                     ? activeSubmit.getAttribute("aria-disabled") : "") === "true") {
             return result("submit-not-ready", {selectionStarted});
         }
-        const submitCountdown = readCountdown();
         const commandElapsedMs = elapsed(monitor.state);
-        const initialRemaining = Number.isFinite(
-            monitor.state.initialCountdownSeconds
-        ) ? monitor.state.initialCountdownSeconds - (commandElapsedMs / 1000)
-            : null;
-        const remainingCandidates = [];
-        if (Number.isFinite(submitCountdown.seconds)) {
-            remainingCandidates.push({
-                seconds: submitCountdown.seconds,
-                source: submitCountdown.source,
-                candidateCount: submitCountdown.candidateCount,
-            });
-        }
-        if (Number.isFinite(initialRemaining)) {
-            remainingCandidates.push({
-                seconds: initialRemaining,
-                source: "armed-elapsed",
-                candidateCount: monitor.state.initialCountdownCandidateCount,
-            });
-        }
-        if (remainingCandidates.length === 0) {
-            monitor.state.countdownAtSubmitSeconds = null;
-            monitor.state.countdownAtSubmitSource = "none";
-            monitor.state.countdownAtSubmitCandidateCount =
-                submitCountdown.candidateCount;
-            monitor.persist();
-            return result("countdown-unverified", {selectionStarted});
-        }
-        const effectiveRemaining = remainingCandidates.reduce(
-            (best, candidate) => candidate.seconds < best.seconds
-                ? candidate : best
-        );
-        monitor.state.countdownAtSubmitSeconds = Math.max(
-            0,
-            effectiveRemaining.seconds,
-        );
-        monitor.state.countdownAtSubmitSource = effectiveRemaining.source;
-        monitor.state.countdownAtSubmitCandidateCount =
-            effectiveRemaining.candidateCount;
-        if (effectiveRemaining.seconds <= __PRE_EXPIRY_RESERVE_SECONDS__) {
-            monitor.persist();
-            return result("challenge-expiring", {selectionStarted});
-        }
         monitor.state.submitInvocationCount = 1;
         monitor.state.submitCommandElapsedMs = commandElapsedMs;
         monitor.state.commandActive = true;
@@ -939,13 +747,8 @@ def _render_ponychart_page_script(
     predicted_labels: tuple[str, ...] | None = None,
 ) -> str:
     """Inject the shared DOM contract into every receipt lifecycle script."""
-    rendered = (
-        template.replace("__MONITOR_ID__", json.dumps(monitor_id))
-        .replace("__EXPECTED_LABELS__", json.dumps(_PONYCHART_LABEL_NAMES))
-        .replace(
-            "__PRE_EXPIRY_RESERVE_SECONDS__",
-            json.dumps(_PONYCHART_PRE_EXPIRY_RESERVE_SECONDS),
-        )
+    rendered = template.replace("__MONITOR_ID__", json.dumps(monitor_id)).replace(
+        "__EXPECTED_LABELS__", json.dumps(_PONYCHART_LABEL_NAMES)
     )
     if predicted_labels is not None:
         rendered = rendered.replace(
@@ -959,8 +762,6 @@ def _render_ponychart_page_script(
         raise ValueError(
             "PonyChart page script has an unresolved prediction placeholder"
         )
-    if "__PRE_EXPIRY_RESERVE_SECONDS__" in rendered:
-        raise ValueError("PonyChart page script has an unresolved expiry placeholder")
     return rendered
 
 
@@ -1008,14 +809,12 @@ class _PonyChartReceiptContext:
     document_url: str
     origin: str
     deadline: SemanticDeadline
-    expiration_classification_deadline: SemanticDeadline
+    reconciliation_deadline: SemanticDeadline
 
 
 class _PonyChartSubmitStatus(StrEnum):
     ALREADY_SUBMITTED = "already-submitted"
-    CHALLENGE_EXPIRING = "challenge-expiring"
     CHALLENGE_ABSENT = "challenge-absent"
-    COUNTDOWN_UNVERIFIED = "countdown-unverified"
     DOCUMENT_NOT_READY = "document-not-ready"
     LABEL_CONTRACT_INVALID = "label-contract-invalid"
     LABEL_CONTROLS_NOT_READY = "label-controls-not-ready"
@@ -1038,21 +837,9 @@ _PONYCHART_RETRIABLE_SUBMIT_STATUSES = frozenset(
         _PonyChartSubmitStatus.SUBMIT_NOT_READY,
     }
 )
-_PONYCHART_SAFE_PRE_SUBMIT_STOP_STATUSES = frozenset(
-    {
-        _PonyChartSubmitStatus.CHALLENGE_EXPIRING,
-        _PonyChartSubmitStatus.COUNTDOWN_UNVERIFIED,
-    }
-)
 _PONYCHART_SUBMIT_DIAGNOSTIC_CODES = {
     _PonyChartSubmitStatus.ALREADY_SUBMITTED: (
         "battle.ponychart.duplicate-submit-prevented"
-    ),
-    _PonyChartSubmitStatus.CHALLENGE_EXPIRING: (
-        "battle.ponychart.challenge-expiring-before-submit"
-    ),
-    _PonyChartSubmitStatus.COUNTDOWN_UNVERIFIED: (
-        "battle.ponychart.countdown-unverified-before-submit"
     ),
     _PonyChartSubmitStatus.DOCUMENT_NOT_READY: ("battle.ponychart.document-not-ready"),
     _PonyChartSubmitStatus.LABEL_CONTRACT_INVALID: (
@@ -1111,15 +898,6 @@ class _PonyChartPageDiagnostic:
     label_descriptors: tuple[_PonyChartLabelDiagnostic, ...]
     storage_available: bool
     initial_submit_disabled: bool | None
-    countdown_seconds: float | None
-    countdown_source: str
-    countdown_candidate_count: int
-    initial_countdown_seconds: float | None
-    initial_countdown_source: str
-    initial_countdown_candidate_count: int
-    countdown_at_submit_seconds: float | None
-    countdown_at_submit_source: str
-    countdown_at_submit_candidate_count: int
     elapsed_ms: float
     submit_enabled_elapsed_ms: float | None
     selection_elapsed_ms: float | None
@@ -1167,22 +945,16 @@ class _PonyChartPageDiagnostic:
 
     @property
     def transition_follows_submit(self) -> bool:
+        """Require a prompt transition and receipt observation after our submit."""
         transition = self.transition_elapsed_ms
         form_submit = self.form_submit_event_elapsed_ms
-        command = self.submit_command_elapsed_ms
-        if transition is None or form_submit is None or command is None:
+        if transition is None or form_submit is None:
             return False
-        transition_latency = transition - form_submit
-        if transition_latency < 0:
-            return False
-        remaining = self.countdown_at_submit_seconds
-        if remaining is None and self.initial_countdown_seconds is not None:
-            remaining = self.initial_countdown_seconds - (command / 1_000)
-        if remaining is None or remaining <= 0:
-            return False
-        expected_expiry = command + (remaining * 1_000)
-        return transition <= (
-            expected_expiry - _PONYCHART_EXPIRY_SAFETY_MARGIN_MILLISECONDS
+        return (
+            0
+            <= transition - form_submit
+            <= self.elapsed_ms - form_submit
+            <= _PONYCHART_RECEIPT_TIMEOUT_SECONDS * 1_000
         )
 
 
@@ -1206,6 +978,7 @@ class _PonyChartReceiptObservation:
             and self.battle_present
             and self.disappeared
             and self.selection_applied
+            and self.diagnostic.ready_state in {"interactive", "complete"}
             and self.diagnostic.has_exact_submit_evidence
             and self.diagnostic.transition_follows_submit
         )
@@ -1217,9 +990,8 @@ class _PonyChartReceiptObservation:
             and not self.present
             and self.battle_present
             and self.disappeared
-            and self.diagnostic.submit_invocation_count == 0
-            and self.diagnostic.command_click_event_count == 0
-            and self.diagnostic.command_form_submit_event_count == 0
+            and self.diagnostic.ready_state in {"interactive", "complete"}
+            and self.diagnostic.proves_no_submission
         )
 
 
@@ -1241,17 +1013,8 @@ _PONYCHART_DIAGNOSTIC_FIELDS = {
     "riddleOptionsPresent",
     "globalLabelCount",
     "labelDescriptors",
-    "countdownSeconds",
-    "countdownSource",
-    "countdownCandidateCount",
     "storageAvailable",
     "initialSubmitDisabled",
-    "initialCountdownSeconds",
-    "initialCountdownSource",
-    "initialCountdownCandidateCount",
-    "countdownAtSubmitSeconds",
-    "countdownAtSubmitSource",
-    "countdownAtSubmitCandidateCount",
     "elapsedMs",
     "submitEnabledElapsedMs",
     "selectionElapsedMs",
@@ -1357,34 +1120,6 @@ def _decode_label_descriptors(
     return tuple(decoded)
 
 
-def _decode_countdown_source(value: object, *, field: str) -> str:
-    if value in {
-        "armed-elapsed",
-        "none",
-        "riddlecounter",
-        "riddlecounter-class-sprite",
-        "riddlecounter-inline-sprite",
-        "timer-candidate",
-    }:
-        assert isinstance(value, str)
-        return value
-    if not isinstance(value, str):
-        raise ValueError(f"PonyChart diagnostic returned invalid {field}")
-    source_kind, separator, token = value.partition(":")
-    if (
-        separator != ":"
-        or source_kind not in {"id", "class"}
-        or not 1 <= len(token) <= 32
-        or any(
-            character not in "abcdefghijklmnopqrstuvwxyz0123456789_-"
-            for character in token
-        )
-        or (source_kind == "class" and not ("timer" in token or "countdown" in token))
-    ):
-        raise ValueError(f"PonyChart diagnostic returned invalid {field}")
-    return value
-
-
 def _decode_page_diagnostic(raw: object) -> _PonyChartPageDiagnostic:
     if not isinstance(raw, dict) or set(raw) != _PONYCHART_DIAGNOSTIC_FIELDS:
         raise ValueError("PonyChart page diagnostic returned an invalid payload")
@@ -1393,9 +1128,6 @@ def _decode_page_diagnostic(raw: object) -> _PonyChartPageDiagnostic:
     submit_type = raw["submitType"]
     submit_source = raw["submitSource"]
     label_scope = raw["labelScope"]
-    countdown_source = raw["countdownSource"]
-    initial_countdown_source = raw["initialCountdownSource"]
-    countdown_at_submit_source = raw["countdownAtSubmitSource"]
     if not isinstance(ready_state, str) or ready_state not in {
         "loading",
         "interactive",
@@ -1428,18 +1160,6 @@ def _decode_page_diagnostic(raw: object) -> _PonyChartPageDiagnostic:
         field="label scope",
         allowed=frozenset({"riddler1", "riddlemaster", "global-diagnostic", "none"}),
     )
-    countdown_source = _decode_countdown_source(
-        countdown_source,
-        field="countdown source",
-    )
-    initial_countdown_source = _decode_countdown_source(
-        initial_countdown_source,
-        field="initial countdown source",
-    )
-    countdown_at_submit_source = _decode_countdown_source(
-        countdown_at_submit_source,
-        field="submit countdown source",
-    )
     form_associated = raw["formAssociated"]
     storage_available = raw["storageAvailable"]
     riddle_master_present = raw["riddleMasterPresent"]
@@ -1457,26 +1177,6 @@ def _decode_page_diagnostic(raw: object) -> _PonyChartPageDiagnostic:
     elapsed_ms = _finite_number(raw["elapsedMs"])
     if not 0 <= elapsed_ms <= 3_600_000:
         raise ValueError("PonyChart diagnostic returned invalid elapsed time")
-    countdown_seconds = _optional_nonnegative_number(
-        raw["countdownSeconds"], field="countdown"
-    )
-    initial_countdown_seconds = _optional_nonnegative_number(
-        raw["initialCountdownSeconds"], field="initial countdown"
-    )
-    countdown_at_submit_seconds = _optional_nonnegative_number(
-        raw["countdownAtSubmitSeconds"], field="submit countdown"
-    )
-    for source, seconds, field in (
-        (countdown_source, countdown_seconds, "countdown"),
-        (initial_countdown_source, initial_countdown_seconds, "initial countdown"),
-        (
-            countdown_at_submit_source,
-            countdown_at_submit_seconds,
-            "submit countdown",
-        ),
-    ):
-        if (source == "none") != (seconds is None):
-            raise ValueError(f"PonyChart diagnostic returned incoherent {field}")
     return _PonyChartPageDiagnostic(
         ready_state=ready_state,
         label_count=_bounded_nonnegative_count(raw["labelCount"], field="label count"),
@@ -1512,27 +1212,6 @@ def _decode_page_diagnostic(raw: object) -> _PonyChartPageDiagnostic:
         storage_available=storage_available,
         initial_submit_disabled=_optional_boolean(
             raw["initialSubmitDisabled"], field="initial submit state"
-        ),
-        countdown_seconds=countdown_seconds,
-        countdown_source=countdown_source,
-        countdown_candidate_count=_bounded_nonnegative_count(
-            raw["countdownCandidateCount"],
-            field="countdown candidate count",
-            maximum=20,
-        ),
-        initial_countdown_seconds=initial_countdown_seconds,
-        initial_countdown_source=initial_countdown_source,
-        initial_countdown_candidate_count=_bounded_nonnegative_count(
-            raw["initialCountdownCandidateCount"],
-            field="initial countdown candidate count",
-            maximum=20,
-        ),
-        countdown_at_submit_seconds=countdown_at_submit_seconds,
-        countdown_at_submit_source=countdown_at_submit_source,
-        countdown_at_submit_candidate_count=_bounded_nonnegative_count(
-            raw["countdownAtSubmitCandidateCount"],
-            field="submit countdown candidate count",
-            maximum=20,
         ),
         elapsed_ms=elapsed_ms,
         submit_enabled_elapsed_ms=_optional_nonnegative_number(
@@ -1602,8 +1281,7 @@ def _log_page_diagnostic(
         "label_scope=%s riddlemaster=%s riddler1=%s labels=%d "
         "global_labels=%d controls=%d checked=%d label_descriptors=%s "
         "submit=%s/%s source=%s connected=%s caption_match=%s disabled=%s "
-        "aria_disabled=%s form=%s storage=%s countdown_initial=%s/%s/%d "
-        "countdown_now=%s/%s/%d countdown_submit=%s/%s/%d elapsed_ms=%.0f "
+        "aria_disabled=%s form=%s storage=%s elapsed_ms=%.0f "
         "submit_enabled_ms=%s selection_ms=%s command_ms=%s click_ms=%s "
         "form_submit_ms=%s transition_ms=%s mutations=%d selected=%d "
         "invocations=%d click_events=%d form_submit_events=%d "
@@ -1628,15 +1306,6 @@ def _log_page_diagnostic(
         diagnostic.submit_aria_disabled,
         diagnostic.form_associated,
         diagnostic.storage_available,
-        diagnostic.initial_countdown_seconds,
-        diagnostic.initial_countdown_source,
-        diagnostic.initial_countdown_candidate_count,
-        diagnostic.countdown_seconds,
-        diagnostic.countdown_source,
-        diagnostic.countdown_candidate_count,
-        diagnostic.countdown_at_submit_seconds,
-        diagnostic.countdown_at_submit_source,
-        diagnostic.countdown_at_submit_candidate_count,
         diagnostic.elapsed_ms,
         diagnostic.submit_enabled_elapsed_ms,
         diagnostic.selection_elapsed_ms,
@@ -2841,25 +2510,20 @@ class PonyChart:
         origin = raw["origin"]
         if not document_url or not origin:
             raise ValueError("PonyChart receipt monitor returned blank identity")
-        countdown = diagnostic.initial_countdown_seconds
-        if countdown is None:
-            challenge_budget = _PONYCHART_UNVERIFIED_TOTAL_DEADLINE_SECONDS
-            expiration_budget = challenge_budget
-        else:
-            challenge_budget = max(
-                0.001,
-                countdown - _PONYCHART_PRE_EXPIRY_RESERVE_SECONDS,
-            )
-            expiration_budget = max(
-                0.001,
-                countdown + _PONYCHART_COUNTDOWN_RESOLUTION_SECONDS,
-            )
         return _PonyChartReceiptContext(
             monitor_id,
             document_url,
             origin,
-            SemanticDeadline(arm_started_at + challenge_budget, active_clock),
-            SemanticDeadline(arm_returned_at + expiration_budget, active_clock),
+            SemanticDeadline(
+                arm_started_at + _PONYCHART_PREPARATION_DEADLINE_SECONDS,
+                active_clock,
+            ),
+            SemanticDeadline(
+                arm_returned_at
+                + _PONYCHART_PREPARATION_DEADLINE_SECONDS
+                + _PONYCHART_RECEIPT_TIMEOUT_SECONDS,
+                active_clock,
+            ),
         )
 
     async def _select_and_submit_answer(
@@ -2958,6 +2622,13 @@ class PonyChart:
                     return True
                 status = _PonyChartSubmitStatus.SUBMIT_EVIDENCE_MISSING
             if status in _PONYCHART_RETRIABLE_SUBMIT_STATUSES:
+                if not diagnostic.proves_no_submission:
+                    raise BattleInterruptedError(
+                        "PonyChart retry acknowledgement cannot prove no submission",
+                        diagnostic_code="battle.ponychart.submit-outcome-unknown",
+                    )
+                # Only acknowledged pre-submit readiness may be polled, within
+                # the original preparation deadline.
                 remaining = deadline.remaining()
                 if remaining <= 0:
                     break
@@ -3079,6 +2750,7 @@ class PonyChart:
             and observation.disappeared
             and observation.selection_applied
             and diagnostic.has_exact_submit_evidence
+            and not diagnostic.transition_follows_submit
         ):
             _log_page_diagnostic(
                 phase="receipt",
@@ -3087,8 +2759,7 @@ class PonyChart:
                 warning=True,
             )
             raise BattleInterruptedError(
-                "PonyChart click was observed, but the return could not be "
-                "distinguished from countdown expiry",
+                "PonyChart submission did not produce a prompt battle-page receipt",
                 diagnostic_code="battle.ponychart.receipt-timing-inconclusive",
             )
         return confirmed
@@ -3099,7 +2770,7 @@ class PonyChart:
         *,
         deadline: SemanticDeadline,
     ) -> bool:
-        """Classify expiry read-only, bounded by the armed counter's expiry."""
+        """Classify an unsubmitted return read-only within the fixed deadline."""
         last_error: Exception | None = None
         while deadline.remaining() > 0:
             try:
@@ -3146,6 +2817,7 @@ class PonyChart:
         deadline: SemanticDeadline,
         check_interval: float = 0.25,
     ) -> None:
+        deadline = deadline.capped(_PONYCHART_RECEIPT_TIMEOUT_SECONDS)
         last_error: Exception | None = None
         while deadline.remaining() > 0:
             try:
@@ -3256,7 +2928,7 @@ class PonyChart:
                 )
                 if await self._reconcile_natural_expiration(
                     receipt_context,
-                    deadline=receipt_context.expiration_classification_deadline,
+                    deadline=receipt_context.reconciliation_deadline,
                 ):
                     return PonyChartResolutionOutcome.EXPIRED_WITHOUT_SUBMISSION
                 raise PonyChartResolutionError(
@@ -3274,16 +2946,15 @@ class PonyChart:
             except BattleInterruptedError as error:
                 safe_pre_submit_codes = {
                     _PONYCHART_SUBMIT_DIAGNOSTIC_CODES[status]
-                    for status in (
-                        _PONYCHART_RETRIABLE_SUBMIT_STATUSES
-                        | _PONYCHART_SAFE_PRE_SUBMIT_STOP_STATUSES
-                    )
+                    for status in _PONYCHART_RETRIABLE_SUBMIT_STATUSES
                 }
                 if audit_trail.intent_recorded and not audit_trail.resolved:
                     try:
                         await self._wait_for_challenge_receipt(
                             receipt_context,
-                            deadline=receipt_context.expiration_classification_deadline,
+                            deadline=SemanticDeadline.after(
+                                _PONYCHART_RECEIPT_TIMEOUT_SECONDS
+                            ),
                         )
                     except Exception as reconciliation_error:
                         if is_browser_generation_error(reconciliation_error):
@@ -3297,7 +2968,7 @@ class PonyChart:
                     error.diagnostic_code in safe_pre_submit_codes
                     and await self._reconcile_natural_expiration(
                         receipt_context,
-                        deadline=receipt_context.expiration_classification_deadline,
+                        deadline=receipt_context.reconciliation_deadline,
                     )
                 ):
                     if audit_trail.intent_recorded and not audit_trail.resolved:
@@ -3310,7 +2981,7 @@ class PonyChart:
                 audit_trail.mark_submitted()
                 await self._wait_for_challenge_receipt(
                     receipt_context,
-                    deadline=receipt_context.expiration_classification_deadline,
+                    deadline=SemanticDeadline.after(_PONYCHART_RECEIPT_TIMEOUT_SECONDS),
                 )
                 audit_trail.confirm_receipt(
                     ActionReceiptEvidence.PONYCHART_SUBMISSION_TRANSITION
@@ -3319,7 +2990,7 @@ class PonyChart:
                 return PonyChartResolutionOutcome.SUBMISSION_CONFIRMED
             if await self._reconcile_natural_expiration(
                 receipt_context,
-                deadline=receipt_context.expiration_classification_deadline,
+                deadline=receipt_context.reconciliation_deadline,
             ):
                 if audit_trail.intent_recorded and not audit_trail.resolved:
                     audit_trail.mark_not_submitted(

@@ -2391,7 +2391,7 @@ class PonyChartResolutionTests(unittest.IsolatedAsyncioTestCase):
         receipt_context = SimpleNamespace(
             monitor_id="monitor",
             deadline=SemanticDeadline.after(30.0),
-            expiration_classification_deadline=SemanticDeadline.after(30.0),
+            reconciliation_deadline=SemanticDeadline.after(30.0),
         )
         challenge._arm_challenge_receipt_monitor = AsyncMock(
             return_value=receipt_context

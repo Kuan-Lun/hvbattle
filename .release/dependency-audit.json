@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-08-31T21:02:15+00:00",
+  "checked_at": "2026-09-05T12:58:02+00:00",
   "manifest_sha256": "17eb016d440a79638860628eb008ea339d94c841efabb67a4fffabee38e8512c",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.15.0",
+  "project_version": "0.15.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -26,8 +26,8 @@
     {
       "declared": "hvbrowser>=0.10.0,<0.11",
       "group": "runtime",
-      "latest": "0.9.8",
-      "latest_satisfies": false,
+      "latest": "0.10.2",
+      "latest_satisfies": true,
       "name": "hvbrowser",
       "python_3_14": true,
       "registry_url": "https://pypi.org/project/hvbrowser/",
@@ -125,7 +125,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.5",
+      "latest": "0.16.6",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -135,7 +135,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all build, runtime, dev, and Node direct dependencies against registry metadata. The new hvbrowser 0.10.0 compatibility line is a coordinated locally merged candidate pending registry publication; it passed its full offline gate (218 tests plus sdist/wheel smoke) against hbrowser 0.44.0. hvbattle session-composition tests passed with that local cohort and Zendriver 0.16.0; all other current direct dependency releases were reviewed against their declared constraints.",
+    "note": "Reviewed every direct build, runtime, development, and Node dependency against current PyPI/npm metadata, including candidates outside existing upper bounds. All current candidates satisfy the declared constraints and Python 3.14 metadata. Reviewed hvbrowser 0.10.1-0.10.2 source changes and Ruff 0.16.6 release notes. Validated the PonyChart DOM submission regressions, action audit and safety tests with the published hvbrowser 0.10.2 wheel under CPython 3.14.7, and repository lint/format checks with Ruff 0.16.6. Other direct dependencies are already current; no dependency bound changes are needed. The required offline integration gate additionally checks the complete suite, Lean model, build and wheel smoke.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
